@@ -1,0 +1,19 @@
+- insert:
+    - id: dsh-company
+      name: dsh-company
+      config:
+        subagentProvider: spawn
+        memberMaxDepth: 1
+        maxEmployees: 8
+        maxProducts: 8
+        maxWorkItems: 128
+        maxOpenWorkItems: 32
+        maxAttemptsPerWork: 5
+        defaultCurrency: CNY
+        defaultMoneyBudgetMicros: 100000000
+        maxMoneyBudgetMicros: 1000000000000000
+        modelPrices: []
+        maxTemporaryAuthorizationMs: 86400000
+        defaultTokenBudget: 20000000
+        maxTokenBudget: 1000000000
+        tokenPrices: []
