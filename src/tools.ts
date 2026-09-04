@@ -493,6 +493,7 @@ function workPlanParameters(required: boolean): ParameterSchemaSpec {
     approval_dependencies: { type: 'array', items: { type: 'string' } },
     assignee_id: { type: 'string', description: 'Employee id, founder, or omit for shared scheduling.' },
     eligible_employee_ids: { type: 'array', items: { type: 'string' } },
+    eligible_org_unit_ids: { type: 'array', items: { type: 'string' }, description: 'Org unit ids (incl. descendants) whose members may claim this work. Use this to scope work to a department subtree — e.g. R&D work goes to the R&D unit. Leave empty for any non-HR employee.' },
     in_scope: array('Workspace-relative paths/globs the attempt may change.'),
     out_of_scope: { type: 'array', items: { type: 'string' } },
     acceptance: array('Measurable acceptance conditions.'),
@@ -513,6 +514,7 @@ function workPlanFromArgs(args: Record<string, unknown>, partial = false): any {
   copy('approval_dependencies', 'approvalDependencies')
   copy('assignee_id', 'assigneeId')
   copy('eligible_employee_ids', 'eligibleEmployeeIds')
+  copy('eligible_org_unit_ids', 'eligibleOrgUnitIds')
   copy('in_scope', 'inScope')
   copy('out_of_scope', 'outOfScope')
   copy('acceptance', 'acceptance')

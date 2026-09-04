@@ -4,16 +4,68 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 import { CompanyRuntime } from '../src/runtime.js'
-import { FOUNDER_ONLY_TOOLS } from '../src/employees.js'
+import { EMPLOYEE_DENIED_SPAWN_TOOLS, FOUNDER_ONLY_TOOLS } from '../src/employees.js'
 import { resolveConfig } from '../src/schemas.js'
 import { CompanyStore } from '../src/state.js'
 
+test('budget-only adjustment keeps the employee session; route change reprovisions with handoff', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'dsh-company-adjust-'))
+  const workspace = join(base, 'workspace')
+  await mkdir(workspace)
+  try {
+    const founder = { id: 'founder-session', options: { provider: 'mock', model: 'mock-model' }, session: { header: { cwd: workspace, delegationDepth: 0 }, requestHeader: () => ({ config: { provider: 'mock', model: 'mock-model' } }), deriveMessages: () => [{ id: 'u1', role: 'user', source: { kind: 'user' } }] } } as any
+    const ctx = { agents: { get: (id: unknown) => String(id) === 'founder-session' ? founder : undefined }, llm: { resolveCallConfig: async (sel: any) => sel }, subagents: { registerContinuableSetup: () => () => undefined, getProvider: () => ({ prepareContinuable: () => undefined, capabilities: { persona: true, toolFilter: true, depthLimit: true } }), startContinuable: async (spec: any) => ({ childId: spec.childId, messageId: `m-${spec.childId}` }), followup: async () => 'mf', interrupt: () => undefined }, logger: { warn: () => undefined }, on: () => () => undefined } as any
+    const config = resolveConfig({ stateRoot: join(base, 'state') })
+    const store = new CompanyStore(config)
+    const runtime = new CompanyRuntime(ctx, config, store)
+    await runtime.bootstrap(founder, { name: 'C', mission: 'm', charter: '1. a', firstProduct: { name: 'P', summary: 's', productRoot: 'p', successCriteria: ['x'], budgetMicros: 1_000_000, tokenBudget: 500_000 }, totalBudgetMicros: 1_000_000, totalTokenBudget: 1_000_000, currency: 'CNY', draftedBy: 'ai', modelPrices: [{ provider: 'mock', model: 'mock-model', inputCacheMissMicrosPerMillion: 0, inputCacheHitMicrosPerMillion: 0, outputMicrosPerMillion: 0 }] })
+    await runtime.approveBootstrap(founder, 'Approved and start.', { source: 'ui' })
+    const hr = (await store.readActive(workspace))!.employees[0]!
+    const hrAgent = { id: hr.sessionId, status: 'idle', session: { header: { cwd: workspace } } } as any
+    ;(ctx.agents as any).get = (id: unknown) => { const k = String(id); return k === 'founder-session' ? founder : k === hr.sessionId ? hrAgent : undefined }
+
+    const hire = async (candidate: string) => {
+      const rq = await runtime.requestStaffing(founder, { action: 'hire', candidateName: candidate, workProfile: 'w' })
+      const cl = await runtime.claimStaffingAssessment(hrAgent, rq.id)
+      const rec = await runtime.submitStaffingAssessment(hrAgent, { requestId: rq.id, attemptId: cl.attemptId, difficulty: 'low', provider: 'mock', model: 'mock-model', budgetMicros: 50_000, rationale: 'r', orgPath: ['T'], positionTitle: 'E', responsibilities: ['x'] })
+      await runtime.resolveApproval(founder, { approvalId: rec.approvalId!, decision: 'approved', humanStatement: 'ok' }, 'ui')
+      return runtime.addEmployee(founder, { name: candidate, role: 'E', staffingRequestId: rq.id, approvalId: rec.approvalId! })
+    }
+    const emp = await hire('W')
+    const sessionBefore = emp.sessionId
+
+    // Budget-only adjust: same route, same position → session survives.
+    const adjust = async (budget: number, positionTitle: string) => {
+      const rq = await runtime.requestStaffing(founder, { action: 'adjust', employeeId: emp.id, workProfile: 'bump' })
+      const cl = await runtime.claimStaffingAssessment(hrAgent, rq.id)
+      const rec = await runtime.submitStaffingAssessment(hrAgent, { requestId: rq.id, attemptId: cl.attemptId, difficulty: 'low', provider: 'mock', model: 'mock-model', budgetMicros: budget, rationale: 'r', orgPath: ['T'], positionTitle, responsibilities: ['x'] })
+      await runtime.resolveApproval(founder, { approvalId: rec.approvalId!, decision: 'approved', humanStatement: 'ok' }, 'ui')
+      return runtime.applyStaffingAdjustment(founder, rq.id, rec.approvalId!)
+    }
+    const kept = await adjust(100_000, 'E')
+    assert.equal(kept.sessionId, sessionBefore, 'budget-only adjustment keeps the continuable session')
+    assert.equal(kept.budgetMicros, 100_000)
+    assert.notEqual(kept.status, 'provisioning')
+
+    // Position (persona) change forces reprovision with a new session.
+    const reprovisioned = await adjust(100_000, 'Senior E')
+    assert.notEqual(reprovisioned.sessionId, sessionBefore, 'persona change reprovisions')
+  } finally {
+    await rm(base, { recursive: true, force: true })
+  }
+})
+
 test('employees are hard-denied from spawning their own subagents', () => {
-  assert.ok((FOUNDER_ONLY_TOOLS as readonly string[]).includes('subagent'), 'native subagent tool denied')
-  assert.ok((FOUNDER_ONLY_TOOLS as readonly string[]).includes('subagent_fork'))
-  assert.ok((FOUNDER_ONLY_TOOLS as readonly string[]).includes('ralph'))
-  assert.ok((FOUNDER_ONLY_TOOLS as readonly string[]).includes('workflow'))
-  assert.ok((FOUNDER_ONLY_TOOLS as readonly string[]).includes('agent_teams_create'))
+  // Spawn tools are denied DYNAMICALLY via a tools.guard at call time, not in
+  // the static toolFilter (a static deny for an unregistered tool breaks the
+  // continuable creation). The guard list is checked at execution time only.
+  assert.ok(!FOUNDER_ONLY_TOOLS.includes('subagent' as never), 'spawn tools removed from static deny')
+  assert.ok(!FOUNDER_ONLY_TOOLS.includes('agent_teams_create' as never), 'agent_teams_create removed from static deny')
+  assert.ok(EMPLOYEE_DENIED_SPAWN_TOOLS.has('subagent'), 'guard set covers subagent')
+  assert.ok(EMPLOYEE_DENIED_SPAWN_TOOLS.has('subagent_fork'))
+  assert.ok(EMPLOYEE_DENIED_SPAWN_TOOLS.has('ralph'))
+  assert.ok(EMPLOYEE_DENIED_SPAWN_TOOLS.has('workflow'))
+  assert.ok(EMPLOYEE_DENIED_SPAWN_TOOLS.has('agent_teams_create'))
 })
 
 test('formation is editable, provisions HR first, and gates later hiring through HR', async () => {

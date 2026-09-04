@@ -355,7 +355,7 @@ export interface TemporaryAuthorization {
   uses: TemporaryAuthorizationUse[]
 }
 
-export type OperationalBlockKind = 'network' | 'quota' | 'rate_limit' | 'money_budget' | 'unpriced_model' | 'token_budget' | 'turn_limit' | 'provider' | 'unknown'
+export type OperationalBlockKind = 'network' | 'quota' | 'rate_limit' | 'money_budget' | 'unpriced_model' | 'token_budget' | 'turn_limit' | 'session_unrecoverable' | 'provider' | 'unknown'
 
 export interface OperationalBlock {
   kind: OperationalBlockKind
@@ -554,6 +554,8 @@ export interface WorkItem {
   status: WorkStatus
   assigneeId?: string | 'founder'
   eligibleEmployeeIds?: string[]
+  /** Org units (incl. descendants) whose members may claim this work. */
+  eligibleOrgUnitIds?: string[]
   dependencies: string[]
   approvalDependencies?: string[]
   inScope: string[]
@@ -617,7 +619,7 @@ export interface ApprovalRequest {
   }
 }
 
-export type MessageDeliveryState = 'queued' | 'reserved' | 'accepted' | 'read' | 'held_budget'
+export type MessageDeliveryState = 'queued' | 'reserved' | 'accepted' | 'read' | 'held_budget' | 'dead'
 
 export interface CompanyMessage {
   id: string
@@ -626,6 +628,8 @@ export interface CompanyMessage {
   content: string
   createdAt: number
   deliveryState: MessageDeliveryState
+  /** Failed delivery attempts; after 3 the message goes dead and the founder is steered. */
+  attempts?: number
   reservationId?: string
   leaseAt?: number
   acceptedAt?: number
@@ -1273,6 +1277,8 @@ export interface CreateWorkInput {
   approvalDependencies?: string[]
   assigneeId?: string | 'founder'
   eligibleEmployeeIds?: string[]
+  /** Org units (incl. descendants) whose members may claim this work. */
+  eligibleOrgUnitIds?: string[]
   inScope: string[]
   outOfScope?: string[]
   acceptance: string[]

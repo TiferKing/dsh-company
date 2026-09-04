@@ -116,3 +116,30 @@ test('web mutations execute and persist for loopback pages, fail closed for anyt
     await harness.cleanup()
   }
 })
+
+
+test('web budget/pricing requests work without any founder chat anchor', async () => {
+  const harness = await buildHarness()
+  try {
+    await harness.runtime.bootstrap(harness.founder, {
+      name: 'Draft Co', mission: 'Build one bounded tool.', charter: '1. Original clause.',
+      firstProduct: { name: 'Tool', summary: 'One tool.', productRoot: 'tool', successCriteria: ['Tests pass'], budgetMicros: 1_000_000, tokenBudget: 500_000 },
+      totalBudgetMicros: 1_000_000, totalTokenBudget: 1_000_000, currency: 'CNY', draftedBy: 'ai',
+      modelPrices: [{ provider: 'mock', model: 'mock-model', inputCacheMissMicrosPerMillion: 0, inputCacheHitMicrosPerMillion: 0, outputMicrosPerMillion: 0 }],
+    })
+    await harness.runtime.approveBootstrap(harness.founder, 'Approved and start.', { source: 'ui' })
+    // A console click is the human decision: no chat user message exists at all.
+    harness.founder.session.deriveMessages = () => []
+    const approvals = await executeUiAction(harness.ctx, harness.runtime, {
+      sessionId: 'founder-session', companyId: (await harness.store.readActive(harness.workspace))!.id, expectedRevision: 4,
+      action: 'request_budget_change',
+      payload: { model_prices: [{ provider: 'mock', model: 'mock-model', input_cache_miss_per_million: '0.28', input_cache_hit_per_million: '0.028', output_per_million: '0.42' }] },
+    }, { remote: false })
+    const pending = approvals.approvals.filter((approval) => approval.status === 'pending')
+    assert.equal(pending.length, 1, 'pricing_change approval opened from the console')
+    assert.equal(approvals.approvals[0]?.kind, 'pricing_change')
+    assert.equal(harness.steered.length >= 1, true, 'founder is steered about the request')
+  } finally {
+    await harness.cleanup()
+  }
+})

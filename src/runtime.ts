@@ -22,6 +22,7 @@ import { createTemporaryAuthorization, revokeTemporaryAuthorization as revokeAut
 import { invalidateModelCatalog, mergeDiscoveredPriceRows, probeRegisteredModels } from './models.js'
 import {
   activateFallback,
+  activeSelection,
   allocateEmployeeSessionId,
   deliverEmployee,
   employeeActivity,
@@ -572,6 +573,7 @@ export class CompanyRuntime {
     }, signal)
     let oldSessionId: string | undefined
     let reservationId: string | undefined
+    let handoff: { previousSessionId: string; openWork: string[] } | undefined
     const prepared = await this.store.transact(founder.session.header.cwd, {
       actor: 'founder', type: 'staffing.adjustment_applied', summary: `Applied HR adjustment ${requestId}`,
     }, (state) => {
@@ -581,6 +583,33 @@ export class CompanyRuntime {
       const approval = requireApproved(state, approvalId, 'organization_change', (payload) => isRecord(payload) && payload.action === 'adjust' && payload.staffingRequestId === request.id && payload.employeeId === request.employeeId)
       const employee = requireEmployee(state, request.employeeId)
       if (employee.isHr === true) throw new Error('HR self-adjustment requires a separately designated HR reviewer')
+      const unit = ensureOrgPath(state, recommendation.orgPath)
+      const position = ensurePosition(state, unit.id, recommendation.positionTitle, recommendation.responsibilities)
+      const personaUnchanged = employee.role === recommendation.positionTitle
+      const currentRoute = employee.llm === undefined ? undefined : activeSelection(employee.llm)
+      const nextRoute = activeSelection(selection)
+      const routeUnchanged = currentRoute !== undefined
+        && currentRoute.provider === nextRoute.provider
+        && currentRoute.model === nextRoute.model
+        && currentRoute.reasoningEffort === nextRoute.reasoningEffort
+      const nextBudget = recommendation.budgetMicros ?? employee.budgetMicros ?? 0
+      if (nextBudget > state.moneyBudget.totalMicros) throw new Error('employee monetary ceiling exceeds company budget')
+      // Budget-only adjustments keep the continuable session (and its whole
+      // conversation memory) alive: the ceiling is consulted at admission
+      // time, so bumping it live is safe. Only a route or persona change
+      // forces the retire-and-reprovision dance, because continuable
+      // descriptors freeze agentProvider/agentModel and persona at creation.
+      if (routeUnchanged && personaUnchanged && employee.status !== 'failed' && employee.sessionId !== undefined) {
+        employee.role = recommendation.positionTitle
+        employee.department = unit.name
+        employee.orgUnitId = unit.id
+        employee.positionId = position.id
+        employee.budgetMicros = nextBudget
+        request.status = 'applied'
+        request.updatedAt = Date.now()
+        consumeApproval(approval)
+        return structuredClone(employee)
+      }
       oldSessionId = employee.sessionId
       releaseEmployeeMoneyReservations(state, employee.id)
       for (const work of state.workItems) {
@@ -594,14 +623,14 @@ export class CompanyRuntime {
         work.reservationId = undefined
         work.leaseAt = undefined
       }
-      const unit = ensureOrgPath(state, recommendation.orgPath)
-      const position = ensurePosition(state, unit.id, recommendation.positionTitle, recommendation.responsibilities)
+      handoff = {
+        previousSessionId: employee.sessionId ?? 'unknown',
+        openWork: state.workItems.filter((work) => work.assigneeId === employee.id && work.status === 'pending').map((work) => `${work.id}: ${work.subject}`),
+      }
       employee.role = recommendation.positionTitle
       employee.department = unit.name
       employee.orgUnitId = unit.id
       employee.positionId = position.id
-      const nextBudget = recommendation.budgetMicros ?? employee.budgetMicros ?? 0
-      if (nextBudget > state.moneyBudget.totalMicros) throw new Error('employee monetary ceiling exceeds company budget')
       employee.budgetMicros = nextBudget
       employee.llm = selection
       employee.sessionId = allocateEmployeeSessionId()
@@ -613,6 +642,12 @@ export class CompanyRuntime {
       consumeApproval(approval)
       return structuredClone(employee)
     })
+    if (prepared.result.status !== 'provisioning') {
+      // Budget-only path: nothing was retired or requeued; the employee keeps
+      // its live continuable session and open attempt.
+      this.kick(founder.session.header.cwd, founder)
+      return prepared.result
+    }
     if (oldSessionId !== undefined) {
       const previous = { ...prepared.result, sessionId: oldSessionId }
       interruptEmployee(this.ctx, founder, previous)
@@ -620,7 +655,7 @@ export class CompanyRuntime {
       await this.store.recordRetiredSession(founder.session.header.cwd, oldSessionId)
     }
     try {
-      await startEmployee(this.ctx, this.config, this.selections, founder, prepared.state, prepared.result, signal ?? new AbortController().signal)
+      await startEmployee(this.ctx, this.config, this.selections, founder, prepared.state, prepared.result, signal ?? new AbortController().signal, handoff)
       const accepted = await this.store.transact(founder.session.header.cwd, {
         actor: 'scheduler', type: 'employee.reprovisioned', summary: `Employee ${prepared.result.id} accepted its adjusted route`,
       }, (state) => {
@@ -805,6 +840,7 @@ export class CompanyRuntime {
         approvalDependencies: replacements.approvalDependencies ?? work.approvalDependencies,
         assigneeId: replacements.assigneeId ?? work.assigneeId,
         eligibleEmployeeIds: replacements.eligibleEmployeeIds ?? work.eligibleEmployeeIds,
+        eligibleOrgUnitIds: replacements.eligibleOrgUnitIds ?? work.eligibleOrgUnitIds,
         inScope: replacements.inScope ?? work.inScope,
         outOfScope: replacements.outOfScope ?? work.outOfScope,
         acceptance: replacements.acceptance ?? work.acceptance,
@@ -960,7 +996,7 @@ export class CompanyRuntime {
     }, (state) => invalidateModelCatalog(state.modelCatalog, Date.now()))
   }
 
-  async requestGovernanceChange(founder: Agent, input: GovernanceChangeInput, expectedRevision?: number): Promise<ApprovalRequest> {
+  async requestGovernanceChange(founder: Agent, input: GovernanceChangeInput, expectedRevision?: number, source: 'tool' | 'ui' = 'tool'): Promise<ApprovalRequest> {
     const located = await this.requireFounder(founder)
     const expected = input.expectedGovernanceRevision ?? located.state.governanceRevision
     const payload: Record<string, JsonValue> = { expectedGovernanceRevision: expected }
@@ -974,14 +1010,16 @@ export class CompanyRuntime {
       detail: `Update ${Object.keys(payload).filter((key) => key !== 'expectedGovernanceRevision').join(', ')} at governance revision ${expected}. The new values take effect only after human approval.`,
       payload,
       risk: 'high',
-    }, expectedRevision)
+    }, expectedRevision, source)
   }
 
-  async requestBudgetChange(founder: Agent, input: BudgetChangeInput, expectedRevision?: number): Promise<ApprovalRequest[]> {
+  async requestBudgetChange(founder: Agent, input: BudgetChangeInput, expectedRevision?: number, source: 'tool' | 'ui' = 'tool'): Promise<ApprovalRequest[]> {
     this.assertAdmission()
     const located = await this.requireFounder(founder)
+    // A console (UI) request is itself a genuine human decision — the founder
+    // chat anchor is used when present but never required.
     const approvalUserMessage = latestGenuineUserMessage(founder)
-    if (approvalUserMessage === undefined) throw new Error('budget/pricing requests require a genuine founder-session user message anchor')
+    if (source === 'tool' && approvalUserMessage === undefined) throw new Error('budget/pricing requests require a genuine founder-session user message anchor')
     if (input.totalBudgetMicros === undefined && input.productBudgets === undefined && input.modelPrices === undefined) {
       throw new Error('budget change requires a company budget, product allocation, or price matrix change')
     }
@@ -1010,7 +1048,7 @@ export class CompanyRuntime {
           detail: `Adjust the company monetary ceiling and ${allocations.length} product allocation(s)${allocations.length === 0 ? '' : ` (${allocations.map((entry) => `${entry.id}: ${entry.budgetMicros}`).join(', ')})`}. Money stays fully reserved-first; existing usage is never rewritten.`,
           payload,
           risk: 'high',
-          requestedFromUserMessageId: String(approvalUserMessage.id),
+          ...(approvalUserMessage === undefined ? {} : { requestedFromUserMessageId: String(approvalUserMessage.id) }),
         }))
       }
       if (input.modelPrices !== undefined) {
@@ -1036,7 +1074,7 @@ export class CompanyRuntime {
             prices,
           },
           risk: 'high',
-          requestedFromUserMessageId: String(approvalUserMessage.id),
+          ...(approvalUserMessage === undefined ? {} : { requestedFromUserMessageId: String(approvalUserMessage.id) }),
         }))
       }
       return structuredClone(approvals)
@@ -1100,6 +1138,7 @@ export class CompanyRuntime {
     caller: Agent,
     input: { kind: ApprovalKind; summary: string; detail?: string; payload: JsonValue; risk?: 'low' | 'medium' | 'high'; expiresAt?: number },
     expectedRevision?: number,
+    source: 'tool' | 'ui' = 'tool',
   ): Promise<ApprovalRequest> {
     this.assertAdmission()
     validateApprovalPayload(input.kind, input.payload)
@@ -1108,7 +1147,7 @@ export class CompanyRuntime {
     const founder = located.actor.kind === 'founder' ? caller : this.liveFounder(located.state)
     if (founder === undefined) throw new Error('founder session must be live to anchor a later human approval decision')
     const latestUser = latestGenuineUserMessage(founder)
-    if (latestUser === undefined) throw new Error('approval requests require a current genuine founder-session user message anchor')
+    if (source === 'tool' && latestUser === undefined) throw new Error('approval requests require a current genuine founder-session user message anchor')
     const result = await this.store.transact(caller.session.header.cwd, {
       ...(expectedRevision === undefined ? {} : { expectedRevision }),
       actor: located.actor.id,
@@ -1506,10 +1545,10 @@ export class CompanyRuntime {
         await this.reprobeModels(founder, request.expectedRevision)
         break
       case 'request_governance_change':
-        await this.requestGovernanceChange(founder, action.input, request.expectedRevision)
+        await this.requestGovernanceChange(founder, action.input, request.expectedRevision, 'ui')
         break
       case 'request_budget_change':
-        await this.requestBudgetChange(founder, action.input, request.expectedRevision)
+        await this.requestBudgetChange(founder, action.input, request.expectedRevision, 'ui')
         break
       case 'grant_temporary_authorization':
         await this.grantTemporaryAuthorization(founder, action.input, request.expectedRevision)
@@ -2083,6 +2122,7 @@ function normalizeWorkPlan(workspace: string, input: CreateWorkInput): Omit<Work
     objective: normalizeString(input.objective, 'work objective', 32_768),
     ...(input.assigneeId === undefined ? {} : { assigneeId: input.assigneeId }),
     ...(input.eligibleEmployeeIds === undefined ? {} : { eligibleEmployeeIds: unique(input.eligibleEmployeeIds, 'eligible_employee_ids') }),
+    ...(input.eligibleOrgUnitIds === undefined ? {} : { eligibleOrgUnitIds: unique(input.eligibleOrgUnitIds, 'eligible_org_unit_ids') }),
     dependencies: unique(input.dependencies ?? [], 'dependencies'),
     ...(input.approvalDependencies === undefined ? {} : { approvalDependencies: unique(input.approvalDependencies, 'approval_dependencies') }),
     inScope,
@@ -2103,6 +2143,9 @@ function validateWorkReferences(state: CompanyState, work: Pick<WorkItem, 'produ
   for (const approvalId of work.approvalDependencies ?? []) if (!state.approvals.some((approval) => approval.id === approvalId)) throw new Error(`unknown approval dependency ${approvalId}`)
   if (work.assigneeId !== undefined && work.assigneeId !== 'founder') requireEmployee(state, work.assigneeId)
   for (const employeeId of work.eligibleEmployeeIds ?? []) requireEmployee(state, employeeId)
+  for (const unitId of (work as Pick<WorkItem, 'eligibleOrgUnitIds'>).eligibleOrgUnitIds ?? []) {
+    if (!state.orgUnits.some((unit) => unit.id === unitId)) throw new Error(`unknown eligible org unit ${unitId}`)
+  }
   if (work.kind === 'review') {
     if (work.reviewedWorkId === undefined) throw new Error('review work requires reviewed_work_id')
     const reviewed = state.workItems.find((candidate) => candidate.id === work.reviewedWorkId)

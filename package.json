@@ -1,6 +1,6 @@
 {
   "name": "dsh-company",
-  "version": "0.13.1",
+  "version": "0.15.0",
   "description": "Decision-driven AI company orchestration with HR governance, monetary budgets, model discovery, and deterministic audit for DeepSeek Harness",
   "type": "module",
   "main": "lib/index.js",

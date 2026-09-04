@@ -66,13 +66,35 @@ export function workBlockedReasons(state: CompanyState, work: WorkItem, employee
 export function canEmployeeOwn(state: CompanyState, work: WorkItem, employeeId: string): boolean {
   const employee = state.employees.find((candidate) => candidate.id === employeeId)
   if (employee === undefined || employee.status === 'retired' || employee.status === 'failed' || employee.status === 'paused') return false
+  // HR governance employees never receive ordinary work — their sole channel
+  // is staffing assessments and direct messages, both handled by the scheduler.
+  if (employee.isHr === true) return false
   if (work.assigneeId !== undefined && work.assigneeId !== employeeId) return false
   if ((work.eligibleEmployeeIds?.length ?? 0) > 0 && work.eligibleEmployeeIds?.includes(employeeId) !== true) return false
+  if ((work.eligibleOrgUnitIds?.length ?? 0) > 0) {
+    if (employee.orgUnitId === undefined) return false
+    const eligible = work.eligibleOrgUnitIds!.some((unitId) =>
+      unitId === employee.orgUnitId || isDescendantOrgUnit(state, employee.orgUnitId!, unitId))
+    if (!eligible) return false
+  }
   if (work.kind === 'review' && work.reviewedWorkId !== undefined) {
     const reviewed = state.workItems.find((candidate) => candidate.id === work.reviewedWorkId)
     if (reviewed?.assigneeId === employeeId) return false
   }
   return true
+}
+
+/** True when unitId is a strict descendant of ancestorId in the org tree. */
+export function isDescendantOrgUnit(state: Pick<CompanyState, 'orgUnits'>, unitId: string, ancestorId: string): boolean {
+  let current = state.orgUnits.find((unit) => unit.id === unitId)
+  const seen = new Set<string>()
+  while (current !== undefined && current.parentId !== undefined) {
+    if (seen.has(current.id)) return false
+    seen.add(current.id)
+    if (current.parentId === ancestorId) return true
+    current = state.orgUnits.find((unit) => unit.id === current!.parentId)
+  }
+  return false
 }
 
 export function selectReadyWork(state: CompanyState, employeeId: string, now = Date.now()): WorkItem | undefined {

@@ -371,7 +371,7 @@ export function assertCompanyState(value: unknown, expectedWorkspaceHash?: strin
     timestamp(raw.updatedAt, `products[${index}].updatedAt`)
     if (raw.releaseApprovalId !== undefined) stringMatches(raw.releaseApprovalId, `products[${index}].releaseApprovalId`, APPROVAL_ID)
   }
-  for (const [index, raw] of value.workItems.entries()) assertWork(raw, index, employeeIds, productIds, workIds, approvalIds, limits.maxAttemptsPerWork)
+  for (const [index, raw] of value.workItems.entries()) assertWork(raw, index, employeeIds, productIds, workIds, approvalIds, limits.maxAttemptsPerWork, orgUnitIds)
   const ticketRows: unknown[] = Array.isArray(value.tickets) ? value.tickets : []
   for (const [index, raw] of ticketRows.entries()) {
     if (!isRecord(raw)) throw new Error(`tickets[${index}] must be an object`)
@@ -916,12 +916,12 @@ function assertOperationalBlock(value: unknown, path: string): void {
   timestamp(value.at, `${path}.at`)
 }
 
-function assertWork(raw: unknown, index: number, employees: Set<string>, products: Set<string>, workIds: Set<string>, approvals: Set<string>, maxAttempts: number): void {
+function assertWork(raw: unknown, index: number, employees: Set<string>, products: Set<string>, workIds: Set<string>, approvals: Set<string>, maxAttempts: number, orgUnits?: Set<string>): void {
   if (!isRecord(raw)) throw new Error(`workItems[${index}] must be an object`)
   exactKeys(raw, [
     'id', 'productId', 'kind', 'subject', 'objective', 'status', 'assigneeId', 'eligibleEmployeeIds',
     'dependencies', 'approvalDependencies', 'inScope', 'outOfScope', 'acceptance', 'verify', 'deliverables',
-    'reviewedWorkId', 'ticketId', 'attempt', 'attemptId', 'handoffId', 'reassigning', 'reservationId', 'leaseAt',
+    'reviewedWorkId', 'ticketId', 'eligibleOrgUnitIds', 'attempt', 'attemptId', 'handoffId', 'reassigning', 'reservationId', 'leaseAt',
     'output', 'verdict', 'findings', 'evidence', 'attemptHistory', 'createdAt', 'updatedAt',
   ], `workItems[${index}]`)
   if (!products.has(String(raw.productId))) throw new Error(`workItems[${index}] references unknown product`)
@@ -947,6 +947,13 @@ function assertWork(raw: unknown, index: number, employees: Set<string>, product
     for (const id of raw.eligibleEmployeeIds as string[]) if (!employees.has(id)) throw new Error(`workItems[${index}] has unknown eligible employee ${id}`)
   }
   if (raw.ticketId !== undefined) stringMatches(raw.ticketId, `workItems[${index}].ticketId`, TICKET_ID)
+  if (raw.eligibleOrgUnitIds !== undefined) {
+    if (!Array.isArray(raw.eligibleOrgUnitIds)) throw new Error(`workItems[${index}].eligibleOrgUnitIds must be an array`)
+    for (const [ui, uid] of raw.eligibleOrgUnitIds.entries()) {
+      stringMatches(String(uid), `workItems[${index}].eligibleOrgUnitIds[${ui}]`, /^ou[1-9][0-9]*$/)
+      if (orgUnits !== undefined && !orgUnits.has(String(uid))) throw new Error(`workItems[${index}] references unknown eligible org unit ${String(uid)}`)
+    }
+  }
   if (raw.reviewedWorkId !== undefined) {
     stringMatches(raw.reviewedWorkId, `workItems[${index}].reviewedWorkId`, WORK_ID)
     if (!workIds.has(raw.reviewedWorkId)) throw new Error(`workItems[${index}] references unknown reviewed work ${raw.reviewedWorkId}`)
@@ -1139,7 +1146,7 @@ export function assertCompanyMessage(value: unknown): asserts value is CompanyMe
   plainString(value.to, 'message.to', 1, 128)
   plainString(value.content, 'message.content', 1, 131_072)
   timestamp(value.createdAt, 'message.createdAt')
-  enumValue(value.deliveryState, 'message.deliveryState', ['queued', 'reserved', 'accepted', 'read', 'held_budget'])
+  enumValue(value.deliveryState, 'message.deliveryState', ['queued', 'reserved', 'accepted', 'read', 'held_budget', 'dead'])
   if (value.reservationId !== undefined) stringMatches(value.reservationId, 'message.reservationId', UUID)
   if (value.leaseAt !== undefined) timestamp(value.leaseAt, 'message.leaseAt')
   if (value.acceptedAt !== undefined) timestamp(value.acceptedAt, 'message.acceptedAt')

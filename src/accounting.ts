@@ -323,7 +323,8 @@ function blockFromCode(code: string, message: string): OperationalBlock | undefi
         : ['AUTH', 'INVALID_CREDENTIAL', 'MISSING_CREDENTIAL', 'NO_ADAPTER', 'SERVER'].includes(code) ? 'provider'
           : code === 'COMPANY_MONEY_BUDGET' ? 'money_budget'
             : code === 'COMPANY_UNPRICED_MODEL' ? 'unpriced_model'
-              : code === 'COMPANY_TOKEN_BUDGET' ? 'token_budget'
+              : code === 'NOT_RESUMABLE' ? 'session_unrecoverable'
+            : code === 'COMPANY_TOKEN_BUDGET' ? 'token_budget'
                 : code === 'COMPANY_TURN_TOKEN_LIMIT' ? 'turn_limit'
               : undefined
   return kind === undefined ? undefined : { kind, code, message: message.slice(0, 4096), at: Date.now() }

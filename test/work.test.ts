@@ -1,7 +1,66 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { beginWorkAttempt, invalidateAttempt, StaleAttemptError, updateWork } from '../src/work.js'
+import { beginWorkAttempt, canEmployeeOwn, invalidateAttempt, isDescendantOrgUnit, selectReadyWork, StaleAttemptError, updateWork } from '../src/work.js'
 import { companyState } from './fixtures.js'
+
+
+test('HR employees are hard-denied from ordinary work dispatch', () => {
+  const state = companyState()
+  state.employees[0]!.isHr = true
+  state.workItems.push({ id: 'w1', productId: 'p1', kind: 'implementation', subject: 'S', objective: 'O', status: 'pending', dependencies: [], inScope: [], outOfScope: [], acceptance: ['a'], verify: [], deliverables: [], attempt: 0, attemptHistory: [], createdAt: 1, updatedAt: 1 })
+  state.counters.work = 1
+  const work = state.workItems[0]!
+  work.status = 'pending'
+  work.assigneeId = undefined
+  assert.equal(canEmployeeOwn(state, work, 'e1'), false, 'HR cannot own ordinary work')
+  // Even with explicit assignee_id pointing at HR, canEmployeeOwn rejects.
+  work.assigneeId = 'e1'
+  assert.equal(canEmployeeOwn(state, work, 'e1'), false, 'HR rejected even when directly assigned')
+  work.assigneeId = undefined
+  // Non-HR employee is fine.
+  state.employees.push({ ...state.employees[0]!, id: 'e2', isHr: false, sessionId: 'e2-session' })
+  assert.equal(canEmployeeOwn(state, work, 'e2'), true)
+  // selectReadyWork for HR returns undefined.
+  assert.equal(selectReadyWork(state, 'e1'), undefined)
+})
+
+test('org-unit scoped work only reaches employees in the subtree', () => {
+  const state = companyState()
+  state.workItems.push({ id: 'w1', productId: 'p1', kind: 'implementation', subject: 'S', objective: 'O', status: 'pending', dependencies: [], inScope: [], outOfScope: [], acceptance: ['a'], verify: [], deliverables: [], attempt: 0, attemptHistory: [], createdAt: 1, updatedAt: 1 })
+  state.counters.work = 1
+  // Build: ou1(company) > ou2(R&D) > ou3(Backend); ou4(Product)
+  state.orgUnits = [
+    { id: 'ou1', kind: 'company', name: 'Root', createdAt: 1 },
+    { id: 'ou2', kind: 'department', name: 'R&D', parentId: 'ou1', createdAt: 1 },
+    { id: 'ou3', kind: 'team', name: 'Backend', parentId: 'ou2', createdAt: 1 },
+    { id: 'ou4', kind: 'department', name: 'Product', parentId: 'ou1', createdAt: 1 },
+  ]
+  // e1: HR (root); e2: engineer in Backend(ou3); e3: PM in Product(ou4)
+  state.employees = [
+    { ...state.employees[0]!, id: 'e1', isHr: true, orgUnitId: 'ou1', sessionId: 's1', status: 'idle' },
+    { ...state.employees[0]!, id: 'e2', isHr: false, orgUnitId: 'ou3', sessionId: 's2', status: 'idle' },
+    { ...state.employees[0]!, id: 'e3', isHr: false, orgUnitId: 'ou4', sessionId: 's3', status: 'idle' },
+  ]
+  const work = state.workItems[0]!
+  work.status = 'pending'
+  work.assigneeId = undefined
+  work.eligibleEmployeeIds = undefined
+  work.eligibleOrgUnitIds = ['ou2'] // R&D subtree
+
+  assert.equal(canEmployeeOwn(state, work, 'e2'), true, 'Backend engineer (descendant of R&D) eligible')
+  assert.equal(canEmployeeOwn(state, work, 'e3'), false, 'Product PM (different subtree) rejected')
+  assert.equal(canEmployeeOwn(state, work, 'e1'), false, 'HR rejected')
+
+  // Unscoped work: non-HR anyone can claim.
+  work.eligibleOrgUnitIds = undefined
+  assert.equal(canEmployeeOwn(state, work, 'e3'), true)
+
+  // isDescendantOrgUnit sanity
+  assert.equal(isDescendantOrgUnit(state, 'ou3', 'ou2'), true)
+  assert.equal(isDescendantOrgUnit(state, 'ou3', 'ou1'), true)
+  assert.equal(isDescendantOrgUnit(state, 'ou4', 'ou2'), false)
+  assert.equal(isDescendantOrgUnit(state, 'ou2', 'ou2'), false, 'strict descendant only')
+})
 
 test('work attempt ids fence stale updates after reassignment', () => {
   const state = withImplementationWork()

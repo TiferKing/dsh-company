@@ -419,7 +419,8 @@ export interface SafeMessageView {
   to?: string
   content: string
   created_at: number
-  delivery_state: 'queued' | 'reserved' | 'accepted' | 'read' | 'held_budget'
+  attempts?: number
+  delivery_state: 'queued' | 'reserved' | 'accepted' | 'read' | 'held_budget' | 'dead'
   read_at?: number
 }
 
@@ -497,7 +498,7 @@ const ACTIVITY_STATES = ['idle', 'running', 'ready', 'cold', 'unavailable', 'ret
 const ORG_UNIT_KINDS = ['company', 'division', 'department', 'team'] as const
 const STAFFING_ACTIONS = ['hire', 'adjust', 'retire'] as const
 const STAFFING_STATUSES = ['pending', 'in_review', 'recommended', 'approved', 'rejected', 'applied'] as const
-const MESSAGE_STATES = ['queued', 'reserved', 'accepted', 'read', 'held_budget'] as const
+const MESSAGE_STATES = ['queued', 'reserved', 'accepted', 'read', 'held_budget', 'dead'] as const
 const VERDICTS = ['pass', 'needs_revision', 'reject'] as const
 const FINDING_SEVERITIES = ['low', 'medium', 'high', 'blocker'] as const
 const MODEL_PRICE_SOURCES = ['manual', 'catalog', 'legacy'] as const

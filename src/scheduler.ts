@@ -20,6 +20,7 @@ import {
   consumeTemporaryAuthorization,
   resolveAuthorizationAdmission,
 } from './authorizations.js'
+import { SubagentError } from '@deepseek-ai/dsh-subagent'
 import { deliverEmployee, untrustedParticipantMessage } from './employees.js'
 import { handleEmployeeOperationalFailure } from './accounting.js'
 import type { CompanyRuntime, SchedulerHandle } from './runtime.js'
@@ -28,6 +29,7 @@ import type { CompanyMessage, CompanyState, Employee, ResolvedCompanyConfig, Wor
 import { beginWorkAttempt, selectReadyWork, workBlockedReasons } from './work.js'
 
 const PREPARED_LEASE_MS = 60_000
+const BACKLOG_STEER_COOLDOWN_MS = 30 * 60_000
 
 export function installCompanyScheduler(
   ctx: Context,
@@ -36,6 +38,42 @@ export function installCompanyScheduler(
 ): SchedulerHandle {
   const queues = new Map<string, Promise<void>>()
   let disposed = false
+
+  const backlogSteeredAt = new Map<string, number>()
+  const steerBacklog = async (cwd: string, founder: Agent): Promise<void> => {
+    const state = await store.readActive(cwd)
+    if (state === undefined || state.phase !== 'operating') return
+    const pending = state.workItems.filter((work) => work.status === 'pending' && work.reassigning !== true && work.ticketId === undefined)
+    if (pending.length === 0) return
+    const nonHr = state.employees.filter((e) => e.status !== 'retired' && e.isHr !== true)
+    // Overload: more than 2× pending per active non-HR employee.
+    if (pending.length <= nonHr.length * 2) return
+    const last = backlogSteeredAt.get(cwd) ?? 0
+    const now = Date.now()
+    if (now - last < BACKLOG_STEER_COOLDOWN_MS) return
+    backlogSteeredAt.set(cwd, now)
+    // Identify the most-loaded org unit for actionable advice.
+    const byUnit = new Map<string, number>()
+    for (const work of pending) {
+      for (const unitId of work.eligibleOrgUnitIds ?? []) byUnit.set(unitId, (byUnit.get(unitId) ?? 0) + 1)
+    }
+    const hottest = [...byUnit.entries()].sort((a, b) => b[1] - a[1])[0]
+    const unitName = hottest === undefined ? '' : state.orgUnits.find((u) => u.id === hottest[0])?.name ?? ''
+    const text = [
+      'dsh-company backlog alert (authoritative record written by the dsh-company plugin).',
+      `${pending.length} work items are pending with only ${nonHr.length} active non-HR employee(s)`,
+      hottest === undefined ? '' : `; the most loaded scope is ${unitName} (${hottest[1]} items)`,
+      '. Consider requesting additional headcount via company_request_staffing so HR can assess and the human can approve.',
+    ].join('')
+    try {
+      founder.steer(createUserMessage({
+        content: [{ type: 'text', text }],
+        source: { kind: 'plugin', plugin: 'dsh-company' },
+      }))
+    } catch {
+      // Best-effort steer; cooldown prevents retry storms.
+    }
+  }
 
   const enqueue = async (cwd: string | undefined, suppliedFounder?: Agent): Promise<void> => {
     if (disposed || cwd === undefined) return
@@ -88,7 +126,13 @@ export function installCompanyScheduler(
         }
         if (live !== undefined && live.status !== 'idle') continue
         if (employee.status !== 'idle') continue
-        if (employee.isHr === true && await deliverOneStaffingRequest(cwd, founder, employee)) continue
+        if (employee.isHr === true) {
+          // HR governance employees handle staffing assessments and messages
+          // only — never ordinary work dispatch.
+          if (await deliverOneStaffingRequest(cwd, founder, employee)) continue
+          if (await deliverOneQueuedMessage(cwd, founder, employee)) continue
+          continue
+        }
         if (await deliverOneQueuedMessage(cwd, founder, employee)) continue
         await dispatchOne(cwd, founder, employee.id)
       } catch (error) {
@@ -104,6 +148,7 @@ export function installCompanyScheduler(
         }
       }
     }
+    await steerBacklog(cwd, founder)
   }
 
   const fanoutGovernanceNotifications = async (cwd: string): Promise<void> => {
@@ -256,9 +301,45 @@ export function installCompanyScheduler(
     }
   }
 
+  const MAX_DELIVERY_ATTEMPTS = 3
+
+  const steerSessionUnrecoverable = async (cwd: string, founder: Agent, employeeId: string, sessionErr: string): Promise<void> => {
+    const state = await store.readActive(cwd)
+    const employee = state?.employees.find((candidate) => candidate.id === employeeId)
+    if (employee === undefined) return
+    const text = [
+      'dsh-company session failure (authoritative record written by the dsh-company plugin).',
+      `Employee ${employee.name} (${employeeId}) has an unrecoverable continuable session: ${sessionErr.slice(0, 200)}`,
+      'The scheduler will skip this employee until corrected. If the session cannot be recovered, retire and re-hire through the HR staffing flow (company_request_staffing → company_remove_employee → company_add_employee) so the org tree and audit reflect the change.',
+    ].join(' ')
+    try {
+      founder.steer(createUserMessage({
+        content: [{ type: 'text', text }],
+        source: { kind: 'plugin', plugin: 'dsh-company' },
+      }))
+    } catch {
+      // Best-effort steer.
+    }
+  }
+
+  const markEmployeeSessionFailed = async (cwd: string, employeeId: string, message: string): Promise<void> => {
+    await store.transact(cwd, {
+      actor: 'scheduler', type: 'employee.session_unrecoverable',
+      summary: `Employee ${employeeId} continuable session is unrecoverable`,
+    }, (state) => {
+      const employee = state.employees.find((candidate) => candidate.id === employeeId)
+      if (employee === undefined || employee.status === 'retired') return
+      employee.status = 'failed'
+      employee.operationalBlock = { kind: 'session_unrecoverable', code: 'NOT_RESUMABLE', message: message.slice(0, 4096), at: Date.now() }
+    }).catch(() => undefined)
+  }
+
   const deliverOneQueuedMessage = async (cwd: string, founder: Agent, employee: Employee): Promise<boolean> => {
     const visible = await store.readMailbox(cwd, employee.id)
-    if (!visible.some((message) => message.deliveryState === 'queued' || message.deliveryState === 'held_budget')) return false
+    const queued = visible.filter((message) => message.deliveryState === 'queued' || message.deliveryState === 'held_budget')
+    // Skip messages that exceeded the retry limit.
+    const deliverable = queued.filter((message) => (message.attempts ?? 0) < MAX_DELIVERY_ATTEMPTS)
+    if (deliverable.length === 0) return false
     let prepared: CompanyMessage | undefined
     let reservationId: string | undefined
     try {
@@ -270,7 +351,7 @@ export function installCompanyScheduler(
         const currentEmployee = state.employees.find((candidate) => candidate.id === employee.id)
         if (currentEmployee === undefined || currentEmployee.status !== 'idle') return undefined
         const messages = await io.readMailbox(employee.id)
-        const message = messages.find((candidate) => candidate.deliveryState === 'queued' || candidate.deliveryState === 'held_budget')
+        const message = messages.find((candidate) => (candidate.deliveryState === 'queued' || candidate.deliveryState === 'held_budget') && (candidate.attempts ?? 0) < MAX_DELIVERY_ATTEMPTS)
         if (message === undefined) return undefined
         try {
           const now = Date.now()
@@ -292,9 +373,7 @@ export function installCompanyScheduler(
     }
     if (prepared === undefined || reservationId === undefined) return false
     try {
-      await deliverEmployee(ctx, founder, employee, `${untrustedParticipantMessage(prepared.from, prepared.id, prepared.content)}
-
-Handle this direct message only; do not claim unrelated work.`, new AbortController().signal)
+      await deliverEmployee(ctx, founder, employee, `${untrustedParticipantMessage(prepared.from, prepared.id, prepared.content)}\n\nHandle this direct message only; do not claim unrelated work.`, new AbortController().signal)
       await store.transact(cwd, {
         actor: 'scheduler',
         type: 'message.accepted',
@@ -307,26 +386,35 @@ Handle this direct message only; do not claim unrelated work.`, new AbortControl
           message.acceptedAt = Date.now()
           message.reservationId = undefined
           message.leaseAt = undefined
+          message.attempts = undefined
           await io.writeMailbox(employee.id, messages)
         }
       })
       return true
     } catch (error) {
+      const isSessionGone = error instanceof SubagentError && error.code === 'NOT_RESUMABLE'
+      const attempts = (prepared.attempts ?? 0) + 1
+      const dead = isSessionGone || attempts >= MAX_DELIVERY_ATTEMPTS
       await store.transact(cwd, {
         actor: 'scheduler',
         type: 'message.delivery_failed',
-        summary: `Queued message ${prepared.id} delivery failed: ${String(error)}`,
+        summary: `Queued message ${prepared.id} delivery failed (attempt ${attempts}/${MAX_DELIVERY_ATTEMPTS}${dead ? ', dead' : ''}): ${String(error)}`,
       }, async (state, io) => {
         releaseMoneyReservation(state, reservationId!)
         const messages = await io.readMailbox(employee.id)
         const message = messages.find((candidate) => candidate.id === prepared!.id)
         if (message !== undefined && message.reservationId === reservationId) {
-          message.deliveryState = 'queued'
           message.reservationId = undefined
           message.leaseAt = undefined
+          message.attempts = attempts
+          message.deliveryState = dead ? 'dead' : 'queued'
           await io.writeMailbox(employee.id, messages)
         }
       })
+      if (isSessionGone) {
+        await markEmployeeSessionFailed(cwd, employee.id, String(error))
+        await steerSessionUnrecoverable(cwd, founder, employee.id, String(error))
+      }
       return true
     }
   }
