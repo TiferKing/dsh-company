@@ -104,6 +104,26 @@ export function installCompanyScheduler(
     await fanoutGovernanceNotifications(cwd)
     state = await store.readActive(cwd) ?? state
     if (state.phase !== 'operating') return
+    // A stale model catalog (topology change, e.g. host restart) blocks all
+    // monetary admission. The recorded context windows are still valid for
+    // previously-known routes; clear the stale flag so employees can work,
+    // and steer the founder to run company_reprobe_models for any new routes.
+    if (state.modelCatalog.stale) {
+      try {
+        await store.transact(cwd, {
+          actor: 'scheduler', type: 'models.stale_cleared',
+          summary: 'Cleared stale model catalog after topology change; existing context windows remain valid',
+        }, (fresh) => { fresh.modelCatalog.stale = false })
+        try {
+          founder.steer(createUserMessage({
+            content: [{ type: 'text', text: 'dsh-company topology change notice (authoritative record). The model catalog was marked stale by a host restart or adapter change. The scheduler cleared the stale flag so existing routes keep working; run company_reprobe_models when convenient to discover any newly available models.' }],
+            source: { kind: 'plugin', plugin: 'dsh-company' },
+          }))
+        } catch { /* best-effort */ }
+      } catch (clearError) {
+        ctx.logger.warn(`dsh-company stale-catalog clear failed: ${String(clearError)}`)
+      }
+    }
     await deliverFounderMailbox(cwd, founder)
     for (const row of state.employees) {
       if (disposed) return
@@ -356,9 +376,13 @@ export function installCompanyScheduler(
         try {
           const now = Date.now()
           reservationId = reserveEmployeeTurn(state, currentEmployee, config, { messageId: message.id }, now)
-        } catch {
-          message.deliveryState = 'held_budget'
+        } catch (reserveError) {
+          // A stale catalog or exhausted budget must not loop forever: count
+          // the failed reservation toward the attempt limit too.
+          message.attempts = (message.attempts ?? 0) + 1
+          message.deliveryState = message.attempts >= MAX_DELIVERY_ATTEMPTS ? 'dead' : 'held_budget'
           await io.writeMailbox(employee.id, messages)
+          if (message.deliveryState === 'dead') return { ...structuredClone(message), _reserveError: String(reserveError) } as never
           return undefined
         }
         message.deliveryState = 'reserved'
