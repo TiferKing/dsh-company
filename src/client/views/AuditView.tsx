@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { CompanyTranslate } from '../locales.js'
-import type { CompanySnapshot, SafeModelPriceView, SafeMoneyUsageView } from '../types.js'
+import type { CompanySnapshot, SafeMoneyUsageView } from '../types.js'
 import { ChartIcon, ChevronIcon, InfoIcon, PackageIcon, WalletIcon, WarningIcon } from '../icons.js'
 import { decimalMoneyToUnits, microsToInput } from './OverviewView.js'
 import {
@@ -18,7 +18,7 @@ export interface AuditViewProps {
   locale: 'zh' | 'en'
   busy?: boolean
   canManageBudget?: boolean
-  onRequestBudgetChange?(payload: Record<string, unknown>): Promise<boolean>
+  onRequestBudgetChange?(payload: Record<string, unknown>, expectedRevision: number): Promise<boolean>
   onOpenApprovals?(): void
 }
 
@@ -67,7 +67,7 @@ function UsageEvent(props: {
   const route = `${item.provider}/${item.model}`
   const costLabel = item.priced
     ? formatMoneyMicros(item.cost_micros, snapshot.budget.currency, locale)
-    : item.authorization_id === undefined ? t('formation.unpriced') : t('audit.unknownCost')
+    : t('audit.unknownCost')
   const bodyId = `dsh-company-audit-${item.id.replace(/[^a-zA-Z0-9_-]/gu, '-')}`
   const references = [
     `usage:${item.id}`,
@@ -119,6 +119,7 @@ export function AuditView(props: AuditViewProps): React.JSX.Element {
   const [productBudgetDrafts, setProductBudgetDrafts] = useState<Record<string, string>>(() => Object.fromEntries(snapshot.products.map((product) => [product.id, microsToInput(product.budget_micros)])))
   const [budgetError, setBudgetError] = useState<string>()
   const budgetDirty = useRef(false)
+  const draftRevision = useRef(snapshot.revision)
   const previousCompanyId = useRef(snapshot.company.id)
   const lifetime = useMemo(
     () => [...budget.provider_model_aggregates].sort((left, right) => right.cost_micros - left.cost_micros || `${left.provider}/${left.model}`.localeCompare(`${right.provider}/${right.model}`)),
@@ -138,8 +139,10 @@ export function AuditView(props: AuditViewProps): React.JSX.Element {
     if (previousCompanyId.current !== snapshot.company.id) {
       previousCompanyId.current = snapshot.company.id
       budgetDirty.current = false
+      draftRevision.current = snapshot.revision
     }
     if (!budgetDirty.current) {
+      draftRevision.current = snapshot.revision
       setTotalBudgetDraft(microsToInput(budget.total_micros))
       setProductBudgetDrafts(Object.fromEntries(snapshot.products.map((product) => [product.id, microsToInput(product.budget_micros)])))
       setBudgetError(undefined)
@@ -154,13 +157,14 @@ export function AuditView(props: AuditViewProps): React.JSX.Element {
       return
     }
     setBudgetError(undefined)
-    budgetDirty.current = false
     const succeeded = await props.onRequestBudgetChange({
       total_budget: totalBudgetUnits,
       product_budgets: productBudgets.map((product) => ({ product_id: product.id, product_budget: product.budget })),
-    })
-    if (succeeded) props.onOpenApprovals?.()
-    else budgetDirty.current = true
+    }, draftRevision.current)
+    if (succeeded) {
+      budgetDirty.current = false
+      props.onOpenApprovals?.()
+    }
   }
   const windowEnd = budget.usage_detail.offset + budget.usage_detail.returned
   const windowLabel = budget.usage_detail.returned === 0
@@ -199,6 +203,12 @@ export function AuditView(props: AuditViewProps): React.JSX.Element {
         <label><span>{t('audit.companyBudget')}</span>{props.canManageBudget ? <input inputMode="decimal" value={totalBudgetDraft} onChange={(event) => { budgetDirty.current = true; setTotalBudgetDraft(event.currentTarget.value) }} /> : <strong>{formatMoneyMicros(budget.total_micros, budget.currency, locale)}</strong>}</label>
         {snapshot.products.map((product) => <label key={product.id}><span>{product.name}</span>{props.canManageBudget ? <input inputMode="decimal" value={productBudgetDrafts[product.id] ?? ''} onChange={(event) => { budgetDirty.current = true; setProductBudgetDrafts((current) => ({ ...current, [product.id]: event.currentTarget.value })) }} /> : <strong>{formatMoneyMicros(product.budget_micros, budget.currency, locale)}</strong>}</label>)}
       </div>
+      {budgetError === undefined ? null : <div className="dsh-company-banner dsh-company-section" data-tone="error" role="alert"><WarningIcon width="14" height="14" />{budgetError}</div>}
+      {props.canManageBudget && props.onRequestBudgetChange !== undefined ? (
+        <div className="dsh-company-inline-actions dsh-company-section">
+          <button type="button" className="dsh-company-action" data-variant="primary" disabled={busy || !budgetDirty.current} onClick={() => void requestBudgetChange()}>{t('audit.requestBudgetChange')}</button>
+        </div>
+      ) : null}
 
       <section className="dsh-company-card dsh-company-section">
         <div className="dsh-company-section__head">

@@ -1,5 +1,5 @@
 import type { Context } from '@deepseek-ai/cordis'
-import type { DiscoveredModelCapability, ModelCatalogState, ModelPrice3 } from './types.js'
+import type { DiscoveredModelCapability, ModelCatalogState } from './types.js'
 
 const MAX_ERRORS = 64
 const MAX_ERROR_CHARS = 2048
@@ -10,20 +10,22 @@ export async function probeRegisteredModels(
   signal?: AbortSignal,
   now = Date.now(),
 ): Promise<ModelCatalogState> {
+  signal?.throwIfAborted()
   const providers = ctx.llm.listProviders()
   const models: DiscoveredModelCapability[] = []
   const errors: Array<{ provider: string; message: string }> = []
   const seen = new Set<string>()
 
   const results = await Promise.allSettled(providers.map(async (provider) => {
-    const advertised = await ctx.llm.listModels(provider.id)
+    const advertised = await abortableProbe(() => ctx.llm.listModels(provider.id), signal)
     const rows: DiscoveredModelCapability[] = []
     for (const model of advertised) {
       if (signal?.aborted) throw signal.reason ?? new Error('model probe aborted')
       let resolved
       try {
-        resolved = await ctx.llm.resolveModelInfo(provider.id, model.id, signal)
+        resolved = await abortableProbe(() => ctx.llm.resolveModelInfo(provider.id, model.id, signal), signal)
       } catch (error) {
+        signal?.throwIfAborted()
         errors.push({ provider: provider.id, message: boundedError(`${model.id}: ${String(error)}`) })
       }
       const info = resolved ?? model
@@ -49,6 +51,7 @@ export async function probeRegisteredModels(
     }
     return rows
   }))
+  signal?.throwIfAborted()
 
   for (let index = 0; index < results.length; index += 1) {
     const provider = providers[index]!
@@ -76,7 +79,7 @@ export async function probeRegisteredModels(
       continue
     }
     try {
-      const resolved = await ctx.llm.resolveModelInfo(previousModel.provider, previousModel.model, signal)
+      const resolved = await abortableProbe(() => ctx.llm.resolveModelInfo(previousModel.provider, previousModel.model, signal), signal)
       models.push({
         provider: resolved.provider,
         model: resolved.id,
@@ -95,12 +98,14 @@ export async function probeRegisteredModels(
       })
       seen.add(key)
     } catch (error) {
+      signal?.throwIfAborted()
       errors.push({ provider: previousModel.provider, message: boundedError(`${previousModel.model}: ${String(error)}`) })
       models.push({ ...structuredClone(previousModel), advertised: false, available: false })
       seen.add(key)
     }
   }
 
+  signal?.throwIfAborted()
   return {
     stale: false,
     generation: previous.generation + 1,
@@ -110,17 +115,21 @@ export async function probeRegisteredModels(
   }
 }
 
-/** Preserve the independent price matrix while discovery updates model identity/capabilities. */
-export function mergeDiscoveredPriceRows(
-  existing: readonly ModelPrice3[],
-  _catalog: ModelCatalogState,
-  _pricingRevision: number,
-  _now: number,
-): ModelPrice3[] {
-  // Catalog-only routes remain visible through ModelCatalogState. Persisting an
-  // all-blank exact price row would make identity and pricing inseparable and
-  // could shadow a complete provider wildcard.
-  return existing.map((price) => structuredClone(price))
+/** Catalog discovery has no Host cancellation parameter; adapters may also
+ * ignore the optional exact-model signal. Cancel our wait in either case. */
+function abortableProbe<T>(operation: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+  signal?.throwIfAborted()
+  if (signal === undefined) return operation()
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => reject(signal.reason)
+    signal.addEventListener('abort', onAbort, { once: true })
+    Promise.resolve().then(() => {
+      signal.throwIfAborted()
+      return operation()
+    }).then(resolve, reject).finally(() => {
+      signal.removeEventListener('abort', onAbort)
+    })
+  })
 }
 
 export function invalidateModelCatalog(catalog: ModelCatalogState, now = Date.now()): void {

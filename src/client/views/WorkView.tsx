@@ -97,8 +97,9 @@ export function WorkView({ snapshot, t }: WorkViewProps): React.JSX.Element {
         <div className="dsh-company-work-list">
           {rows.map(({ item, incomplete, blocked }) => {
             const product = productById.get(item.product_id)
+            const hasContract = item.acceptance !== undefined || item.verify !== undefined || item.deliverables !== undefined
             const hasDetails = item.objective !== undefined || item.output_summary !== undefined ||
-              item.findings.length > 0 || item.evidence !== undefined
+              item.findings.length > 0 || item.evidence !== undefined || hasContract
             return (
               <article
                 className="dsh-company-card dsh-company-work"
@@ -174,13 +175,20 @@ export function WorkView({ snapshot, t }: WorkViewProps): React.JSX.Element {
                           <p>{item.output_summary}</p>
                         </section>
                       ) : null}
+                      {hasContract ? (
+                        <section>
+                          <h4>{t('work.contract')}</h4>
+                          <EvidenceList title={t('work.acceptance')} values={item.acceptance ?? []} />
+                          <EvidenceList title={t('work.commands')} values={item.verify ?? []} />
+                          <EvidenceList title={t('work.deliverables')} values={item.deliverables ?? []} />
+                        </section>
+                      ) : null}
                       {item.evidence !== undefined ? (
                         <section>
                           <h4>{t('work.evidence')}</h4>
                           <EvidenceList title={t('work.paths')} values={item.evidence.changed_paths} />
                           <EvidenceList title={t('work.acceptance')} values={item.evidence.acceptance_results} />
                           <EvidenceList title={t('work.commands')} values={item.evidence.commands_run} />
-                          <EvidenceList title={t('work.deliverables')} values={item.evidence.deliverables} />
                         </section>
                       ) : null}
                       {item.findings.length > 0 ? (

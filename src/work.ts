@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto'
+import { matchesGlob } from 'node:path'
 import { assertAcyclic } from './schemas.js'
 import { normalizeWorkspaceRelative } from './paths.js'
 import { resolveAuthorizationAdmission } from './authorizations.js'
@@ -27,6 +28,7 @@ function hasRequiredProtectedApproval(state: CompanyState, work: WorkItem): bool
 export function workBlockedReasons(state: CompanyState, work: WorkItem, employeeId?: string, now = Date.now()): string[] {
   const reasons: string[] = []
   if (state.phase !== 'operating') reasons.push(`company_${state.phase}`)
+  if (work.status === 'pending' && work.attempt >= state.limits.maxAttemptsPerWork) reasons.push('attempts_exhausted')
   const product = state.products.find((candidate) => candidate.id === work.productId)
   if (product === undefined) reasons.push('unknown_product')
   else if (product.status !== 'active' && product.status !== 'approved' && product.status !== 'validating') reasons.push(`product_${product.status}`)
@@ -127,6 +129,7 @@ export function beginWorkAttempt(state: CompanyState, work: WorkItem, assigneeId
   work.assigneeId = assigneeId
   work.handoffId = undefined
   work.reassigning = false
+  work.deliveryAttempts = 0
   work.output = undefined
   work.verdict = undefined
   work.findings = undefined
@@ -156,27 +159,33 @@ export function updateWork(
   if ((next === 'completed' || next === 'failed' || next === 'cancelled') && (output === undefined || output === '')) {
     throw new Error(`terminal work update ${next} requires non-empty output`)
   }
-  const changedPaths = input.changedPaths?.map((path, index) => normalizeWorkspaceRelative(workspace, path, `changed_paths[${index}]`, { allowGlob: false }))
+  // Updates are patches: evidence and review results may be reported over
+  // several progress calls before the terminal status is submitted.
+  const changedPaths = input.changedPaths?.map((path, index) => normalizeWorkspaceRelative(workspace, path, `changed_paths[${index}]`, { allowGlob: false })) ?? work.evidence?.changedPaths
+  const acceptanceResults = input.acceptanceResults === undefined ? work.evidence?.acceptanceResults : normalizeEvidence(input.acceptanceResults, 'acceptance_results')
+  const commandsRun = input.commandsRun === undefined ? work.evidence?.commandsRun : normalizeEvidence(input.commandsRun, 'commands_run')
+  const verdict = input.verdict ?? work.verdict
+  const findings = input.findings === undefined ? work.findings : normalizeFindings(input.findings)
   if (next === 'completed') validateCompletion(state, work, actorId, {
     output,
-    verdict: input.verdict,
-    findings: input.findings,
+    verdict,
+    findings,
     changedPaths,
-    acceptanceResults: input.acceptanceResults,
-    commandsRun: input.commandsRun,
+    acceptanceResults,
+    commandsRun,
   })
-  if (work.kind === 'review' && (input.verdict === 'needs_revision' || input.verdict === 'reject')) {
-    if ((input.findings?.length ?? 0) === 0) throw new Error(`${input.verdict} review requires findings`)
-    if (next === 'completed') throw new Error(`${input.verdict} review must fail rather than complete`)
+  if (work.kind === 'review' && (verdict === 'needs_revision' || verdict === 'reject')) {
+    if ((findings?.length ?? 0) === 0) throw new Error(`${verdict} review requires findings`)
+    if (next === 'completed') throw new Error(`${verdict} review must fail rather than complete`)
   }
   work.status = next
   work.output = output
-  if (input.verdict !== undefined) work.verdict = input.verdict
-  if (input.findings !== undefined) work.findings = normalizeFindings(input.findings)
+  if (verdict !== undefined) work.verdict = verdict
+  if (findings !== undefined) work.findings = findings
   work.evidence = {
     ...(changedPaths === undefined ? {} : { changedPaths }),
-    ...(input.acceptanceResults === undefined ? {} : { acceptanceResults: normalizeEvidence(input.acceptanceResults, 'acceptance_results') }),
-    ...(input.commandsRun === undefined ? {} : { commandsRun: normalizeEvidence(input.commandsRun, 'commands_run') }),
+    ...(acceptanceResults === undefined ? {} : { acceptanceResults }),
+    ...(commandsRun === undefined ? {} : { commandsRun }),
   }
   work.updatedAt = Date.now()
   if (next === 'failed' || next === 'cancelled') {
@@ -216,17 +225,20 @@ export function invalidateAttempt(work: WorkItem, nextAssignee: string | 'founde
   work.leaseAt = undefined
   work.handoffId = randomUUID()
   work.reassigning = true
+  work.deliveryAttempts = 0
   work.status = 'pending'
   work.assigneeId = nextAssignee
   work.output = undefined
   work.verdict = undefined
   work.findings = undefined
+  work.evidence = undefined
   work.updatedAt = Date.now()
   return work.handoffId
 }
 
 export function finishHandoff(work: WorkItem, handoffId: string): void {
   if (work.handoffId !== handoffId) throw new Error(`work ${work.id} handoff was superseded`)
+  work.handoffId = undefined
   work.reassigning = false
   work.updatedAt = Date.now()
 }
@@ -283,8 +295,7 @@ function validateCompletion(
 
 function matchesScope(scope: string, changed: string): boolean {
   if (!/[*?[\]{}!]/.test(scope)) return changed === scope || changed.startsWith(`${scope.replace(/\/$/, '')}/`)
-  const escaped = scope.replace(/[.+^$()|\\]/g, '\\$&').replace(/\*\*/g, '\u0000').replace(/\*/g, '[^/]*').replace(/\?/g, '[^/]').replace(/\u0000/g, '.*')
-  return new RegExp(`^${escaped}$`).test(changed)
+  return matchesGlob(changed, scope)
 }
 
 function normalizeFindings(findings: ReviewFinding[]): ReviewFinding[] {

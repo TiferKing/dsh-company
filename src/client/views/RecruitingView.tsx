@@ -12,7 +12,7 @@ export interface RecruitingViewProps {
   locale: 'zh' | 'en'
   busy?: boolean
   canManage?: boolean
-  onRequestModelPrices?(payload: Record<string, unknown>): Promise<boolean>
+  onRequestModelPrices?(payload: Record<string, unknown>, expectedRevision: number): Promise<boolean>
   onReprobe?(): Promise<boolean>
   onOpenApprovals?(): void
 }
@@ -24,12 +24,20 @@ export function RecruitingView(props: RecruitingViewProps): React.JSX.Element {
   const [priceRows, setPriceRows] = useState<PriceDraft[]>(() => buildPriceDrafts(snapshot))
   const [error, setError] = useState<string>()
   const pricesDirty = useRef(false)
+  const draftRevision = useRef(snapshot.revision)
+  const draftPricingRevision = useRef(snapshot.budget.pricing_revision)
   const previousCompanyId = useRef(snapshot.company.id)
 
   useEffect(() => {
     if (previousCompanyId.current !== snapshot.company.id) {
       previousCompanyId.current = snapshot.company.id
       pricesDirty.current = false
+      draftRevision.current = snapshot.revision
+      draftPricingRevision.current = snapshot.budget.pricing_revision
+    }
+    if (!pricesDirty.current) {
+      draftRevision.current = snapshot.revision
+      draftPricingRevision.current = snapshot.budget.pricing_revision
     }
     const fresh = buildPriceDrafts(snapshot)
     setPriceRows((current) => pricesDirty.current ? mergeModelPriceDrafts(current, fresh) : fresh)
@@ -63,13 +71,14 @@ export function RecruitingView(props: RecruitingViewProps): React.JSX.Element {
       return
     }
     setError(undefined)
-    pricesDirty.current = false
     const succeeded = await props.onRequestModelPrices({
       model_prices: modelPrices,
-      expected_pricing_revision: snapshot.budget.pricing_revision,
-    })
-    if (succeeded) props.onOpenApprovals?.()
-    else pricesDirty.current = true
+      expected_pricing_revision: draftPricingRevision.current,
+    }, draftRevision.current)
+    if (succeeded) {
+      pricesDirty.current = false
+      props.onOpenApprovals?.()
+    }
   }
 
   return (

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, mkdir, readFile, rm } from 'node:fs/promises'
+import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
@@ -114,6 +114,7 @@ test('archive releases money reservations and consumes the forced-archive approv
       fresh.counters.work = 1
       const reservationId = reserveMoneyTurn(fresh, { employeeId: 'e1', provider: 'mock', model: 'mock-model', workId: 'w1' })
       fresh.workItems[0]!.reservationId = reservationId
+      fresh.workItems[0]!.leaseAt = Date.now()
     })
     const before = await store.readActive(workspace)
     assert.equal(before?.moneyBudget.reservations.length, 1)
@@ -122,8 +123,6 @@ test('archive releases money reservations and consumes the forced-archive approv
     const archived = await store.archive(workspace, undefined, approval.id)
     assert.equal(archived.moneyBudget.reservations.length, 0)
     assert.equal(archived.moneyBudget.reservedMicros, 0)
-    assert.equal(archived.tokenBudget.reservations.length, 0)
-    assert.equal(archived.tokenBudget.reservedTokens, 0)
     assert.equal(archived.workItems[0]?.status, 'cancelled')
     assert.equal(archived.workItems[0]?.reservationId, undefined)
     assert.notEqual(archived.approvals[0]?.consumedAt, undefined)
@@ -153,6 +152,29 @@ test('a failed archive burns neither the approval nor the reservation', async ()
   }
 })
 
+test('archive destination collision is rejected before approval consumption', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'dsh-company-archive-collision-'))
+  const workspace = join(base, 'workspace')
+  await mkdir(workspace)
+  try {
+    const store = new CompanyStore(resolveConfig({ stateRoot: join(base, 'state') }))
+    const paths = await store.pathsForCwd(workspace)
+    const state = companyState({ workspaceHash: paths.workspace.sha256 })
+    const approval = createApproval(state, 'founder', { kind: 'forced_archive', summary: 'Force archive', payload: { reason: 'Collision test' } })
+    approval.status = 'approved'
+    approval.resolvedAt = Date.now()
+    await store.createStaged(workspace, state)
+    await mkdir(join(paths.archiveDir, state.id), { recursive: true })
+
+    await assert.rejects(() => store.archive(workspace, undefined, approval.id), /already exists/)
+    const active = await store.readActive(workspace)
+    assert.equal(active?.phase, 'operating')
+    assert.equal(active?.approvals[0]?.consumedAt, undefined)
+  } finally {
+    await rm(base, { recursive: true, force: true })
+  }
+})
+
 test('mailbox writes are staged and discarded when the mutation fails', async () => {
   const base = await mkdtemp(join(tmpdir(), 'dsh-company-mail-stage-'))
   const workspace = join(base, 'workspace')
@@ -174,6 +196,38 @@ test('mailbox writes are staged and discarded when the mutation fails', async ()
       assert.equal(read[0]?.content, 'hello', 'staged mailbox writes are visible to the same mutation')
     })
     assert.equal((await store.readMailbox(workspace, 'e1'))[0]?.content, 'hello')
+  } finally {
+    await rm(base, { recursive: true, force: true })
+  }
+})
+
+test('write-ahead journal completes a crash-interrupted state, audit, and mailbox commit', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'dsh-company-journal-recovery-'))
+  const workspace = join(base, 'workspace')
+  await mkdir(workspace)
+  try {
+    const store = new CompanyStore(resolveConfig({ stateRoot: join(base, 'state') }))
+    const paths = await store.pathsForCwd(workspace)
+    const initial = companyState({ workspaceHash: paths.workspace.sha256 })
+    await store.createStaged(workspace, initial)
+    const target = structuredClone(initial)
+    target.revision = 2
+    target.counters.event = 1
+    target.updatedAt = Date.now()
+    target.mission = 'Recovered journal mission.'
+    const message: CompanyMessage = { id: '550e8400-e29b-41d4-a716-446655440010', from: 'founder', to: 'e1', content: 'Recovered mailbox row', createdAt: Date.now(), deliveryState: 'queued' }
+    const auditContent = `${JSON.stringify({ schemaVersion: 1, id: 1, at: target.updatedAt, type: 'test.recovered', actor: 'founder', summary: 'Recovered transaction', revision: 2 })}\n`
+    await writeFile(paths.transactionFile, `${JSON.stringify({
+      schemaVersion: 1, workspaceHash: paths.workspace.sha256, baseRevision: 1,
+      state: target, auditContent, mailboxes: [{ participantId: 'e1', messages: [message] }],
+    }, null, 2)}\n`, { mode: 0o600 })
+
+    const recovered = await store.readActive(workspace)
+    assert.equal(recovered?.revision, 2)
+    assert.equal(recovered?.mission, 'Recovered journal mission.')
+    assert.equal((await store.readMailbox(workspace, 'e1'))[0]?.content, 'Recovered mailbox row')
+    assert.match(await readFile(paths.auditFile, 'utf8'), /test\.recovered/)
+    await assert.rejects(readFile(paths.transactionFile, 'utf8'), /ENOENT/)
   } finally {
     await rm(base, { recursive: true, force: true })
   }
@@ -251,8 +305,6 @@ test('an idle employee with open work is re-driven with the same attempt', async
     await store.transact(workspace, { actor: 'scheduler', type: 'test.idle', summary: 'idle event' }, (fresh) => {
       fresh.moneyBudget.reservations = []
       fresh.moneyBudget.reservedMicros = 0
-      fresh.tokenBudget.reservations = []
-      fresh.tokenBudget.reservedTokens = 0
       fresh.employees[0]!.status = 'idle'
     })
     employeeLive = { status: 'idle' }
@@ -298,6 +350,7 @@ test('factual usage beyond the reservation is persisted first and then halts the
       type: 'assistant/message', seq: 11, time: Date.now(),
       data: { turn: 1, step: 1, usage: { inputTokens: 90, outputTokens: 105 } },
     })
+    await handlers.get('session/flush')!(employee.session)
     const saved = await store.readActive(workspace)
     assert.equal(saved?.moneyBudget.usage.length, 1, 'overrun usage is preserved, never discarded')
     assert.equal(saved?.moneyBudget.spentMicros, 195)
@@ -307,7 +360,7 @@ test('factual usage beyond the reservation is persisted first and then halts the
     assert.equal(saved?.moneyBudget.reservations.length, 0)
     assert.equal(saved?.employees[0]?.status, 'paused')
     assert.notEqual(saved?.employees[0]?.operationalBlock, undefined)
-    dispose()
+    await dispose()
   } finally {
     await rm(base, { recursive: true, force: true })
   }

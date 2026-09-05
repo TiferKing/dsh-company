@@ -1,5 +1,4 @@
 import {
-  isCompanyLive,
   parseCompanySnapshot,
   type CompanyAction,
   type CompanyActionRequest,
@@ -8,11 +7,15 @@ import {
 
 const STATE_ROUTE = '/plugins/dsh-company/state'
 const ACTION_ROUTE = '/plugins/dsh-company/action'
-const MAX_RESPONSE_CHARS = 4 * 1024 * 1024
+const MAX_RESPONSE_CHARS = 16 * 1024 * 1024
 const DEFAULT_OPEN_POLL_MS = 1_000
 const DEFAULT_CLOSED_POLL_MS = 15_000
+const DEFAULT_REQUEST_TIMEOUT_MS = 15_000
+const DEFAULT_ACTION_TIMEOUT_MS = 30_000
 const MIN_POLL_MS = 500
 const MAX_POLL_MS = 60_000
+const MIN_TIMEOUT_MS = 1
+const MAX_TIMEOUT_MS = 120_000
 
 export interface CompanyUiState {
   sessionId: string | undefined
@@ -21,7 +24,6 @@ export interface CompanyUiState {
   open: boolean
   loading: boolean
   stale: boolean
-  lastSuccessfulAt: number | undefined
   networkError: string | undefined
   action: CompanyAction | undefined
   actionError: string | undefined
@@ -29,9 +31,10 @@ export interface CompanyUiState {
 
 export interface CompanyUiControllerOptions {
   fetch?: typeof globalThis.fetch
-  now?: () => number
   openPollMs?: number
   closedPollMs?: number
+  requestTimeoutMs?: number
+  actionTimeoutMs?: number
   actionTransport?: (request: CompanyActionRequest, signal: AbortSignal) => Promise<unknown>
 }
 
@@ -39,6 +42,10 @@ type Listener = () => void
 
 class NotFoundError extends Error {
   override readonly name = 'NotFoundError'
+}
+
+class RequestTimeoutError extends Error {
+  override readonly name = 'RequestTimeoutError'
 }
 
 class HttpResponseError extends Error {
@@ -60,6 +67,52 @@ function messageOf(error: unknown): string {
 function clampPoll(value: number): number {
   if (!Number.isFinite(value)) return DEFAULT_OPEN_POLL_MS
   return Math.min(MAX_POLL_MS, Math.max(MIN_POLL_MS, Math.round(value)))
+}
+
+function clampTimeout(value: number, fallback: number): number {
+  if (!Number.isFinite(value)) return fallback
+  return Math.min(MAX_TIMEOUT_MS, Math.max(MIN_TIMEOUT_MS, Math.round(value)))
+}
+
+function timeoutReason(signal: AbortSignal): RequestTimeoutError | undefined {
+  return signal.reason instanceof RequestTimeoutError ? signal.reason : undefined
+}
+
+function withTimeout<T>(
+  operation: Promise<T>,
+  controller: AbortController,
+  timeoutMs: number,
+  message: string,
+): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      const error = new RequestTimeoutError(`${message} timed out after ${timeoutMs}ms`)
+      controller.abort(error)
+      reject(error)
+    }, timeoutMs)
+    operation.then(
+      (value) => {
+        clearTimeout(timer)
+        resolve(value)
+      },
+      (error: unknown) => {
+        clearTimeout(timer)
+        reject(error)
+      },
+    )
+  })
+}
+
+function errorCodeFromJson(value: unknown): string | undefined {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return undefined
+  const input = value as Record<string, unknown>
+  if (typeof input.code === 'string') return input.code
+  if (typeof input.error === 'string') return input.error
+  if (input.error !== null && typeof input.error === 'object' && !Array.isArray(input.error)) {
+    const error = input.error as Record<string, unknown>
+    if (typeof error.code === 'string') return error.code
+  }
+  return undefined
 }
 
 function errorMessageFromJson(value: unknown, fallback: string): string {
@@ -111,17 +164,18 @@ export class CompanyUiController {
     open: false,
     loading: false,
     stale: false,
-    lastSuccessfulAt: undefined,
     networkError: undefined,
     action: undefined,
     actionError: undefined,
   })
 
   private readonly listeners = new Set<Listener>()
+  private readonly snapshotCache = new Map<string, { etag: string; snapshot: CompanySnapshot }>()
   private readonly fetcher: typeof globalThis.fetch
-  private readonly now: () => number
   private readonly openPollMs: number
   private readonly closedPollMs: number
+  private readonly requestTimeoutMs: number
+  private readonly actionTimeoutMs: number
   private readonly actionTransport: ((request: CompanyActionRequest, signal: AbortSignal) => Promise<unknown>) | undefined
   private visible = true
   private disposed = false
@@ -135,9 +189,10 @@ export class CompanyUiController {
 
   constructor(options: CompanyUiControllerOptions = {}) {
     this.fetcher = options.fetch ?? globalThis.fetch.bind(globalThis)
-    this.now = options.now ?? Date.now
     this.openPollMs = clampPoll(options.openPollMs ?? DEFAULT_OPEN_POLL_MS)
     this.closedPollMs = clampPoll(options.closedPollMs ?? DEFAULT_CLOSED_POLL_MS)
+    this.requestTimeoutMs = clampTimeout(options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS, DEFAULT_REQUEST_TIMEOUT_MS)
+    this.actionTimeoutMs = clampTimeout(options.actionTimeoutMs ?? DEFAULT_ACTION_TIMEOUT_MS, DEFAULT_ACTION_TIMEOUT_MS)
     this.actionTransport = options.actionTransport
   }
 
@@ -146,6 +201,7 @@ export class CompanyUiController {
     this.generation += 1
     this.cancelTimer()
     this.cancelRequest()
+    this.snapshotCache.clear()
     this.actionController?.abort()
     this.actionController = undefined
     this.returnFocus = null
@@ -156,7 +212,6 @@ export class CompanyUiController {
       open: false,
       loading: sessionId !== undefined,
       stale: false,
-      lastSuccessfulAt: undefined,
       networkError: undefined,
       action: undefined,
       actionError: undefined,
@@ -193,16 +248,20 @@ export class CompanyUiController {
     }
   }
 
-  clearActionError(): void {
-    if (this.state.actionError !== undefined) this.publish({ actionError: undefined })
-  }
-
   connectionReset(): void {
     if (this.disposed) return
     this.generation += 1
     this.cancelTimer()
     this.cancelRequest()
-    this.publish({ stale: this.state.snapshot !== undefined, networkError: undefined })
+    this.snapshotCache.clear()
+    this.actionController?.abort()
+    this.actionController = undefined
+    this.publish({
+      stale: this.state.snapshot !== undefined,
+      networkError: undefined,
+      action: undefined,
+      actionError: undefined,
+    })
     if (this.visible && this.state.sessionId !== undefined) void this.refresh('connection-reset')
   }
 
@@ -221,7 +280,7 @@ export class CompanyUiController {
     return promise
   }
 
-  async performAction(action: CompanyAction, payload: unknown): Promise<boolean> {
+  async performAction(action: CompanyAction, payload: unknown, expectedRevision?: number): Promise<boolean> {
     const { sessionId, snapshot } = this.state
     if (this.disposed || sessionId === undefined || snapshot === undefined || this.state.archived) return false
     if (this.state.action !== undefined) return false
@@ -235,17 +294,17 @@ export class CompanyUiController {
     const request: CompanyActionRequest = {
       sessionId,
       companyId: snapshot.company.id,
-      expectedRevision: snapshot.revision,
+      expectedRevision: expectedRevision ?? snapshot.revision,
       action,
       payload,
     }
     this.publish({ action, actionError: undefined, networkError: undefined })
 
     try {
-      let body: unknown
-      if (this.actionTransport !== undefined) {
-        body = await this.actionTransport(request, controller.signal)
-      } else {
+      const body = await withTimeout((async () => {
+        if (this.actionTransport !== undefined) {
+          return this.actionTransport(request, controller.signal)
+        }
         const response = await this.fetcher(ACTION_ROUTE, {
           method: 'POST',
           cache: 'no-store',
@@ -257,16 +316,21 @@ export class CompanyUiController {
           body: JSON.stringify(request),
           signal: controller.signal,
         })
-        body = await readResponseJson(response)
+        const responseBody = await readResponseJson(response)
         if (!response.ok) {
           throw new HttpResponseError(
             response.status,
-            errorMessageFromJson(body, `Company action failed (HTTP ${response.status})`),
+            errorMessageFromJson(responseBody, `Company action failed (HTTP ${response.status})`),
           )
         }
-      }
+        return responseBody
+      })(), controller, this.actionTimeoutMs, 'Company action')
       if (this.disposed || controller.signal.aborted || generation !== this.generation) return false
 
+      // A manual/visibility refresh may have started during the mutation.
+      // It cannot serve as the authoritative read after that mutation.
+      this.cancelRequest()
+      this.snapshotCache.clear()
       // A Host may return the next snapshot directly. Validate it before use,
       // then still repull: the HTTP state endpoint remains the presentation truth.
       if (body !== undefined) {
@@ -277,7 +341,6 @@ export class CompanyUiController {
               snapshot: next,
               archived: next.company.phase === 'archived',
               stale: false,
-              lastSuccessfulAt: this.now(),
             })
           }
         } catch {
@@ -291,14 +354,20 @@ export class CompanyUiController {
       this.schedule()
       return true
     } catch (error) {
-      if (controller.signal.aborted || this.disposed || generation !== this.generation) return false
-      const conflict = error instanceof HttpResponseError && error.status === 409
+      const timeout = timeoutReason(controller.signal)
+      if (this.disposed || generation !== this.generation) return false
+      if (controller.signal.aborted && timeout === undefined) return false
+      const failure = timeout ?? error
+      const conflict = failure instanceof HttpResponseError && failure.status === 409
       this.publish({
         action: undefined,
-        actionError: messageOf(error),
+        actionError: messageOf(failure),
         stale: this.state.snapshot !== undefined,
       })
-      if (conflict) await this.refresh('revision-conflict')
+      if (conflict) {
+        this.cancelRequest()
+        await this.refresh('revision-conflict')
+      }
       else this.schedule()
       return false
     } finally {
@@ -315,6 +384,7 @@ export class CompanyUiController {
     this.actionController?.abort()
     this.actionController = undefined
     this.returnFocus = null
+    this.snapshotCache.clear()
     this.listeners.clear()
   }
 
@@ -325,32 +395,35 @@ export class CompanyUiController {
       let snapshot: CompanySnapshot | undefined
       let archived = false
       try {
-        snapshot = await this.fetchSnapshot(sessionId, false, controller.signal)
+        snapshot = await this.fetchSnapshot(sessionId, false, controller)
       } catch (error) {
         if (!(error instanceof NotFoundError)) throw error
         try {
-          snapshot = await this.fetchSnapshot(sessionId, true, controller.signal)
+          snapshot = await this.fetchSnapshot(sessionId, true, controller)
           archived = snapshot !== undefined
         } catch (archiveError) {
           if (!(archiveError instanceof NotFoundError)) throw archiveError
         }
       }
 
+      const timeout = timeoutReason(controller.signal)
+      if (timeout !== undefined) throw timeout
       if (this.disposed || controller.signal.aborted || generation !== this.generation) return
       this.publish({
         snapshot,
         archived,
         loading: false,
         stale: false,
-        lastSuccessfulAt: this.now(),
         networkError: undefined,
       })
     } catch (error) {
-      if (this.disposed || controller.signal.aborted || generation !== this.generation) return
+      const timeout = timeoutReason(controller.signal)
+      if (this.disposed || generation !== this.generation) return
+      if (controller.signal.aborted && timeout === undefined) return
       this.publish({
         loading: false,
         stale: this.state.snapshot !== undefined,
-        networkError: messageOf(error),
+        networkError: messageOf(timeout ?? error),
       })
     } finally {
       if (this.request?.controller === controller) this.request = undefined
@@ -361,30 +434,49 @@ export class CompanyUiController {
   private async fetchSnapshot(
     sessionId: string,
     archived: boolean,
-    signal: AbortSignal,
+    controller: AbortController,
   ): Promise<CompanySnapshot> {
     const query = new URLSearchParams({
       sessionId,
       archived: archived ? '1' : '0',
     })
-    const response = await this.fetcher(`${STATE_ROUTE}?${query.toString()}`, {
-      cache: 'no-store',
-      credentials: 'same-origin',
-      headers: { accept: 'application/json' },
-      signal,
-    })
-    const body = await readResponseJson(response)
+    const cacheKey = `${sessionId}\u0000${archived ? 'archive' : 'active'}`
+    const cached = this.snapshotCache.get(cacheKey)
+    const { response, body } = await withTimeout((async () => {
+      const response = await this.fetcher(`${STATE_ROUTE}?${query.toString()}`, {
+        cache: 'no-cache',
+        credentials: 'same-origin',
+        headers: { accept: 'application/json', ...(cached === undefined ? {} : { 'if-none-match': cached.etag }) },
+        signal: controller.signal,
+      })
+      return { response, body: response.status === 304 ? undefined : await readResponseJson(response) }
+    })(), controller, this.requestTimeoutMs, 'Company request')
+    if (response.status === 304) {
+      if (cached === undefined) throw new Error('Host returned 304 without a matching cached company snapshot')
+      return cached.snapshot
+    }
+    // Validators belong to a successfully parsed representation, never to a
+    // failed response or to whichever snapshot happens to be on screen.
+    if (!controller.signal.aborted && this.state.sessionId === sessionId) this.snapshotCache.delete(cacheKey)
     const message = errorMessageFromJson(body, `Could not load company (HTTP ${response.status})`)
+    const code = errorCodeFromJson(body)
     if (
-      response.status === 404 ||
-      (response.status === 422 && message === 'no company exists for this workspace')
+      response.status === 404 && (
+        code === 'company_not_found' ||
+        (code === 'not_found' && message === 'no company exists for this workspace')
+      )
     ) {
       throw new NotFoundError('Company not found')
     }
     if (!response.ok) {
       throw new HttpResponseError(response.status, message)
     }
-    return parseCompanySnapshot(body)
+    const snapshot = parseCompanySnapshot(body)
+    const nextEtag = response.headers.get('etag')
+    if (nextEtag !== null && !controller.signal.aborted && this.state.sessionId === sessionId) {
+      this.snapshotCache.set(cacheKey, { etag: nextEtag, snapshot })
+    }
+    return snapshot
   }
 
   private schedule(): void {
@@ -393,7 +485,6 @@ export class CompanyUiController {
       this.disposed ||
       !this.visible ||
       this.state.sessionId === undefined ||
-      this.state.archived ||
       this.state.action !== undefined
     ) {
       return
@@ -401,15 +492,7 @@ export class CompanyUiController {
 
     const requested = this.state.snapshot?.poll_after_ms
     const fast = clampPoll(requested ?? this.openPollMs)
-    let delay: number
-    if (
-      this.state.open ||
-      (this.state.snapshot !== undefined && isCompanyLive(this.state.snapshot))
-    ) {
-      delay = fast
-    } else {
-      delay = Math.max(fast * 15, this.closedPollMs)
-    }
+    const delay = this.state.open && !this.state.archived ? fast : this.closedPollMs
     this.timer = setTimeout(() => {
       this.timer = undefined
       void this.refresh('poll')

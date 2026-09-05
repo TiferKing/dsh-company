@@ -41,7 +41,7 @@ test('store no-clobber create and revision-fenced mutation', async () => {
   }
 })
 
-test('archive revokes open capabilities and reconciles prepared credits', async () => {
+test('archive revokes open capabilities and reconciles money reservations', async () => {
   const base = await mkdtemp(join(tmpdir(), 'dsh-company-archive-'))
   const workspace = join(base, 'workspace')
   const { mkdir } = await import('node:fs/promises')

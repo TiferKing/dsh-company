@@ -71,7 +71,7 @@ export function createTemporaryAuthorization(
     id: `ta${state.counters.authorization}`,
     employeeId: input.employeeId,
     reason,
-    ...(input.approvalId === undefined ? {} : { approvalId: input.approvalId }),
+    approvalId: input.approvalId,
     authorizedBy: 'founder',
     startsAt,
     expiresAt: input.expiresAt,
@@ -125,20 +125,6 @@ export function waivableApprovalDependencies(state: CompanyState, work: WorkItem
   })
 }
 
-export function protectedApprovalDependencyReasons(state: CompanyState, work: WorkItem): string[] {
-  const waivable = new Set(waivableApprovalDependencies(state, work))
-  return (work.approvalDependencies ?? []).flatMap((approvalId) => {
-    const approval = state.approvals.find((candidate) => candidate.id === approvalId)
-    if (approval?.status === 'approved' || waivable.has(approvalId)) return []
-    return [`approval:${approvalId}:${approval?.status ?? 'missing'}`]
-  })
-}
-
-/** Monetary admission is an all-or-nothing fixed scope; there is no allowance or use limit. */
-export function authorizationCanCoverMoney(authorization: TemporaryAuthorization, requestedMicros: number, now: number): boolean {
-  return Number.isSafeInteger(requestedMicros) && requestedMicros >= 0 && isTemporaryAuthorizationActive(authorization, now)
-}
-
 export function consumeTemporaryAuthorization(
   authorization: TemporaryAuthorization,
   input: {
@@ -174,10 +160,6 @@ export function requireTemporaryAuthorization(state: CompanyState, id: string): 
   const authorization = state.temporaryAuthorizations.find((candidate) => candidate.id === id)
   if (authorization === undefined) throw new Error(`unknown temporary authorization ${id}`)
   return authorization
-}
-
-export function isProtectedApprovalKind(kind: ApprovalKind): boolean {
-  return !TEMP_AUTH_WAIVABLE_APPROVAL_KINDS.has(kind)
 }
 
 function assertTimestamp(value: number, label: string): void {

@@ -56,7 +56,7 @@ test('pause interrupts everyone, releases reservations, and requeues without att
     assert.equal(paused.phase, 'paused')
     assert.equal(paused.health.status, 'manual_pause')
     assert.equal(paused.employees[0]?.status, 'paused')
-    assert.equal(paused.tokenBudget.reservedTokens, 0)
+    assert.equal(paused.moneyBudget.reservations.length, 0)
     assert.equal(paused.workItems[0]?.status, 'pending')
     assert.equal(paused.workItems[0]?.attempt, 0)
     assert.equal(paused.workItems[0]?.attemptId, undefined)

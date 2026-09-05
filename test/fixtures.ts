@@ -1,10 +1,11 @@
 import { randomUUID } from 'node:crypto'
-import type { CompanyState } from '../src/types.js'
+import { createTemporaryAuthorization } from '../src/authorizations.js'
+import type { CompanyState, GrantTemporaryAuthorizationInput } from '../src/types.js'
 
 export function companyState(overrides: Partial<CompanyState> = {}): CompanyState {
   const now = Date.now()
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     revision: 1,
     id: `c_${randomUUID()}`,
     name: 'Example Company',
@@ -32,18 +33,6 @@ export function companyState(overrides: Partial<CompanyState> = {}): CompanyStat
       memberMaxDepth: 0,
     },
     counters: { employee: 1, product: 1, work: 0, approval: 0, event: 0, orgUnit: 2, position: 1, staffing: 0, authorization: 0, ticket: 0 },
-    budget: {
-      unit: 'activation-credit',
-      totalCredits: 100,
-      reservedCredits: 0,
-      spentCredits: 0,
-      warningAtCredits: 10,
-      entries: [],
-    },
-    tokenBudget: {
-      unit: 'token', currency: 'USD', totalTokens: 20_000_000, reservedTokens: 0, usedTokens: 0,
-      warningAtTokens: 2_000_000, totalCostMicros: 0, prices: [], usage: [], reservations: [],
-    },
     moneyBudget: {
       unit: 'micro-currency', currency: 'USD', totalMicros: 100_000_000, reservedMicros: 0, spentMicros: 0,
       warningAtMicros: 10_000_000, pricingRevision: 1,
@@ -64,7 +53,7 @@ export function companyState(overrides: Partial<CompanyState> = {}): CompanyStat
       id: 'e1',
       name: 'Engineer',
       role: 'Implement bounded work',
-      department: 'Engineering', orgUnitId: 'ou2', positionId: 'pos1', budgetMicros: 100_000_000,
+      orgUnitId: 'ou2', positionId: 'pos1', budgetMicros: 100_000_000,
       status: 'idle',
       sessionId: 'employee-session',
       joinedAt: now,
@@ -77,8 +66,6 @@ export function companyState(overrides: Partial<CompanyState> = {}): CompanyStat
       status: 'active',
       productRoot: 'product',
       successCriteria: ['All tests pass'],
-      budgetCredits: 90,
-      tokenBudget: 10_000_000,
       budgetMicros: 100_000_000,
       createdAt: now,
       updatedAt: now,
@@ -89,4 +76,31 @@ export function companyState(overrides: Partial<CompanyState> = {}): CompanyStat
     governanceNotifications: [],
     ...overrides,
   }
+}
+
+export function approvedTemporaryAuthorization(
+  state: CompanyState,
+  input: Omit<GrantTemporaryAuthorizationInput, 'approvalId'>,
+  limits: { maxMs: number },
+  now: number,
+) {
+  state.counters.approval += 1
+  const approvalId = `a${state.counters.approval}`
+  state.approvals.push({
+    id: approvalId,
+    kind: 'temporary_authorization',
+    status: 'approved',
+    requestedBy: 'founder',
+    summary: `Approve temporary authorization for ${input.employeeId}`,
+    payload: {
+      action: 'grant', employeeId: input.employeeId, reason: input.reason,
+      ...(input.startsAt === undefined ? {} : { startsAt: input.startsAt }), expiresAt: input.expiresAt,
+    },
+    risk: 'high',
+    requestedAt: now,
+    resolvedAt: now,
+    consumedAt: now,
+    resolution: { decision: 'approved', source: 'ui', humanStatement: 'Approved in test fixture.' },
+  })
+  return createTemporaryAuthorization(state, { ...input, approvalId }, limits, now)
 }

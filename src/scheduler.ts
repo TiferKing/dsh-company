@@ -24,20 +24,49 @@ import { SubagentError } from '@deepseek-ai/dsh-subagent'
 import { deliverEmployee, untrustedParticipantMessage } from './employees.js'
 import { handleEmployeeOperationalFailure } from './accounting.js'
 import type { CompanyRuntime, SchedulerHandle } from './runtime.js'
-import type { CompanyStore } from './state.js'
-import type { CompanyMessage, CompanyState, Employee, ResolvedCompanyConfig, WorkItem } from './types.js'
+import { makeMailboxRoom, type CompanyStore } from './state.js'
+import type { CompanyMessage, CompanyState, Employee, ResolvedCompanyConfig, StaffingRequest, WorkItem } from './types.js'
 import { beginWorkAttempt, selectReadyWork, workBlockedReasons } from './work.js'
 
 const PREPARED_LEASE_MS = 60_000
+const MAX_ATTEMPT_DELIVERIES = 3
+const STAFFING_REDELIVERY_COOLDOWN_MS = 5 * 60_000
 const BACKLOG_STEER_COOLDOWN_MS = 30 * 60_000
+const DELIVERY_RETRY_MS = 30_000
 
 export function installCompanyScheduler(
   ctx: Context,
   config: ResolvedCompanyConfig,
   store: CompanyStore,
+  runtime?: Pick<CompanyRuntime, 'recoverWorkspace' | 'reprobeModels'>,
 ): SchedulerHandle {
   const queues = new Map<string, Promise<void>>()
+  const lifecycle = new AbortController()
   let disposed = false
+  const workspaceKeys = new Map<string, string>()
+  const wakeups = new Map<string, { at: number; timer: ReturnType<typeof setTimeout> }>()
+
+  const clearWakeup = (key: string): void => {
+    const pending = wakeups.get(key)
+    if (pending !== undefined) clearTimeout(pending.timer)
+    wakeups.delete(key)
+  }
+
+  const scheduleWakeup = (cwd: string, delayMs: number): void => {
+    const key = workspaceKeys.get(cwd)
+    if (disposed || lifecycle.signal.aborted || key === undefined) return
+    const at = Date.now() + Math.max(1, delayMs)
+    if ((wakeups.get(key)?.at ?? Infinity) <= at) return
+    clearWakeup(key)
+    const timer = setTimeout(() => {
+      wakeups.delete(key)
+      // Resolve the currently live founder from Host state on every wake;
+      // a cached Agent must never revive an unloaded founder session.
+      void enqueue(cwd).catch((error) => ctx.logger.warn(`dsh-company scheduled wake failed: ${String(error)}`))
+    }, Math.max(1, delayMs))
+    timer.unref()
+    wakeups.set(key, { at, timer })
+  }
 
   const backlogSteeredAt = new Map<string, number>()
   const steerBacklog = async (cwd: string, founder: Agent): Promise<void> => {
@@ -76,10 +105,14 @@ export function installCompanyScheduler(
   }
 
   const enqueue = async (cwd: string | undefined, suppliedFounder?: Agent): Promise<void> => {
-    if (disposed || cwd === undefined) return
+    if (disposed || lifecycle.signal.aborted || cwd === undefined) return
     const key = (await store.pathsForCwd(cwd, false)).workspace.key
+    if (disposed || lifecycle.signal.aborted) return
+    workspaceKeys.set(cwd, key)
     const previous = queues.get(key) ?? Promise.resolve()
     const next = previous.catch(() => undefined).then(async () => {
+      if (lifecycle.signal.aborted) return
+      clearWakeup(key)
       await driveWorkspace(cwd, suppliedFounder)
     })
     queues.set(key, next)
@@ -91,37 +124,41 @@ export function installCompanyScheduler(
   }
 
   const driveWorkspace = async (cwd: string, suppliedFounder?: Agent): Promise<void> => {
+    if (lifecycle.signal.aborted) return
     let state = await store.readActive(cwd)
+    if (lifecycle.signal.aborted) return
     if (state === undefined) return
     const founder = suppliedFounder?.id === state.founderSessionId
       ? suppliedFounder
       : ctx.agents.get(SessionId(state.founderSessionId))
     if (founder === undefined || String(founder.id) !== state.founderSessionId) return
+    if (runtime !== undefined && (state.phase === 'provisioning' || state.employees.some((employee) => employee.status === 'provisioning') || state.workItems.some((work) => work.reassigning === true))) {
+      await runtime.recoverWorkspace(founder)
+      state = await store.readActive(cwd) ?? state
+    }
     await reconcileOrphanedTurnReservations(cwd, state)
+    if (lifecycle.signal.aborted) return
     state = await store.readActive(cwd) ?? state
     await reconcileExpiredPrepared(cwd, state)
+    if (lifecycle.signal.aborted) return
     state = await store.readActive(cwd) ?? state
     await fanoutGovernanceNotifications(cwd)
+    if (lifecycle.signal.aborted) return
     state = await store.readActive(cwd) ?? state
     if (state.phase !== 'operating') return
-    // A stale model catalog (topology change, e.g. host restart) blocks all
-    // monetary admission. The recorded context windows are still valid for
-    // previously-known routes; clear the stale flag so employees can work,
-    // and steer the founder to run company_reprobe_models for any new routes.
+    // Context windows and route availability are admission inputs. Never turn a
+    // stale topology marker off without re-probing the actual DSH registry.
     if (state.modelCatalog.stale) {
+      if (runtime === undefined) return
       try {
-        await store.transact(cwd, {
-          actor: 'scheduler', type: 'models.stale_cleared',
-          summary: 'Cleared stale model catalog after topology change; existing context windows remain valid',
-        }, (fresh) => { fresh.modelCatalog.stale = false })
-        try {
-          founder.steer(createUserMessage({
-            content: [{ type: 'text', text: 'dsh-company topology change notice (authoritative record). The model catalog was marked stale by a host restart or adapter change. The scheduler cleared the stale flag so existing routes keep working; run company_reprobe_models when convenient to discover any newly available models.' }],
-            source: { kind: 'plugin', plugin: 'dsh-company' },
-          }))
-        } catch { /* best-effort */ }
-      } catch (clearError) {
-        ctx.logger.warn(`dsh-company stale-catalog clear failed: ${String(clearError)}`)
+        await runtime.reprobeModels(founder, state.revision, lifecycle.signal)
+        if (lifecycle.signal.aborted) return
+        state = await store.readActive(cwd) ?? state
+      } catch (probeError) {
+        if (lifecycle.signal.aborted) return
+        ctx.logger.warn(`dsh-company automatic model reprobe failed: ${String(probeError)}`)
+        scheduleWakeup(cwd, DELIVERY_RETRY_MS)
+        return
       }
     }
     await deliverFounderMailbox(cwd, founder)
@@ -130,7 +167,7 @@ export function installCompanyScheduler(
       const fresh = await store.readActive(cwd)
       if (fresh === undefined || fresh.phase !== 'operating') return
       const employee = fresh.employees.find((candidate) => candidate.id === row.id)
-      if (employee === undefined || employee.status === 'retired' || employee.status === 'failed' || employee.operationalBlock !== undefined || employee.sessionId === undefined) continue
+      if (employee === undefined || !['idle', 'working'].includes(employee.status) || employee.operationalBlock !== undefined || employee.sessionId === undefined) continue
       const live = ctx.agents.get(SessionId(employee.sessionId))
       try {
         const open = fresh.workItems.find((work) => work.assigneeId === employee.id && (work.status === 'claimed' || work.status === 'in_progress'))
@@ -142,6 +179,14 @@ export function installCompanyScheduler(
           // update is re-driven with the SAME attempt instead of being stranded.
           if (live !== undefined && live.status === 'running') continue
           await recoverOpenAttempt(cwd, founder, employee, open)
+          continue
+        }
+        const staffingReview = employee.isHr === true
+          ? fresh.staffingRequests.find((request) => request.hrEmployeeId === employee.id && request.status === 'in_review')
+          : undefined
+        if (staffingReview !== undefined) {
+          if (live !== undefined && live.status === 'running') continue
+          await recoverStaffingAssessment(cwd, founder, employee, staffingReview)
           continue
         }
         if (live !== undefined && live.status !== 'idle') continue
@@ -169,6 +214,16 @@ export function installCompanyScheduler(
       }
     }
     await steerBacklog(cwd, founder)
+    const remaining = await store.readActive(cwd)
+    if (remaining?.phase !== 'operating') return
+    for (const request of remaining.staffingRequests) {
+      if (request.status !== 'pending' || request.lastDeliveredAt === undefined) continue
+      const employee = remaining.employees.find((candidate) => candidate.id === request.hrEmployeeId)
+      if (employee?.status !== 'idle' || employee.operationalBlock !== undefined || employee.sessionId === undefined) continue
+      const live = ctx.agents.get(SessionId(employee.sessionId))
+      if (live !== undefined && live.status !== 'idle') continue
+      scheduleWakeup(cwd, Math.max(DELIVERY_RETRY_MS, request.lastDeliveredAt + STAFFING_REDELIVERY_COOLDOWN_MS - Date.now()))
+    }
   }
 
   const fanoutGovernanceNotifications = async (cwd: string): Promise<void> => {
@@ -192,11 +247,7 @@ export function installCompanyScheduler(
         if (current === undefined || current.deliveredEmployeeIds.includes(employeeId) || !current.employeeIds.includes(employeeId)) return true
         const messages = await io.readMailbox(employeeId)
         if (!messages.some((message) => message.id === messageId)) {
-          while (messages.length >= state.limits.maxMailboxMessages) {
-            const disposable = messages.findIndex((message) => message.deliveryState === 'accepted' || message.deliveryState === 'read')
-            if (disposable < 0) return false
-            messages.splice(disposable, 1)
-          }
+          try { makeMailboxRoom(messages, state.limits.maxMailboxMessages) } catch { return false }
           messages.push({ id: messageId, from: 'founder', to: employeeId, content: current.content, createdAt: current.createdAt, deliveryState: 'queued' })
           await io.writeMailbox(employeeId, messages)
         }
@@ -216,7 +267,7 @@ export function installCompanyScheduler(
       && ctx.agents.get(SessionId(employee.sessionId)) === undefined)
     if (orphaned.length === 0) return
     await store.transact(cwd, {
-      actor: 'scheduler', type: 'tokens.orphan_released', summary: 'Released token reservations whose employee activation disappeared',
+      actor: 'scheduler', type: 'money.orphan_released', summary: 'Released monetary reservations whose employee activation disappeared',
     }, (state) => {
       for (const employee of orphaned) {
         const current = state.employees.find((candidate) => candidate.id === employee.id)
@@ -228,28 +279,57 @@ export function installCompanyScheduler(
 
   const reconcileExpiredPrepared = async (cwd: string, snapshot: CompanyState): Promise<void> => {
     const staleWork = snapshot.workItems.filter((work) => work.reservationId !== undefined && (work.leaseAt ?? 0) + PREPARED_LEASE_MS <= Date.now())
+    const staleStaffing = snapshot.staffingRequests.filter((request) => request.reservationId !== undefined && (request.leaseAt ?? 0) + PREPARED_LEASE_MS <= Date.now())
     const employees = snapshot.employees.filter((employee) => employee.sessionId !== undefined)
     let hasStaleMail = false
     for (const employee of employees) {
       const messages = await store.readMailbox(cwd, employee.id)
       if (messages.some((message) => message.deliveryState === 'reserved' && (message.leaseAt ?? 0) + PREPARED_LEASE_MS <= Date.now())) hasStaleMail = true
     }
-    if (staleWork.length === 0 && !hasStaleMail) return
+    if (staleWork.length === 0 && staleStaffing.length === 0 && !hasStaleMail) return
     await store.transact(cwd, {
       actor: 'scheduler',
       type: 'scheduler.recovered',
-      summary: 'Released crash-left token reservations and requeued prepared dispatches',
+      summary: 'Released crash-left monetary reservations and requeued prepared dispatches',
     }, async (state, io) => {
+      const recoveredEmployeeIds = new Set<string>()
+      const isEmployeeRunning = (employeeId: string | undefined): boolean => {
+        const employee = state.employees.find((candidate) => candidate.id === employeeId)
+        return employee?.sessionId !== undefined && ctx.agents.get(SessionId(employee.sessionId))?.status === 'running'
+      }
       for (const work of state.workItems) {
         if (work.reservationId === undefined || (work.leaseAt ?? 0) + PREPARED_LEASE_MS > Date.now()) continue
+        // A crash can occur after inbox acceptance and before its commit. The
+        // lease alone does not prove that a running child failed admission.
+        if (isEmployeeRunning(work.assigneeId)) continue
         releaseMoneyReservation(state, work.reservationId)
-        work.status = 'pending'
-        work.attempt = Math.max(0, work.attempt - 1)
-        work.attemptId = undefined
+        if (work.assigneeId !== undefined && work.assigneeId !== 'founder') recoveredEmployeeIds.add(work.assigneeId)
+        // Recovery preparations belong to an already accepted attempt. Keep
+        // its capability and progress when only the re-delivery lease expires.
+        if (work.status === 'claimed' && (work.deliveryAttempts ?? 0) === 0) {
+          work.status = 'pending'
+          work.attempt = Math.max(0, work.attempt - 1)
+          work.deliveryAttempts = 0
+          work.attemptId = undefined
+        }
         work.reservationId = undefined
         work.leaseAt = undefined
       }
+      for (const request of state.staffingRequests) {
+        if (request.reservationId === undefined || (request.leaseAt ?? 0) + PREPARED_LEASE_MS > Date.now()) continue
+        if (isEmployeeRunning(request.hrEmployeeId)) continue
+        releaseMoneyReservation(state, request.reservationId)
+        recoveredEmployeeIds.add(request.hrEmployeeId)
+        request.reservationId = undefined
+        request.leaseAt = undefined
+      }
+      for (const employeeId of recoveredEmployeeIds) {
+        const employee = state.employees.find((candidate) => candidate.id === employeeId)
+        const hasOtherOpenWork = state.workItems.some((work) => work.assigneeId === employeeId && (work.status === 'claimed' || work.status === 'in_progress'))
+        if (employee?.status === 'working' && !hasOtherOpenWork) employee.status = state.phase === 'operating' ? 'idle' : 'paused'
+      }
       for (const employee of state.employees) {
+        if (isEmployeeRunning(employee.id)) continue
         const messages = await io.readMailbox(employee.id)
         let changed = false
         for (const message of messages) {
@@ -289,12 +369,83 @@ export function installCompanyScheduler(
       })
     } catch {
       // Durable queued row remains for the next kick.
+      scheduleWakeup(cwd, DELIVERY_RETRY_MS)
+    }
+  }
+
+  const recoverStaffingAssessment = async (cwd: string, founder: Agent, employee: Employee, request: StaffingRequest): Promise<void> => {
+    if (request.attemptId === undefined) return
+    let reservationId: string | undefined
+    const prepared = await store.transact(cwd, {
+      actor: 'scheduler', type: 'staffing.recovery_prepared', summary: `Prepared staffing recovery ${request.id}`,
+    }, (state) => {
+      const current = state.staffingRequests.find((candidate) => candidate.id === request.id && candidate.status === 'in_review' && candidate.attemptId === request.attemptId)
+      const currentEmployee = state.employees.find((candidate) => candidate.id === employee.id && candidate.sessionId === employee.sessionId && ['idle', 'working'].includes(candidate.status) && candidate.operationalBlock === undefined)
+      if (state.phase !== 'operating' || current === undefined || currentEmployee === undefined) return 'superseded' as const
+      if ((current.reviewDeliveryAttempts ?? 1) >= MAX_ATTEMPT_DELIVERIES) {
+        releaseMoneyReservation(state, current.reservationId)
+        current.status = 'pending'
+        current.attemptId = undefined
+        current.reviewDeliveryAttempts = 0
+        current.lastDeliveredAt = Date.now()
+        current.reservationId = undefined
+        current.leaseAt = undefined
+        current.updatedAt = Date.now()
+        currentEmployee.status = 'idle'
+        return 'exhausted' as const
+      }
+      const now = Date.now()
+      reservationId = reserveEmployeeTurn(state, currentEmployee, { staffingRequestId: current.id }, now)
+      current.reservationId = reservationId
+      current.leaseAt = now
+      currentEmployee.status = 'working'
+      return 'ready' as const
+    })
+    if (prepared.result === 'exhausted') {
+      try {
+        founder.steer(createUserMessage({
+          content: [{ type: 'text', text: `dsh-company staffing supervision alert (authoritative record). HR assessment ${request.id} was reset after ${MAX_ATTEMPT_DELIVERIES} accepted prompts without a recommendation. It may be claimed again after review.` }],
+          source: { kind: 'plugin', plugin: 'dsh-company' },
+        }))
+      } catch { /* best-effort */ }
+      return
+    }
+    if (prepared.result !== 'ready' || reservationId === undefined) return
+    try {
+      await deliverEmployee(ctx, founder, employee, `dsh-company recovered staffing assessment ${request.id} after an interrupted HR turn. Continue the SAME assessment capability. Call company_claim_staffing_assessment for ${request.id}; it must return attempt_id=${request.attemptId}. Then submit the recommendation, or stop if the capability is stale.`, lifecycle.signal)
+      if (lifecycle.signal.aborted) return
+      await store.transact(cwd, { actor: 'scheduler', type: 'staffing.recovered', summary: `Recovered staffing assessment ${request.id}` }, (state) => {
+        const current = state.staffingRequests.find((candidate) => candidate.id === request.id && candidate.attemptId === request.attemptId)
+        if (current === undefined) throw new Error('staffing recovery was superseded')
+        current.reviewDeliveryAttempts = (current.reviewDeliveryAttempts ?? 1) + 1
+        if (current.reservationId === reservationId) {
+          current.reservationId = undefined
+          current.leaseAt = undefined
+        }
+      })
+    } catch (error) {
+      if (lifecycle.signal.aborted) return
+      await store.transact(cwd, { actor: 'scheduler', type: 'staffing.recovery_failed', summary: `Staffing recovery ${request.id} failed` }, (state) => {
+        releaseMoneyReservation(state, reservationId)
+        const current = state.staffingRequests.find((candidate) => candidate.id === request.id && candidate.reservationId === reservationId)
+        if (current !== undefined) {
+          current.reservationId = undefined
+          current.leaseAt = undefined
+        }
+        const currentEmployee = state.employees.find((candidate) => candidate.id === employee.id && candidate.sessionId === employee.sessionId)
+        if (currentEmployee?.status === 'working') currentEmployee.status = state.phase === 'operating' ? 'idle' : 'paused'
+      }).catch(() => undefined)
+      if (error instanceof SubagentError && error.code === 'NOT_RESUMABLE') {
+        await markEmployeeSessionFailed(cwd, employee, String(error))
+        await steerSessionUnrecoverable(cwd, founder, employee.id, String(error))
+      } else scheduleWakeup(cwd, DELIVERY_RETRY_MS)
+      ctx.logger.warn(`dsh-company staffing recovery ${request.id} failed: ${String(error)}`)
     }
   }
 
   const deliverOneStaffingRequest = async (cwd: string, founder: Agent, employee: Employee): Promise<boolean> => {
     const visible = await store.readActive(cwd)
-    const request = visible?.staffingRequests.find((candidate) => candidate.hrEmployeeId === employee.id && candidate.status === 'pending')
+    const request = visible?.staffingRequests.find((candidate) => candidate.hrEmployeeId === employee.id && candidate.status === 'pending' && (candidate.lastDeliveredAt ?? 0) + STAFFING_REDELIVERY_COOLDOWN_MS <= Date.now())
     if (visible === undefined || request === undefined) return false
     let reservationId: string | undefined
     try {
@@ -302,21 +453,49 @@ export function installCompanyScheduler(
         actor: 'scheduler', type: 'staffing.delivery_prepared', summary: `Prepared staffing assessment ${request.id}`,
       }, (state) => {
         if (state.phase !== 'operating') return false
-        const current = state.staffingRequests.find((candidate) => candidate.id === request.id && candidate.status === 'pending')
-        const currentEmployee = state.employees.find((candidate) => candidate.id === employee.id && candidate.status === 'idle' && candidate.operationalBlock === undefined)
+        const current = state.staffingRequests.find((candidate) => candidate.id === request.id && candidate.status === 'pending' && (candidate.lastDeliveredAt ?? 0) + STAFFING_REDELIVERY_COOLDOWN_MS <= Date.now())
+        const currentEmployee = state.employees.find((candidate) => candidate.id === employee.id && candidate.sessionId === employee.sessionId && candidate.status === 'idle' && candidate.operationalBlock === undefined)
         if (current === undefined || currentEmployee === undefined) return false
         const now = Date.now()
-        reservationId = reserveEmployeeTurn(state, currentEmployee, config, {}, now)
+        reservationId = reserveEmployeeTurn(state, currentEmployee, { staffingRequestId: current.id }, now)
+        current.reservationId = reservationId
+        current.leaseAt = now
         return true
       })
       if (!prepared.result || reservationId === undefined) return false
-      await deliverEmployee(ctx, founder, employee, `HR staffing assessment ${request.id} is ready. Action: ${request.action}. Work profile: ${request.workProfile}${request.constraints === undefined ? '' : `\nConstraints: ${request.constraints}`}\n\nClaim it with company_claim_staffing_assessment, assess difficulty, provider/model, reasoning effort, turn token limit, multi-level org path, position, and responsibilities, then submit through company_submit_staffing_assessment. Never calculate token usage or monetary cost.`, new AbortController().signal)
-      await store.transact(cwd, { actor: 'scheduler', type: 'staffing.delivered', summary: `Delivered staffing assessment ${request.id}` }, () => undefined)
+      const assessmentContract = request.action === 'retire'
+        ? 'Assess retirement difficulty, impact, and rationale. The Host derives the current route, budget, org path, position, and responsibilities; omit those fields.'
+        : 'Assess difficulty, provider/model, reasoning effort, monetary ceiling, multi-level org path, position, responsibilities, and whether this hire/adjustment should become the HR successor.'
+      await deliverEmployee(ctx, founder, employee, `HR staffing assessment ${request.id} is ready. Action: ${request.action}. Work profile: ${request.workProfile}${request.constraints === undefined ? '' : `\nConstraints: ${request.constraints}`}\n\nClaim it with company_claim_staffing_assessment. ${assessmentContract} Submit through company_submit_staffing_assessment. Never calculate token usage or monetary cost.`, lifecycle.signal)
+      if (lifecycle.signal.aborted) return false
+      await store.transact(cwd, { actor: 'scheduler', type: 'staffing.delivered', summary: `Delivered staffing assessment ${request.id}` }, (state) => {
+        const current = state.staffingRequests.find((candidate) => candidate.id === request.id)
+        if (current !== undefined) {
+          if (current.status === 'pending') current.lastDeliveredAt = Date.now()
+          if (current.reservationId === reservationId) {
+            current.reservationId = undefined
+            current.leaseAt = undefined
+          }
+        }
+      })
       return true
-    } catch {
+    } catch (error) {
+      if (lifecycle.signal.aborted) return false
       if (reservationId !== undefined) await store.transact(cwd, {
         actor: 'scheduler', type: 'staffing.delivery_failed', summary: `Staffing assessment ${request.id} delivery failed`,
-      }, (state) => { releaseMoneyReservation(state, reservationId) }).catch(() => undefined)
+      }, (state) => {
+        releaseMoneyReservation(state, reservationId)
+        const current = state.staffingRequests.find((candidate) => candidate.id === request.id && candidate.reservationId === reservationId)
+        if (current !== undefined) {
+          current.reservationId = undefined
+          current.leaseAt = undefined
+        }
+      }).catch(() => undefined)
+      if (error instanceof SubagentError && error.code === 'NOT_RESUMABLE') {
+        await markEmployeeSessionFailed(cwd, employee, String(error))
+        await steerSessionUnrecoverable(cwd, founder, employee.id, String(error))
+      } else if (!(error instanceof CompanyMoneyBudgetError) && !(error instanceof CompanyUnpricedModelError)) scheduleWakeup(cwd, DELIVERY_RETRY_MS)
+      if (error instanceof CompanyMoneyBudgetError || error instanceof CompanyUnpricedModelError) throw error
       return false
     }
   }
@@ -342,15 +521,16 @@ export function installCompanyScheduler(
     }
   }
 
-  const markEmployeeSessionFailed = async (cwd: string, employeeId: string, message: string): Promise<void> => {
+  const markEmployeeSessionFailed = async (cwd: string, failed: Employee, message: string): Promise<void> => {
     await store.transact(cwd, {
       actor: 'scheduler', type: 'employee.session_unrecoverable',
-      summary: `Employee ${employeeId} continuable session is unrecoverable`,
+      summary: `Employee ${failed.id} continuable session is unrecoverable`,
     }, (state) => {
-      const employee = state.employees.find((candidate) => candidate.id === employeeId)
-      if (employee === undefined || employee.status === 'retired') return
+      const employee = state.employees.find((candidate) => candidate.id === failed.id)
+      if (employee === undefined || employee.sessionId !== failed.sessionId || employee.status === 'retired') return
       employee.status = 'failed'
       employee.operationalBlock = { kind: 'session_unrecoverable', code: 'NOT_RESUMABLE', message: message.slice(0, 4096), at: Date.now() }
+      if (state.supportEmployeeId === employee.id) state.supportEmployeeId = undefined
     }).catch(() => undefined)
   }
 
@@ -362,6 +542,7 @@ export function installCompanyScheduler(
     if (deliverable.length === 0) return false
     let prepared: CompanyMessage | undefined
     let reservationId: string | undefined
+    let reserveFailure: unknown
     try {
       const transaction = await store.transact(cwd, {
         actor: 'scheduler',
@@ -369,20 +550,21 @@ export function installCompanyScheduler(
         summary: `Prepared queued mailbox delivery for ${employee.id}`,
       }, async (state, io) => {
         const currentEmployee = state.employees.find((candidate) => candidate.id === employee.id)
-        if (currentEmployee === undefined || currentEmployee.status !== 'idle') return undefined
+        if (state.phase !== 'operating' || currentEmployee === undefined || currentEmployee.sessionId !== employee.sessionId || currentEmployee.status !== 'idle' || currentEmployee.operationalBlock !== undefined) return undefined
         const messages = await io.readMailbox(employee.id)
         const message = messages.find((candidate) => (candidate.deliveryState === 'queued' || candidate.deliveryState === 'held_budget') && (candidate.attempts ?? 0) < MAX_DELIVERY_ATTEMPTS)
         if (message === undefined) return undefined
         try {
           const now = Date.now()
-          reservationId = reserveEmployeeTurn(state, currentEmployee, config, { messageId: message.id }, now)
+          reservationId = reserveEmployeeTurn(state, currentEmployee, { messageId: message.id }, now)
         } catch (reserveError) {
-          // A stale catalog or exhausted budget must not loop forever: count
-          // the failed reservation toward the attempt limit too.
-          message.attempts = (message.attempts ?? 0) + 1
-          message.deliveryState = message.attempts >= MAX_DELIVERY_ATTEMPTS ? 'dead' : 'held_budget'
+          // No delivery was attempted. Temporary admission failures must not
+          // exhaust transport retries or lose the message after a budget fix.
+          reserveFailure = reserveError
+          message.deliveryState = 'held_budget'
+          message.reservationId = undefined
+          message.leaseAt = undefined
           await io.writeMailbox(employee.id, messages)
-          if (message.deliveryState === 'dead') return { ...structuredClone(message), _reserveError: String(reserveError) } as never
           return undefined
         }
         message.deliveryState = 'reserved'
@@ -395,9 +577,11 @@ export function installCompanyScheduler(
     } catch {
       return false
     }
+    if (reserveFailure !== undefined) throw reserveFailure
     if (prepared === undefined || reservationId === undefined) return false
     try {
-      await deliverEmployee(ctx, founder, employee, `${untrustedParticipantMessage(prepared.from, prepared.id, prepared.content)}\n\nHandle this direct message only; do not claim unrelated work.`, new AbortController().signal)
+      await deliverEmployee(ctx, founder, employee, `${untrustedParticipantMessage(prepared.from, prepared.id, prepared.content)}\n\nHandle this direct message only; do not claim unrelated work.`, lifecycle.signal)
+      if (lifecycle.signal.aborted) return true
       await store.transact(cwd, {
         actor: 'scheduler',
         type: 'message.accepted',
@@ -416,6 +600,7 @@ export function installCompanyScheduler(
       })
       return true
     } catch (error) {
+      if (lifecycle.signal.aborted) return true
       const isSessionGone = error instanceof SubagentError && error.code === 'NOT_RESUMABLE'
       const attempts = (prepared.attempts ?? 0) + 1
       const dead = isSessionGone || attempts >= MAX_DELIVERY_ATTEMPTS
@@ -436,9 +621,9 @@ export function installCompanyScheduler(
         }
       })
       if (isSessionGone) {
-        await markEmployeeSessionFailed(cwd, employee.id, String(error))
+        await markEmployeeSessionFailed(cwd, employee, String(error))
         await steerSessionUnrecoverable(cwd, founder, employee.id, String(error))
-      }
+      } else if (!dead) scheduleWakeup(cwd, DELIVERY_RETRY_MS)
       return true
     }
   }
@@ -456,7 +641,7 @@ export function installCompanyScheduler(
     }, (state) => {
       if (state.phase !== 'operating') return undefined
       const employee = state.employees.find((candidate) => candidate.id === employeeId)
-      if (employee === undefined || employee.status !== 'idle' || employee.sessionId === undefined) return undefined
+      if (employee === undefined || employee.status !== 'idle' || employee.operationalBlock !== undefined || employee.sessionId === undefined) return undefined
       const live = ctx.agents.get(SessionId(employee.sessionId))
       if (live !== undefined && live.status !== 'idle') return undefined
       const now = Date.now()
@@ -464,7 +649,7 @@ export function installCompanyScheduler(
       if (work === undefined) return undefined
       previousAssignee = work.assigneeId
       const attemptId = beginWorkAttempt(state, work, employee.id, now)
-      reservationId = reserveAuthorizedWorkTurn(state, employee, work, config, now)
+      reservationId = reserveAuthorizedWorkTurn(state, employee, work, now)
       work.reservationId = reservationId
       work.leaseAt = now
       employee.status = 'working'
@@ -474,18 +659,23 @@ export function installCompanyScheduler(
     const { work, employee, attemptId } = prepared.result
     try {
       const currentGovernance = await store.readActive(cwd)
-      await deliverEmployee(ctx, founder, employee, assignmentPrompt(currentGovernance ?? visible, work, attemptId), new AbortController().signal)
+      await deliverEmployee(ctx, founder, employee, assignmentPrompt(currentGovernance ?? visible, work, attemptId), lifecycle.signal)
+      if (lifecycle.signal.aborted) return
       await store.transact(cwd, {
         actor: 'scheduler',
         type: 'work.dispatched',
         summary: `Work ${work.id} attempt ${work.attempt} accepted by ${employee.id}`,
       }, (state) => {
         const current = state.workItems.find((candidate) => candidate.id === work.id)
-        if (current?.attemptId !== attemptId || current.reservationId !== reservationId) throw new Error('work dispatch was superseded before acceptance commit')
-        current.reservationId = undefined
-        current.leaseAt = undefined
+        if (current?.attemptId !== attemptId || (current.reservationId !== undefined && current.reservationId !== reservationId)) throw new Error('work dispatch was superseded before acceptance commit')
+        current.deliveryAttempts = (current.deliveryAttempts ?? 0) + 1
+        if (current.reservationId === reservationId) {
+          current.reservationId = undefined
+          current.leaseAt = undefined
+        }
       })
     } catch (error) {
+      if (lifecycle.signal.aborted) return
       await store.transact(cwd, {
         actor: 'scheduler',
         type: 'work.dispatch_rejected',
@@ -496,14 +686,19 @@ export function installCompanyScheduler(
         releaseMoneyReservation(state, reservationId!)
         current.status = 'pending'
         current.attempt = Math.max(0, current.attempt - 1)
+        current.deliveryAttempts = 0
         current.attemptId = undefined
         current.reservationId = undefined
         current.leaseAt = undefined
         current.assigneeId = previousAssignee
         current.updatedAt = Date.now()
-        const currentEmployee = state.employees.find((candidate) => candidate.id === employee.id)
-        if (currentEmployee !== undefined && currentEmployee.status !== 'retired') currentEmployee.status = 'idle'
+        const currentEmployee = state.employees.find((candidate) => candidate.id === employee.id && candidate.sessionId === employee.sessionId)
+        if (currentEmployee?.status === 'working') currentEmployee.status = state.phase === 'operating' ? 'idle' : 'paused'
       })
+      if (error instanceof SubagentError && error.code === 'NOT_RESUMABLE') {
+        await markEmployeeSessionFailed(cwd, employee, String(error))
+        await steerSessionUnrecoverable(cwd, founder, employee.id, String(error))
+      } else scheduleWakeup(cwd, DELIVERY_RETRY_MS)
       ctx.logger.warn(`dsh-company dispatch ${work.id} to ${employee.id} failed: ${String(error)}`)
     }
   }
@@ -518,13 +713,27 @@ export function installCompanyScheduler(
     }, (state) => {
       const current = state.workItems.find((candidate) => candidate.id === work.id)
       const currentEmployee = state.employees.find((candidate) => candidate.id === employee.id)
-      if (current === undefined || current.attemptId !== work.attemptId || currentEmployee === undefined || currentEmployee.status === 'retired') return 'superseded' as const
+      if (state.phase !== 'operating' || current === undefined || current.attemptId !== work.attemptId || currentEmployee === undefined || currentEmployee.sessionId !== employee.sessionId || !['idle', 'working'].includes(currentEmployee.status) || currentEmployee.operationalBlock !== undefined) return 'superseded' as const
       const now = Date.now()
+      if ((current.deliveryAttempts ?? 0) >= MAX_ATTEMPT_DELIVERIES) {
+        releaseMoneyReservation(state, current.reservationId)
+        const output = `Attempt stopped after ${MAX_ATTEMPT_DELIVERIES} accepted assignment prompts without a terminal company_update_work.`
+        current.attemptHistory.push({ attempt: current.attempt, assigneeId: currentEmployee.id, status: 'failed', output, closedAt: now })
+        current.status = 'failed'
+        current.output = output
+        current.attemptId = undefined
+        current.reservationId = undefined
+        current.leaseAt = undefined
+        current.updatedAt = now
+        currentEmployee.status = 'idle'
+        return 'exhausted' as const
+      }
       const blockers = workBlockedReasons(state, current, currentEmployee.id, now).filter((reason) => reason !== 'open_work_cap')
       if (blockers.length > 0) {
         releaseMoneyReservation(state, current.reservationId)
         current.status = 'pending'
         current.attempt = Math.max(0, current.attempt - 1)
+        current.deliveryAttempts = 0
         current.attemptId = undefined
         current.reservationId = undefined
         current.leaseAt = undefined
@@ -532,27 +741,41 @@ export function installCompanyScheduler(
         currentEmployee.status = 'idle'
         return 'blocked' as const
       }
-      reservationId = reserveAuthorizedWorkTurn(state, currentEmployee, current, config, now)
+      reservationId = reserveAuthorizedWorkTurn(state, currentEmployee, current, now)
       current.reservationId = reservationId
       current.leaseAt = now
       currentEmployee.status = 'working'
       return 'ready' as const
     })
+    if (prepared.result === 'exhausted') {
+      try {
+        founder.steer(createUserMessage({
+          content: [{ type: 'text', text: `dsh-company work supervision alert (authoritative record). Work ${work.id} attempt ${work.attempt} stopped after ${MAX_ATTEMPT_DELIVERIES} accepted prompts without a terminal update. Review the employee transcript, then explicitly reassign or replace the work.` }],
+          source: { kind: 'plugin', plugin: 'dsh-company' },
+        }))
+      } catch { /* best-effort */ }
+      return
+    }
     if (prepared.result !== 'ready' || reservationId === undefined) return
     try {
       const currentGovernance = await store.readActive(cwd)
-      await deliverEmployee(ctx, founder, employee, recoveryPrompt(currentGovernance ?? prepared.state, work), new AbortController().signal)
+      await deliverEmployee(ctx, founder, employee, recoveryPrompt(currentGovernance ?? prepared.state, work), lifecycle.signal)
+      if (lifecycle.signal.aborted) return
       await store.transact(cwd, {
         actor: 'scheduler',
         type: 'work.recovered',
         summary: `Recovered ${work.id} attempt ${work.attempt} with the same capability`,
       }, (state) => {
         const current = state.workItems.find((candidate) => candidate.id === work.id)
-        if (current === undefined || current.attemptId !== work.attemptId || current.reservationId !== reservationId) throw new Error('recovery attempt was superseded')
-        current.reservationId = undefined
-        current.leaseAt = undefined
+        if (current === undefined || current.attemptId !== work.attemptId || (current.reservationId !== undefined && current.reservationId !== reservationId)) throw new Error('recovery attempt was superseded')
+        current.deliveryAttempts = (current.deliveryAttempts ?? 0) + 1
+        if (current.reservationId === reservationId) {
+          current.reservationId = undefined
+          current.leaseAt = undefined
+        }
       })
     } catch (error) {
+      if (lifecycle.signal.aborted) return
       await store.transact(cwd, {
         actor: 'scheduler',
         type: 'work.recovery_failed',
@@ -560,16 +783,22 @@ export function installCompanyScheduler(
       }, (state) => {
         const current = state.workItems.find((candidate) => candidate.id === work.id)
         if (current === undefined || current.attemptId !== work.attemptId || current.reservationId !== reservationId) return
+        releaseMoneyReservation(state, reservationId)
         current.reservationId = undefined
         current.leaseAt = undefined
-        const currentEmployee = state.employees.find((candidate) => candidate.id === employee.id)
-        if (currentEmployee !== undefined && currentEmployee.status !== 'retired') currentEmployee.status = 'idle'
+        const currentEmployee = state.employees.find((candidate) => candidate.id === employee.id && candidate.sessionId === employee.sessionId)
+        if (currentEmployee?.status === 'working') currentEmployee.status = state.phase === 'operating' ? 'idle' : 'paused'
       })
+      if (error instanceof SubagentError && error.code === 'NOT_RESUMABLE') {
+        await markEmployeeSessionFailed(cwd, employee, String(error))
+        await steerSessionUnrecoverable(cwd, founder, employee.id, String(error))
+      } else scheduleWakeup(cwd, DELIVERY_RETRY_MS)
       ctx.logger.warn(`dsh-company cold recovery ${work.id} failed: ${String(error)}`)
     }
   }
 
   const syncEmployeeStatus = async (agent: Agent, status: 'idle' | 'running'): Promise<void> => {
+    if (disposed || lifecycle.signal.aborted) return
     const cwd = agent.session.header.cwd
     if (cwd === undefined) return
     const located = await store.readActive(cwd)
@@ -582,7 +811,7 @@ export function installCompanyScheduler(
       summary: `Employee ${employee.id} became ${status}`,
     }, (state) => {
       const current = state.employees.find((candidate) => candidate.id === employee.id)
-      if (current === undefined || current.status === 'retired' || current.status === 'failed') return
+      if (state.id !== located.id || current === undefined || current.sessionId !== String(agent.id) || current.status === 'retired' || current.status === 'failed') return
       if (status === 'idle') releaseEmployeeMoneyReservations(state, current.id)
       if (state.phase === 'paused' || state.phase === 'halted' || current.operationalBlock !== undefined) current.status = 'paused'
       else current.status = status === 'running' ? 'working' : 'idle'
@@ -596,8 +825,14 @@ export function installCompanyScheduler(
 
   return {
     kick: enqueue,
-    dispose(): void {
-      disposed = true
+    async dispose(): Promise<void> {
+      if (!disposed) {
+        disposed = true
+        lifecycle.abort(new Error('dsh-company scheduler disposed'))
+        for (const key of wakeups.keys()) clearWakeup(key)
+        workspaceKeys.clear()
+      }
+      await Promise.allSettled([...queues.values()])
     },
   }
 }
@@ -605,8 +840,7 @@ export function installCompanyScheduler(
 function reserveEmployeeTurn(
   state: CompanyState,
   employee: Employee,
-  config: ResolvedCompanyConfig,
-  subject: { workId?: string; messageId?: string },
+  subject: { workId?: string; messageId?: string; staffingRequestId?: string },
   now: number,
 ): string {
   const provider = employee.llm.provider
@@ -624,7 +858,6 @@ function reserveAuthorizedWorkTurn(
   state: CompanyState,
   employee: Employee,
   work: WorkItem,
-  config: ResolvedCompanyConfig,
   now: number,
 ): string {
   const provider = employee.llm.activeProvider ?? employee.llm.provider

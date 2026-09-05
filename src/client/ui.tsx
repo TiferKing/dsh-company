@@ -65,7 +65,6 @@ export function phaseTone(phase: CompanyPhase): StatusTone {
     case 'operating':
       return 'success'
     case 'provisioning':
-    case 'closing':
       return 'active'
     case 'staged':
     case 'paused':

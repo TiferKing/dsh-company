@@ -4,7 +4,7 @@ const CHARTER_TEXT = '1. Human decisions remain explicit.\n2. Every change is bo
 
 export function snapshotFixture(revision = 1): Record<string, unknown> {
   return {
-    schema_version: 4,
+    schema_version: 5,
     revision,
     viewer: {
       role: 'founder',
@@ -59,10 +59,7 @@ export function snapshotFixture(revision = 1): Record<string, unknown> {
       status: 'active',
       product_root: '.',
       success_criteria: ['Tests pass'],
-      budget_credits: 0,
-      token_budget: 1_000_000,
       token_used: 175,
-      cost_micros: 42,
       budget_micros: 12_000_000,
       spent_micros: 42,
       reserved_micros: 2_000_000,
@@ -90,6 +87,9 @@ export function snapshotFixture(revision = 1): Record<string, unknown> {
       acceptance: ['Unit tests'],
       verify: ['pnpm test'],
       deliverables: ['src/widget.ts'],
+      changed_paths: ['src/widget.ts'],
+      acceptance_results: ['Unit tests: pass'],
+      commands_run: ['pnpm test'],
       attempt_id: 'must-be-dropped',
     }],
     budget: {
@@ -135,7 +135,7 @@ export function snapshotFixture(revision = 1): Record<string, unknown> {
       errors: [],
     },
     temporary_authorizations: [{
-      id: 'auth-1', employee_id: 'engineer', reason: 'Finish the bounded implementation.', authorized_by: 'founder',
+      id: 'auth-1', employee_id: 'engineer', reason: 'Finish the bounded implementation.', approval_id: 'approval-auth-1', authorized_by: 'founder',
       starts_at: 1_720_000_000_000, expires_at: 1_720_003_600_000, status: 'active', created_at: 1_720_000_000_000,
       uses: [{ id: 'auth-use-1', at: 1_720_000_100_000, work_id: 'work-1', approval_ids: [], bypassed: ['company_budget'], amount_micros: 42, usage_id: 'employee-session:1' }],
     }],
@@ -151,7 +151,7 @@ export function snapshotFixture(revision = 1): Record<string, unknown> {
       requested_at: 1_720_000_000_000,
     }],
     inbox: [{ id: 'message-1', from: 'engineer', to: 'founder', content: 'Ready for review.', created_at: 1_720_000_000_000, delivery_state: 'accepted' }],
-    warnings: ['Legacy activation credits are not monetary budget.'],
+    warnings: [],
     poll_after_ms: 1_500,
   }
 }

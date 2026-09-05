@@ -2,21 +2,11 @@ import type { Context } from '@deepseek-ai/cordis'
 import { defineTool, type JsonValue, type ParameterSchemaSpec, type ToolRunContext } from '@deepseek-ai/dsh-tools'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { CompanyRuntime } from './runtime.js'
-import type { ApprovalKind, ModelPriceInput, ProductStatus, ReviewFinding, TokenPriceInput, WorkKind } from './types.js'
-import { currencyUnitsToMicros } from './schemas.js'
+import { PRODUCT_STATUSES, WORK_KINDS, type ApprovalKind, type CompanySnapshot, type ModelPriceInput, type ProductStatus, type ReviewFinding } from './types.js'
+import { currencyUnitsToMicros, isRecord } from './schemas.js'
 
-const WORK_KINDS: WorkKind[] = ['discovery', 'design', 'implementation', 'verification', 'review', 'repair', 'integration', 'release', 'operations']
-const PRODUCT_STATUSES: ProductStatus[] = ['proposed', 'approved', 'active', 'paused', 'validating', 'released', 'retired', 'cancelled']
 const APPROVAL_KINDS: ApprovalKind[] = ['budget_change', 'pricing_change', 'governance_change', 'temporary_authorization', 'organization_change', 'product_scope', 'model_route', 'release', 'external_effect', 'forced_archive']
-
-export const COMPANY_TOOL_NAMES = [
-  'company_bootstrap', 'company_edit_formation', 'company_approve',
-  'company_request_staffing', 'company_claim_staffing_assessment', 'company_submit_staffing_assessment', 'company_apply_staffing_adjustment',
-  'company_add_employee', 'company_remove_employee', 'company_create_product', 'company_update_product', 'company_create_work', 'company_edit_work',
-  'company_reassign_work', 'company_claim_work', 'company_update_work', 'company_send_message',
-  'company_request_approval', 'company_request_budget_change', 'company_resolve_approval', 'company_reprobe_models', 'company_request_governance_change',
-  'company_grant_temporary_authorization', 'company_revoke_temporary_authorization', 'company_status', 'company_control',
-] as const
+const STATUS_SECTIONS = ['overview', 'company', 'org_units', 'positions', 'staffing_requests', 'employees', 'products', 'work', 'tickets', 'budget', 'model_catalog', 'temporary_authorizations', 'approvals', 'inbox'] as const
 
 export function registerCompanyTools(ctx: Context, runtime: CompanyRuntime): void {
   register(ctx, 'company_bootstrap', 'Stage a currency-budget-first formation decision with company identity, governance, first product, three-rate price matrix, and initial HR lead. Nothing starts until a later explicit human approval.', {
@@ -31,14 +21,11 @@ export function registerCompanyTools(ctx: Context, runtime: CompanyRuntime): voi
         product_root: requiredString('Workspace-relative product root.'),
         success_criteria: requiredStringArray('Measurable product success criteria.'),
         product_budget: { type: 'number', required: true, description: 'First-product monetary ceiling in normal currency units (maximum 6 decimals).' },
-        token_budget: { type: 'integer', description: 'Deprecated compatibility token-safety allocation.' },
       },
     },
     total_budget: { type: 'number', required: true, description: 'Company-wide monetary ceiling in normal currency units (maximum 6 decimals).' },
-    total_token_budget: { type: 'integer', description: 'Deprecated compatibility token-safety ceiling.' },
     currency: requiredString('ISO-like currency code for all monetary amounts, e.g. USD or CNY.'),
     model_prices: modelPriceArray(),
-    prices: tokenPriceArray(),
     drafted_by: { type: 'string', enum: ['ai', 'user'] },
     hr_name: { type: 'string', description: 'Initial HR governance lead display name.' },
     hr_provider: { type: 'string' }, hr_model: { type: 'string' }, hr_reasoning_effort: { type: 'string' },
@@ -49,12 +36,9 @@ export function registerCompanyTools(ctx: Context, runtime: CompanyRuntime): voi
       firstProduct: {
         name: first.name as string, summary: first.summary as string, productRoot: first.product_root as string,
         successCriteria: first.success_criteria as string[], budgetMicros: currencyUnitsToMicros(first.product_budget, 'first_product.product_budget'),
-        ...(first.token_budget === undefined ? {} : { tokenBudget: first.token_budget as number }),
       },
       totalBudgetMicros: currencyUnitsToMicros(args.total_budget, 'total_budget'), currency: args.currency as string,
-      ...(args.total_token_budget === undefined ? {} : { totalTokenBudget: args.total_token_budget as number }),
       ...(args.model_prices === undefined ? {} : { modelPrices: modelPricesFromArgs(args.model_prices) }),
-      ...(args.prices === undefined ? {} : { prices: tokenPricesFromArgs(args.prices) }),
       ...(args.drafted_by === undefined ? {} : { draftedBy: args.drafted_by as 'ai' | 'user' }),
       ...(args.hr_name === undefined ? {} : { hrName: args.hr_name as string }),
       ...(args.hr_provider === undefined ? {} : { hrProvider: args.hr_provider as string }),
@@ -64,16 +48,17 @@ export function registerCompanyTools(ctx: Context, runtime: CompanyRuntime): voi
     return { company_id: result.companyId, phase: result.phase, revision: result.revision, state_root_display: result.stateRootDisplay }
   })
 
-  register(ctx, 'company_edit_formation', 'Edit the staged company identity, governance, first product, monetary budget, currency, or three-rate price matrix before approval.', {
+  register(ctx, 'company_edit_formation', 'Edit the staged company identity, governance, initial HR route, first product, monetary budget, currency, or three-rate price matrix before approval or provisioning retry.', {
     name: { type: 'string' }, slogan: { type: 'string' }, mission: { type: 'string' }, charter: { type: 'string' },
     first_product: {
       type: 'object', additionalProperties: false,
       properties: {
         name: { type: 'string' }, summary: { type: 'string' }, product_root: { type: 'string' },
-        success_criteria: { type: 'array', items: { type: 'string' } }, product_budget: { type: 'number' }, token_budget: { type: 'integer' },
+        success_criteria: { type: 'array', items: { type: 'string' } }, product_budget: { type: 'number' },
       },
     },
-    total_budget: { type: 'number' }, total_token_budget: { type: 'integer' }, currency: { type: 'string' }, model_prices: modelPriceArray(), prices: tokenPriceArray(),
+    total_budget: { type: 'number' }, currency: { type: 'string' }, model_prices: modelPriceArray(),
+    hr_name: { type: 'string' }, hr_provider: { type: 'string' }, hr_model: { type: 'string' }, hr_reasoning_effort: { type: 'string' },
     expected_revision: { type: 'integer' },
   }, async (args, exec) => {
     const first = args.first_product as Record<string, unknown> | undefined
@@ -88,13 +73,14 @@ export function registerCompanyTools(ctx: Context, runtime: CompanyRuntime): voi
         ...(first.product_root === undefined ? {} : { productRoot: first.product_root as string }),
         ...(first.success_criteria === undefined ? {} : { successCriteria: first.success_criteria as string[] }),
         ...(first.product_budget === undefined ? {} : { budgetMicros: currencyUnitsToMicros(first.product_budget, 'first_product.product_budget') }),
-        ...(first.token_budget === undefined ? {} : { tokenBudget: first.token_budget as number }),
       } }),
       ...(args.total_budget === undefined ? {} : { totalBudgetMicros: currencyUnitsToMicros(args.total_budget, 'total_budget') }),
-      ...(args.total_token_budget === undefined ? {} : { totalTokenBudget: args.total_token_budget as number }),
       ...(args.currency === undefined ? {} : { currency: args.currency as string }),
       ...(args.model_prices === undefined ? {} : { modelPrices: modelPricesFromArgs(args.model_prices) }),
-      ...(args.prices === undefined ? {} : { prices: tokenPricesFromArgs(args.prices) }),
+      ...(args.hr_name === undefined ? {} : { hrName: args.hr_name as string }),
+      ...(args.hr_provider === undefined ? {} : { hrProvider: args.hr_provider as string }),
+      ...(args.hr_model === undefined ? {} : { hrModel: args.hr_model as string }),
+      ...(args.hr_reasoning_effort === undefined ? {} : { hrReasoningEffort: args.hr_reasoning_effort as string }),
     }, args.expected_revision as number | undefined)
     return { company_id: state.id, phase: state.phase, revision: state.revision, formation_status: state.formation.status }
   })
@@ -110,7 +96,7 @@ export function registerCompanyTools(ctx: Context, runtime: CompanyRuntime): voi
     return { company_id: state.id, phase: state.phase, revision: state.revision, employees: state.employees.map((employee) => ({ id: employee.id, status: employee.status })) }
   })
 
-  register(ctx, 'company_request_staffing', 'Ask the designated HR lead to assess a hire, adjustment, or retirement. HR decides difficulty, model route, reasoning effort, token limit, org path, position, and responsibilities before human approval.', {
+  register(ctx, 'company_request_staffing', 'Ask the designated HR lead to assess a hire, adjustment, or retirement. HR decides difficulty, model route, reasoning effort, monetary ceiling, org path, position, responsibilities, and optional HR succession before human approval.', {
     action: { type: 'string', required: true, enum: ['hire', 'adjust', 'retire'] },
     candidate_name: { type: 'string' }, employee_id: { type: 'string' },
     work_profile: requiredString('Concrete work profile and expected outcomes.'), constraints: { type: 'string' },
@@ -129,20 +115,27 @@ export function registerCompanyTools(ctx: Context, runtime: CompanyRuntime): voi
     return { request_id: result.requestId, attempt_id: result.attemptId }
   })
 
-  register(ctx, 'company_submit_staffing_assessment', 'Submit the designated HR lead assessment and open an organization_change approval. Token and money usage remain program-calculated. The recommended provider/model must be an enabled route: one with a complete three-rate price row configured on the recruiting page (check company_status budget prices first; unpriced routes are rejected).', {
+  register(ctx, 'company_submit_staffing_assessment', 'Submit the designated HR assessment and open an organization_change approval. Hire/adjust require an enabled three-rate-priced route and full staffing fields; retire requires only difficulty and rationale because current staffing facts are Host-derived.', {
     request_id: requiredString('Staffing request id.'), attempt_id: requiredString('Exact HR assessment capability.'),
     difficulty: { type: 'string', required: true, enum: ['low', 'medium', 'high', 'critical'] },
-    provider: requiredString('Recommended provider; must be an enabled (three-rate priced) route.'), model: requiredString('Recommended model; must be an enabled (three-rate priced) route.'),
-    employee_budget: { type: 'number', required: true, description: 'Recommended employee monetary ceiling in normal company-currency units (maximum 6 decimals).' },
-    rationale: requiredString('HR assessment rationale.'), org_path: requiredStringArray('Multi-level organization path from the company root.'),
-    position_title: requiredString('Recommended staffed position.'), responsibilities: requiredStringArray('Bounded responsibilities.'),
+    provider: { type: 'string', description: 'Recommended enabled provider; required for hire/adjust and omitted for retire.' }, model: { type: 'string', description: 'Recommended enabled model; required for hire/adjust and omitted for retire.' },
+    reasoning_effort: { type: 'string', description: 'Optional enabled reasoning-effort id, or default.' },
+    employee_budget: { type: 'number', description: 'Recommended employee monetary ceiling; required for hire/adjust and omitted for retire.' },
+    rationale: requiredString('HR assessment rationale.'), org_path: { type: 'array', items: { type: 'string' }, description: 'Organization path; required for hire/adjust and omitted for retire.' },
+    position_title: { type: 'string', description: 'Staffed position; required for hire/adjust and omitted for retire.' }, responsibilities: { type: 'array', items: { type: 'string' }, description: 'Responsibilities; required for hire/adjust and omitted for retire.' },
+    designate_as_hr: { type: 'boolean', description: 'For hire/adjust only: transfer singleton HR governance authority to this employee after successful provisioning.' },
   }, async (args, exec) => runtime.submitStaffingAssessment(requireAgent(exec), {
     requestId: args.request_id as string, attemptId: args.attempt_id as string,
-    difficulty: args.difficulty as 'low' | 'medium' | 'high' | 'critical', provider: args.provider as string, model: args.model as string,
+    difficulty: args.difficulty as 'low' | 'medium' | 'high' | 'critical',
+    ...(args.provider === undefined ? {} : { provider: args.provider as string }),
+    ...(args.model === undefined ? {} : { model: args.model as string }),
     ...(args.reasoning_effort === undefined ? {} : { reasoningEffort: args.reasoning_effort as string }),
-    budgetMicros: currencyUnitsToMicros(args.employee_budget, 'employee_budget'),
-    rationale: args.rationale as string, orgPath: args.org_path as string[],
-    positionTitle: args.position_title as string, responsibilities: args.responsibilities as string[],
+    ...(args.employee_budget === undefined ? {} : { budgetMicros: currencyUnitsToMicros(args.employee_budget, 'employee_budget') }),
+    rationale: args.rationale as string,
+    ...(args.org_path === undefined ? {} : { orgPath: args.org_path as string[] }),
+    ...(args.position_title === undefined ? {} : { positionTitle: args.position_title as string }),
+    ...(args.responsibilities === undefined ? {} : { responsibilities: args.responsibilities as string[] }),
+    ...(args.designate_as_hr === undefined ? {} : { designateAsHr: args.designate_as_hr as boolean }),
   }))
 
   register(ctx, 'company_apply_staffing_adjustment', 'Apply one human-approved HR employee adjustment by reprovisioning the employee route and position without losing its durable identity.', {
@@ -176,14 +169,12 @@ export function registerCompanyTools(ctx: Context, runtime: CompanyRuntime): voi
     product_root: requiredString('Workspace-relative POSIX path; no traversal.'),
     success_criteria: requiredStringArray('Measurable product success criteria.'),
     product_budget: { type: 'number', required: true, description: 'Product monetary allocation ceiling in normal currency units (maximum 6 decimals).' },
-    token_budget: { type: 'integer', description: 'Deprecated compatibility token-safety allocation.' },
   }, async (args, exec) => runtime.createProduct(requireAgent(exec), {
     name: args.name as string,
     summary: args.summary as string,
     productRoot: args.product_root as string,
     successCriteria: args.success_criteria as string[],
     budgetMicros: currencyUnitsToMicros(args.product_budget, 'product_budget'),
-    ...(args.token_budget === undefined ? {} : { tokenBudget: args.token_budget as number }),
   }))
 
   register(ctx, 'company_update_product', 'Edit bounded product metadata or request a validated lifecycle transition. Releases require approved release scope plus completed verification and independent review.', {
@@ -191,14 +182,12 @@ export function registerCompanyTools(ctx: Context, runtime: CompanyRuntime): voi
     status: { type: 'string', enum: [...PRODUCT_STATUSES] },
     summary: { type: 'string' },
     success_criteria: { type: 'array', items: { type: 'string' } },
-    token_budget: { type: 'integer' },
     approval_id: { type: 'string' },
   }, async (args, exec) => runtime.updateProduct(requireAgent(exec), {
     productId: args.product_id as string,
     ...(args.status === undefined ? {} : { status: args.status as ProductStatus }),
     ...(args.summary === undefined ? {} : { summary: args.summary as string }),
     ...(args.success_criteria === undefined ? {} : { successCriteria: args.success_criteria as string[] }),
-    ...(args.token_budget === undefined ? {} : { tokenBudget: args.token_budget as number }),
     ...(args.approval_id === undefined ? {} : { approvalId: args.approval_id as string }),
   }))
 
@@ -208,7 +197,7 @@ export function registerCompanyTools(ctx: Context, runtime: CompanyRuntime): voi
     work_id: requiredString('Work item id.'),
     expected_revision: { type: 'integer' },
     ...workPlanParameters(false),
-  }, async (args, exec) => runtime.editWork(requireAgent(exec), args.work_id as string, workPlanFromArgs(args, true), args.expected_revision as number | undefined))
+  }, async (args, exec) => runtime.editWork(requireAgent(exec), args.work_id as string, workPlanFromArgs(args), args.expected_revision as number | undefined))
 
   register(ctx, 'company_reassign_work', 'Revoke an old work attempt capability, wait best-effort for its prior owner, and complete a fenced handoff to an employee or the founder.', {
     work_id: requiredString('Work item id.'),
@@ -341,7 +330,7 @@ export function registerCompanyTools(ctx: Context, runtime: CompanyRuntime): voi
 
   register(ctx, 'company_reprobe_models', 'Reprobe all registered LLM providers/models and revision-fenced merge capability rows. Previously configured price rows are preserved; discovered routes without prices remain explicitly unpriced.', {
     expected_revision: { type: 'integer', description: 'Optional optimistic revision fence; the pre-probe state is always fenced.' },
-  }, async (args, exec) => runtime.reprobeModels(requireAgent(exec), args.expected_revision as number | undefined))
+  }, async (args, exec) => runtime.reprobeModels(requireAgent(exec), args.expected_revision as number | undefined, exec.signal))
 
   register(ctx, 'company_request_governance_change', 'Request a high-risk, revision-fenced post-formation change to the company slogan, mission, or charter.', {
     slogan: { type: 'string' }, mission: { type: 'string' }, charter: { type: 'string' },
@@ -374,9 +363,14 @@ export function registerCompanyTools(ctx: Context, runtime: CompanyRuntime): voi
     approvalId: args.approval_id as string, authorizationId: args.authorization_id as string, reason: args.reason as string,
   }))
 
-  register(ctx, 'company_status', 'Read a role-filtered company snapshot with organization load, capability catalog, monetary authority, full-lifecycle aggregates, bounded detail, temporary authorizations, health, approvals, and only the caller mailbox.', {
+  register(ctx, 'company_status', 'Read the role-filtered company overview, including budget, pending approvals, and caller mailbox. Query a section for details; array sections support exact id/status filters and offset/limit pagination. Pages cover the Host snapshot projection, which already bounds historical detail.', {
     archived: { type: 'boolean', description: 'Read the newest archive when no active company exists.' },
-  }, async (args, exec) => runtime.status(requireAgent(exec), args.archived === true))
+    section: { type: 'string', enum: [...STATUS_SECTIONS], description: 'Defaults to overview. Query work, approvals, inbox, budget, or another named section for complete projected details.' },
+    id: { type: 'string', description: 'Optional exact entity id filter for array sections.' },
+    status: { type: 'string', description: 'Optional exact status filter, e.g. pending approvals or in_progress work.' },
+    offset: { type: 'integer', description: 'Zero-based offset within filtered rows; defaults to 0.' },
+    limit: { type: 'integer', description: 'Rows per page, from 1 to 20; defaults to 5. Applies separately to each array in budget/model_catalog.' },
+  }, async (args, exec) => projectToolStatus(await runtime.status(requireAgent(exec), args.archived === true), args))
 
   register(ctx, 'company_control', 'Pause, resume, archive, or discard a staged company. Archive revokes scheduling and attempts but preserves child transcripts. Forced archive requires approval.', {
     action: { type: 'string', required: true, enum: ['pause', 'resume', 'archive', 'discard_staged'] },
@@ -408,13 +402,62 @@ function register(
     parameters,
     output: {
       schema: { type: 'json' },
-      render: (_args, value) => [{ type: 'text', text: renderValue(value) }],
+      render: (_args, value) => [{ type: 'text', text: name === 'company_status' ? JSON.stringify(value) : renderValue(value) }],
     },
     async execute(args, exec) {
       const value = await execute(args as Record<string, unknown>, exec)
       return toJsonValue(value)
     },
   }))
+}
+
+function projectToolStatus(snapshot: CompanySnapshot, args: Record<string, unknown>): unknown {
+  const section = (args.section ?? 'overview') as typeof STATUS_SECTIONS[number]
+  const offset = (args.offset ?? 0) as number
+  const limit = (args.limit ?? 5) as number
+  if (!Number.isSafeInteger(offset) || offset < 0) throw new Error('company_status offset must be a non-negative safe integer')
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 20) throw new Error('company_status limit must be an integer from 1 to 20')
+  const page = (rows: readonly unknown[]) => {
+    const filtered = rows.filter((row) => isRecord(row)
+      && (args.id === undefined || row.id === args.id)
+      && (args.status === undefined || row.status === args.status))
+    const items = filtered.slice(offset, offset + limit)
+    return { total: rows.length, filtered_total: filtered.length, offset, limit, returned: items.length,
+      next_offset: offset + items.length < filtered.length ? offset + items.length : null, items }
+  }
+  const identity = { revision: snapshot.revision, viewer: snapshot.viewer,
+    company: { id: snapshot.company.id, name: snapshot.company.name, phase: snapshot.company.phase, health: snapshot.company.health } }
+  if (section === 'company') return { ...identity, company: snapshot.company, warnings: snapshot.warnings }
+  const { prices, provider_model_aggregates, usage_detail, ...budget } = snapshot.budget
+  if (section === 'budget') return { ...identity, section, ...budget,
+    prices: page(prices), provider_model_aggregates: page(provider_model_aggregates),
+    usage_detail: { source_total: usage_detail.total, source_offset: usage_detail.offset, source_truncated: usage_detail.truncated, ...page(usage_detail.items) } }
+  if (section === 'model_catalog') {
+    const { models, errors, ...catalog } = snapshot.model_catalog
+    return { ...identity, section, ...catalog, models: page(models), errors: page(errors) }
+  }
+  if (section !== 'overview') return { ...identity, section, ...page(snapshot[section]) }
+  if (args.id !== undefined || args.status !== undefined || args.offset !== undefined || args.limit !== undefined) {
+    throw new Error('company_status filters and pagination require a detail section')
+  }
+  const pending = snapshot.approvals.filter((approval) => approval.status === 'pending')
+  const counts = (rows: readonly { status: string }[]) => {
+    const result: Record<string, number> = {}
+    for (const row of rows) result[row.status] = (result[row.status] ?? 0) + 1
+    return result
+  }
+  return { ...identity, section, budget,
+    mission: snapshot.company.mission.slice(0, 1_000),
+    governance_revision: snapshot.company.governance_revision, formation_status: snapshot.company.formation_status,
+    counts: { employees: counts(snapshot.employees), products: counts(snapshot.products), work: counts(snapshot.work), tickets: counts(snapshot.tickets),
+      staffing_requests: counts(snapshot.staffing_requests), approvals: counts(snapshot.approvals), inbox: snapshot.inbox.length },
+    pending_approvals: pending.slice(0, 5).map((approval) => ({ id: approval.id, kind: approval.kind, risk: approval.risk, summary: approval.summary.slice(0, 512) })),
+    recent_inbox: snapshot.inbox.slice(-3).map((message) => ({ id: message.id, from: message.from, created_at: message.created_at, content_preview: message.content.slice(0, 1_000) })),
+    warnings: snapshot.warnings,
+    query: { tool: 'company_status', sections: STATUS_SECTIONS.filter((value) => value !== 'overview'),
+      defaults: { offset: 0, limit: 5 }, max_limit: 20,
+      examples: [{ section: 'approvals', status: 'pending' }, { section: 'inbox' }, { section: 'work', id: 'w1' }, { section: 'budget' }],
+      note: 'Overview text is abbreviated. Query a detail section for full projected records and follow next_offset for more rows. Historical rows/details may already be bounded by the Host snapshot.' } }
 }
 
 function requireAgent(exec: ToolRunContext): Agent {
@@ -456,31 +499,6 @@ function modelPricesFromArgs(value: unknown): ModelPriceInput[] {
   }))
 }
 
-function tokenPriceArray(): ParameterSchemaSpec[string] {
-  return {
-    type: 'array',
-    description: 'Optional provider/model prices per one million tokens in the configured currency.',
-    items: {
-      type: 'object', additionalProperties: false,
-      properties: {
-        provider: requiredString('Provider id.'), model: requiredString('Model id.'),
-        input_per_million: { type: 'number', required: true }, cache_read_per_million: { type: 'number', required: true },
-        cache_write_per_million: { type: 'number', required: true }, output_per_million: { type: 'number', required: true },
-        reasoning_per_million: { type: 'number' },
-      },
-    },
-  }
-}
-
-function tokenPricesFromArgs(value: unknown): TokenPriceInput[] {
-  return (value as Array<Record<string, unknown>>).map((price) => ({
-    provider: price.provider as string, model: price.model as string,
-    inputPerMillion: price.input_per_million as number, cacheReadPerMillion: price.cache_read_per_million as number,
-    cacheWritePerMillion: price.cache_write_per_million as number, outputPerMillion: price.output_per_million as number,
-    ...(price.reasoning_per_million === undefined ? {} : { reasoningPerMillion: price.reasoning_per_million as number }),
-  }))
-}
-
 function workPlanParameters(required: boolean): ParameterSchemaSpec {
   const string = (description: string): ParameterSchemaSpec[string] => ({ type: 'string', ...(required ? { required: true } : {}), description })
   const array = (description: string): ParameterSchemaSpec[string] => ({ type: 'array', ...(required ? { required: true } : {}), description, items: { type: 'string' } })
@@ -503,7 +521,7 @@ function workPlanParameters(required: boolean): ParameterSchemaSpec {
   }
 }
 
-function workPlanFromArgs(args: Record<string, unknown>, partial = false): any {
+function workPlanFromArgs(args: Record<string, unknown>): import('./types.js').CreateWorkInput {
   const result: Record<string, unknown> = {}
   const copy = (wire: string, internal: string): void => { if (args[wire] !== undefined) result[internal] = args[wire] }
   copy('product_id', 'productId')
@@ -521,7 +539,7 @@ function workPlanFromArgs(args: Record<string, unknown>, partial = false): any {
   copy('verify', 'verify')
   copy('deliverables', 'deliverables')
   copy('reviewed_work_id', 'reviewedWorkId')
-  return result
+  return result as unknown as import('./types.js').CreateWorkInput
 }
 
 function findingFromArgs(input: Record<string, unknown>): ReviewFinding {

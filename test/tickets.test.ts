@@ -31,7 +31,12 @@ async function buildHarness(): Promise<{
   sessions.set('founder-session', founder)
   const ctx = {
     agents: { get(id: unknown) { return sessions.get(String(id)) } },
-    llm: { resolveCallConfig: async (selection: any) => selection },
+    llm: {
+      resolveCallConfig: async (selection: any) => selection,
+      listProviders: () => [{ id: 'mock', name: 'Mock' }],
+      listModels: async () => [{ id: 'mock-model', name: 'Mock model' }],
+      resolveModelInfo: async () => ({ provider: 'mock', id: 'mock-model', name: 'Mock model', context: { contextWindow: 128_000 } }),
+    },
     subagents: {
       registerContinuableSetup: () => () => undefined,
       getProvider: () => ({ prepareContinuable: () => undefined, capabilities: { persona: true, toolFilter: true, depthLimit: true } }),
@@ -66,7 +71,7 @@ async function hireEngineer(harness: Awaited<ReturnType<typeof buildHarness>>): 
   await harness.runtime.resolveApproval(harness.founder, {
     approvalId: recommendation.approvalId!, decision: 'approved', humanStatement: 'I approve this hire.',
   }, 'ui')
-  const engineer = await harness.runtime.addEmployee(harness.founder, { name: 'Engineer', role: 'Support Engineer', staffingRequestId: request.id, approvalId: recommendation.approvalId })
+  const engineer = await harness.runtime.addEmployee(harness.founder, { name: 'Engineer', role: 'Support Engineer', staffingRequestId: request.id, approvalId: recommendation.approvalId! })
   return { engineer, engineerAgent: harness.agentOf(engineer.sessionId!) }
 }
 
@@ -83,21 +88,21 @@ async function waitForAdmission(harness: Awaited<ReturnType<typeof buildHarness>
 test('a ticket travels file → triage → dispatch → resolve → close with steers and guardrails', async () => {
   const harness = await buildHarness()
   try {
-    const scheduler = installCompanyScheduler(harness.ctx, harness.config, harness.store)
+    const scheduler = installCompanyScheduler(harness.ctx, harness.config, harness.store, harness.runtime)
     harness.runtime.attachScheduler(scheduler)
     await harness.runtime.bootstrap(harness.founder, {
       name: 'Draft Co', mission: 'Build one bounded tool.', charter: '1. Human approval governs.',
-      firstProduct: { name: 'Tool', summary: 'One tool.', productRoot: 'tool', successCriteria: ['Tests pass'], budgetMicros: 1_000_000, tokenBudget: 500_000 },
-      totalBudgetMicros: 1_000_000, totalTokenBudget: 1_000_000, currency: 'CNY', draftedBy: 'ai',
+      firstProduct: { name: 'Tool', summary: 'One tool.', productRoot: 'tool', successCriteria: ['Tests pass'], budgetMicros: 1_000_000 },
+      totalBudgetMicros: 1_000_000, currency: 'CNY', draftedBy: 'ai',
       modelPrices: [{ provider: 'mock', model: 'mock-model', inputCacheMissMicrosPerMillion: 0, inputCacheHitMicrosPerMillion: 0, outputMicrosPerMillion: 0 }],
     })
     await harness.runtime.approveBootstrap(harness.founder, 'Approved and start.', { source: 'ui' })
     const { engineer, engineerAgent } = await hireEngineer(harness)
 
-    // The real Host's accounting releases the provisioning activation
+    // The real Host's accounting releases the provisioning monetary
     // reservation when the fresh employee's first turn ends; the fake harness
     // has no session events, so release it explicitly before admission.
-    await harness.store.transact(harness.workspace, { actor: 'scheduler', type: 'harness.reservation_released', summary: 'release activation reservation' }, (state) => {
+    await harness.store.transact(harness.workspace, { actor: 'scheduler', type: 'harness.reservation_released', summary: 'release monetary reservation' }, (state) => {
       releaseEmployeeMoneyReservations(state, engineer.id)
     })
 
@@ -184,6 +189,12 @@ test('a ticket travels file → triage → dispatch → resolve → close with s
     const failedTicket = state?.tickets.find((row) => row.id === t3.id)
     assert.equal(failedTicket?.status, 'triaged', 'failed repair returns to triaged')
     assert.equal(failedTicket?.severity, 'urgent')
+    const retryWork = state?.workItems.find((item) => item.id === t3.workItemId)
+    assert.deepEqual({ status: retryWork?.status, assignee: retryWork?.assigneeId, attempt: retryWork?.attempt }, { status: 'pending', assignee: undefined, attempt: 1 })
+    await harness.runtime.dispatchTicket(harness.founder, { ticketId: t3.id, assigneeId: engineer.id, note: 'Retry with preserved attempt history' })
+    await waitForAdmission(harness, t3.workItemId!)
+    const retryClaim = await harness.runtime.claimWork(engineerAgent, t3.workItemId!)
+    assert.equal(retryClaim.attempt, 2, 'a failed ticket repair can be dispatched as a new fenced attempt')
     await scheduler.dispose?.()
   } finally {
     await harness.cleanup()
@@ -195,8 +206,8 @@ test('filing is bounded to operating companies and existing products', async () 
   try {
     await harness.runtime.bootstrap(harness.founder, {
       name: 'Draft Co', mission: 'Build one bounded tool.', charter: '1. Human approval governs.',
-      firstProduct: { name: 'Tool', summary: 'One tool.', productRoot: 'tool', successCriteria: ['Tests pass'], budgetMicros: 1_000_000, tokenBudget: 500_000 },
-      totalBudgetMicros: 1_000_000, totalTokenBudget: 1_000_000, currency: 'CNY', draftedBy: 'ai',
+      firstProduct: { name: 'Tool', summary: 'One tool.', productRoot: 'tool', successCriteria: ['Tests pass'], budgetMicros: 1_000_000 },
+      totalBudgetMicros: 1_000_000, currency: 'CNY', draftedBy: 'ai',
       modelPrices: [{ provider: 'mock', model: 'mock-model', inputCacheMissMicrosPerMillion: 0, inputCacheHitMicrosPerMillion: 0, outputMicrosPerMillion: 0 }],
     })
     await assert.rejects(() => harness.runtime.fileTicket(harness.founder, { productId: 'p1', title: 'x', description: 'y' }), /operating/)

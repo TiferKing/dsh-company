@@ -4,7 +4,6 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { SessionId } from '@deepseek-ai/dsh-session'
 import { createApproval, consumeApproval, requireApproved, resolveApproval } from './approvals.js'
-import { adjustTokenBudget } from './tokens.js'
 import {
   adjustMoneyBudgetTotal,
   activeMoneyReservation,
@@ -19,13 +18,13 @@ import {
   resolveRateSnapshot,
 } from './money.js'
 import { createTemporaryAuthorization, revokeTemporaryAuthorization as revokeAuthorizationRecord } from './authorizations.js'
-import { invalidateModelCatalog, mergeDiscoveredPriceRows, probeRegisteredModels } from './models.js'
+import { invalidateModelCatalog, probeRegisteredModels } from './models.js'
 import {
   activateFallback,
   activeSelection,
   allocateEmployeeSessionId,
   deliverEmployee,
-  employeeActivity,
+  employeeLabel,
   installEmployeeSelectionRuntime,
   interruptEmployee,
   isFallbackEligible,
@@ -36,9 +35,9 @@ import {
   type SelectionRuntime,
 } from './employees.js'
 import { normalizeMultilineString, normalizeString, normalizeWorkspaceRelative } from './paths.js'
-import { assertAcyclic, isRecord, currencyUnitsToMicros, normalizeCurrency, normalizeModelPrices, normalizeTokenPrices, validateApprovalPayload } from './schemas.js'
-import type { CompanyStore } from './state.js'
-import { RevisionConflictError } from './state.js'
+import { assertAcyclic, isRecord, currencyUnitsToMicros, normalizeCurrency, normalizeModelPrices, validateApprovalPayload } from './schemas.js'
+import { makeMailboxRoom, RevisionConflictError, type CompanyStore, type MutationContext } from './state.js'
+import { COMPANY_STATE_SCHEMA_VERSION } from './types.js'
 import type {
   AddEmployeeInput,
   ApprovalKind,
@@ -75,6 +74,7 @@ import type {
 } from './types.js'
 import {
   beginWorkAttempt,
+  canEmployeeOwn,
   finishHandoff,
   invalidateAttempt,
   isOpenStatus,
@@ -88,6 +88,9 @@ export interface SchedulerHandle {
   kick(cwd: string | undefined, suppliedFounder?: Agent): Promise<void>
   dispose?(): void | Promise<void>
 }
+
+type ListChildren = Context['subagents']['listChildren']
+const MAX_MESSAGE_DELIVERY_ATTEMPTS = 3
 
 export interface OperationSource {
   source: 'tool' | 'ui'
@@ -105,6 +108,7 @@ export class CompanyRuntime {
   private closing = false
   private modelTopologyEpoch = 0
   private modelTopologyChangedAt = 0
+  private readonly recoveries = new Map<string, Promise<void>>()
 
   constructor(ctx: Context, config: ResolvedCompanyConfig, store: CompanyStore) {
     this.ctx = ctx
@@ -126,6 +130,54 @@ export class CompanyRuntime {
     this.modelTopologyChangedAt = Math.max(Date.now(), this.modelTopologyChangedAt + 1)
   }
 
+  /** Resume durable sagas that may have been interrupted by Host/plugin restart. */
+  async recoverWorkspace(founder: Agent): Promise<void> {
+    if (this.closing) return
+    const key = String(founder.id)
+    const pending = this.recoveries.get(key)
+    if (pending !== undefined) return pending
+    const recovery = this.recoverWorkspaceOnce(founder)
+    this.recoveries.set(key, recovery)
+    try {
+      await recovery
+    } finally {
+      if (this.recoveries.get(key) === recovery) this.recoveries.delete(key)
+    }
+  }
+
+  private async recoverWorkspaceOnce(founder: Agent): Promise<void> {
+    let state = await this.store.readActive(founder.session.header.cwd)
+    if (state === undefined || String(founder.id) !== state.founderSessionId) return
+    this.assertFounderState(founder, state)
+    if (state.phase === 'provisioning' && state.provisioning !== undefined) {
+      await this.continueBootstrapProvisioning(founder, state.provisioning.id)
+      return
+    }
+    if (state.phase !== 'operating') return
+
+    if (state.workItems.some((work) => work.reassigning === true)) {
+      state = (await this.store.transact(founder.session.header.cwd, {
+        actor: 'scheduler', type: 'work.handoffs_recovered', summary: 'Finalized crash-interrupted work handoffs with revoked capabilities',
+      }, (fresh) => {
+        for (const work of fresh.workItems) {
+          if (work.reassigning !== true) continue
+          work.reassigning = false
+          work.handoffId = undefined
+          work.updatedAt = Date.now()
+        }
+      })).state
+    }
+
+    const known = await this.knownEmployeeSessions(founder, state)
+    for (const employee of state.employees.filter((candidate) => candidate.status === 'provisioning' && candidate.sessionId !== undefined)) {
+      const request = state.staffingRequests.find((candidate) => candidate.employeeId === employee.id && candidate.status === 'approved')
+      if (request === undefined) continue
+      await this.continueStaffingProvisioning(founder, employee.id, request.id, known.has(employee.sessionId!))
+      state = await this.store.readActive(founder.session.header.cwd) ?? state
+    }
+    this.kick(founder.session.header.cwd, founder)
+  }
+
   async bootstrap(founder: Agent, input: BootstrapInput): Promise<{ companyId: string; phase: string; revision: number; stateRootDisplay: string }> {
     this.assertAdmission()
     this.assertBootstrapActor(founder)
@@ -139,16 +191,13 @@ export class CompanyRuntime {
     const mission = normalizeMultilineString(input.mission, 'company mission', 16_384)
     const slogan = normalizeString(input.slogan ?? deriveSlogan(mission), 'company slogan', 160)
     const charter = normalizeMultilineString(input.charter, 'company charter', 32_768)
-    const totalTokenBudget = boundedTokenBudget(input.totalTokenBudget ?? this.config.defaultTokenBudget, this.config.maxTokenBudget, 'total_token_budget')
-    const totalBudgetMicros = boundedMicros(input.totalBudgetMicros ?? this.config.defaultMoneyBudgetMicros, this.config.maxMoneyBudgetMicros, 'total_budget_micros')
+    const totalBudgetMicros = boundedMicros(input.totalBudgetMicros, this.config.maxMoneyBudgetMicros, 'total_budget_micros')
     const currency = normalizeCurrency(input.currency)
-    const prices = input.prices === undefined ? structuredClone(this.config.tokenPrices) : normalizeTokenPrices(input.prices)
-    let modelPrices = input.modelPrices === undefined
+    const modelPrices = input.modelPrices === undefined
       ? this.config.modelPrices.map((price) => ({ ...structuredClone(price), updatedAt: now }))
       : normalizeModelPrices(input.modelPrices, 'manual', 1, now)
     const productRoot = normalizeWorkspaceRelative(workspace.workspace.canonicalPath, input.firstProduct.productRoot, 'first_product.product_root')
-    const productTokenBudget = boundedTokenBudget(input.firstProduct.tokenBudget ?? totalTokenBudget, totalTokenBudget, 'first_product.token_budget')
-    const productBudgetMicros = boundedMicros(input.firstProduct.budgetMicros ?? totalBudgetMicros, totalBudgetMicros, 'first_product.budget_micros')
+    const productBudgetMicros = boundedMicros(input.firstProduct.budgetMicros, totalBudgetMicros, 'first_product.budget_micros')
     const successCriteria = normalizeList(input.firstProduct.successCriteria, 'first_product.success_criteria', 1, 256, 16_384)
     const hrName = normalizeString(input.hrName ?? 'People & Model Governance Lead', 'hr_name', 200)
     const hrSelection = await resolveEmployeeSelection(this.ctx, founder, this.config, {
@@ -169,10 +218,9 @@ export class CompanyRuntime {
     for (const route of formationRoutes) if (!modelCatalog.models.some((candidate) => candidate.provider === route.provider && candidate.model === route.model)) {
       modelCatalog.models.push({ provider: route.provider, model: route.model, name: route.model, advertised: false, available: true })
     }
-    modelPrices = mergeDiscoveredPriceRows(modelPrices, modelCatalog, 1, now)
     const companyId = `c_${randomUUID()}`
     const state: CompanyState = {
-      schemaVersion: 1,
+      schemaVersion: COMPANY_STATE_SCHEMA_VERSION,
       revision: 1,
       id: companyId,
       name,
@@ -183,7 +231,6 @@ export class CompanyRuntime {
       founderSessionId: String(founder.id),
       stagedFromUserMessageId: String(latestUser.id),
       phase: 'staged',
-      planReviewState: 'awaiting_review',
       createdAt: now,
       updatedAt: now,
       limits: {
@@ -200,12 +247,6 @@ export class CompanyRuntime {
         memberMaxDepth: this.config.memberMaxDepth,
       },
       counters: { employee: 1, product: 1, work: 0, approval: 1, event: 0, orgUnit: 2, position: 1, staffing: 0, authorization: 0, ticket: 0 },
-      budget: { unit: 'activation-credit', totalCredits: 0, reservedCredits: 0, spentCredits: 0, entries: [] },
-      tokenBudget: {
-        unit: 'token', currency, totalTokens: totalTokenBudget, reservedTokens: 0, usedTokens: 0,
-        warningAtTokens: Math.max(1, Math.floor(totalTokenBudget * 0.2)), totalCostMicros: 0,
-        prices, usage: [], reservations: [],
-      },
       moneyBudget: {
         unit: 'micro-currency', currency, totalMicros: totalBudgetMicros, reservedMicros: 0, spentMicros: 0,
         warningAtMicros: Math.max(1, Math.floor(totalBudgetMicros * 0.2)), pricingRevision: 1,
@@ -226,7 +267,7 @@ export class CompanyRuntime {
       staffingRequests: [],
       hrEmployeeId: 'e1',
       employees: [{
-        id: 'e1', name: hrName, role: 'Head of People & Model Governance', department: 'Human Resources',
+        id: 'e1', name: hrName, role: 'Head of People & Model Governance',
         orgUnitId: 'ou2', positionId: 'pos1', isHr: true, budgetMicros: totalBudgetMicros,
         status: 'planned', llm: hrSelection,
         executionPrompt: 'Assess staffing work difficulty and submit structured, bounded model-route and reasoning-effort recommendations. Never estimate or report token usage or money; the plugin accounts for those programmatically.',
@@ -234,7 +275,7 @@ export class CompanyRuntime {
       products: [{
         id: 'p1', name: normalizeString(input.firstProduct.name, 'first product name', 200),
         summary: normalizeMultilineString(input.firstProduct.summary, 'first product summary', 16_384), status: 'approved',
-        productRoot, successCriteria, budgetCredits: 0, tokenBudget: productTokenBudget, budgetMicros: productBudgetMicros, createdAt: now, updatedAt: now,
+        productRoot, successCriteria, budgetMicros: productBudgetMicros, createdAt: now, updatedAt: now,
       }],
       workItems: [],
       tickets: [],
@@ -253,6 +294,19 @@ export class CompanyRuntime {
   async editFormation(founder: Agent, input: EditFormationInput, expectedRevision?: number): Promise<CompanyState> {
     this.assertAdmission()
     const located = await this.requireFounder(founder)
+    const currentHr = located.state.hrEmployeeId === undefined ? undefined : located.state.employees.find((employee) => employee.id === located.state.hrEmployeeId)
+    if ((input.hrName !== undefined || input.hrProvider !== undefined || input.hrModel !== undefined || input.hrReasoningEffort !== undefined) && currentHr === undefined) throw new Error('formation has no HR lead to edit')
+    if ((input.hrProvider === undefined) !== (input.hrModel === undefined)) throw new Error('hr_provider and hr_model must be supplied together')
+    const currentHrRoute = currentHr === undefined ? undefined : activeSelection(currentHr.llm)
+    const requestedEffort = input.hrReasoningEffort?.trim().toLowerCase() === 'default' ? undefined : input.hrReasoningEffort?.trim()
+    const editHrSelection = (input.hrProvider !== undefined && (input.hrProvider.trim() !== currentHrRoute?.provider || input.hrModel?.trim() !== currentHrRoute.model))
+      || (input.hrReasoningEffort !== undefined && requestedEffort !== currentHrRoute?.reasoningEffort)
+    const hrSelection = !editHrSelection ? undefined : await resolveEmployeeSelection(this.ctx, founder, this.config, {
+      provider: input.hrProvider ?? currentHr?.llm.provider,
+      model: input.hrModel ?? currentHr?.llm.model,
+      ...(input.hrReasoningEffort === undefined ? {} : { reasoningEffort: input.hrReasoningEffort }),
+    })
+    const hrModelInfo = hrSelection === undefined ? undefined : await this.ctx.llm.resolveModelInfo(hrSelection.provider, hrSelection.model).catch(() => undefined)
     const workspace = (await this.store.pathsForCwd(founder.session.header.cwd, false)).workspace.canonicalPath
     const result = await this.store.transact(founder.session.header.cwd, {
       expectedRevision,
@@ -266,6 +320,32 @@ export class CompanyRuntime {
       if (state.formation.status !== 'draft') throw new Error('approved formation is immutable')
       const first = state.formation.firstProductId === undefined ? undefined : state.products.find((product) => product.id === state.formation.firstProductId)
       if (first === undefined) throw new Error('formation has no first product to edit')
+      const hr = state.hrEmployeeId === undefined ? undefined : state.employees.find((employee) => employee.id === state.hrEmployeeId)
+      if ((input.hrName !== undefined || hrSelection !== undefined) && hr === undefined) throw new Error('formation has no HR lead to edit')
+      if (hr !== undefined) {
+        if (input.hrName !== undefined) hr.name = normalizeString(input.hrName, 'hr_name', 200)
+        if (hrSelection !== undefined) {
+          releaseEmployeeMoneyReservations(state, hr.id)
+          hr.llm = hrSelection
+          const capability = {
+            provider: hrSelection.provider,
+            model: hrSelection.model,
+            name: hrModelInfo?.name ?? hrSelection.model,
+            ...(hrModelInfo?.description === undefined ? {} : { description: hrModelInfo.description }),
+            ...(hrModelInfo?.inputModalities === undefined ? {} : { inputModalities: [...hrModelInfo.inputModalities] }),
+            ...(hrModelInfo?.context?.contextWindow === undefined ? {} : { contextWindow: hrModelInfo.context.contextWindow }),
+            ...(hrModelInfo?.defaultMaxTokens === undefined ? {} : { defaultMaxTokens: hrModelInfo.defaultMaxTokens }),
+            advertised: state.modelCatalog.models.some((model) => model.provider === hrSelection.provider && model.model === hrSelection.model && model.advertised),
+            available: true,
+          }
+          const catalogIndex = state.modelCatalog.models.findIndex((model) => model.provider === hrSelection.provider && model.model === hrSelection.model)
+          if (catalogIndex < 0) state.modelCatalog.models.push(capability)
+          else state.modelCatalog.models[catalogIndex] = { ...state.modelCatalog.models[catalogIndex]!, ...capability }
+          hr.sessionId = allocateEmployeeSessionId()
+          hr.status = 'planned'
+          hr.failure = undefined
+        }
+      }
       if (input.name !== undefined) {
         state.name = normalizeString(input.name, 'company name', 200)
         const root = state.orgUnits.find((unit) => unit.parentId === undefined)
@@ -283,36 +363,26 @@ export class CompanyRuntime {
         if (nextCurrency !== state.moneyBudget.currency && (
           state.moneyBudget.usage.length > 0 || state.moneyBudget.reservations.length > 0 || state.moneyBudget.legacyV02 !== undefined
         )) throw new Error('currency is immutable after any usage, reservation, or legacy ledger')
+        if (nextCurrency !== state.moneyBudget.currency && input.modelPrices === undefined) throw new Error('changing currency requires an explicit replacement model price matrix; old numeric rates are never relabeled')
         state.moneyBudget.currency = nextCurrency
-        state.tokenBudget.currency = state.moneyBudget.currency
         if (input.modelPrices !== undefined) {
           const normalized = normalizeModelPrices(input.modelPrices, 'manual', state.moneyBudget.pricingRevision + 1, Date.now())
           replaceModelPrices(state, normalized)
         }
       }
-      if (input.prices !== undefined) state.tokenBudget.prices = normalizeTokenPrices(input.prices)
       if (input.totalBudgetMicros !== undefined) {
         const total = boundedMicros(input.totalBudgetMicros, this.config.maxMoneyBudgetMicros, 'total_budget_micros')
         const nextFirstProductBudget = input.firstProduct?.budgetMicros ?? first.budgetMicros ?? 0
         if (nextFirstProductBudget > total) throw new Error('first product monetary budget exceeds company monetary budget')
         if (input.firstProduct?.budgetMicros !== undefined) first.budgetMicros = boundedMicros(input.firstProduct.budgetMicros, total, 'first_product.budget_micros')
-        const hr = state.hrEmployeeId === undefined ? undefined : state.employees.find((employee) => employee.id === state.hrEmployeeId)
         if (hr !== undefined && (hr.budgetMicros ?? 0) > total) hr.budgetMicros = total
         adjustMoneyBudgetTotal(state, total)
-      }
-      if (input.totalTokenBudget !== undefined) {
-        const total = boundedTokenBudget(input.totalTokenBudget, this.config.maxTokenBudget, 'total_token_budget')
-        const nextFirstProductBudget = input.firstProduct?.tokenBudget ?? first.tokenBudget
-        if (nextFirstProductBudget > total) throw new Error('first product token budget exceeds company token budget')
-        if (input.firstProduct?.tokenBudget !== undefined) first.tokenBudget = boundedTokenBudget(input.firstProduct.tokenBudget, total, 'first_product.token_budget')
-        adjustTokenBudget(state, total)
       }
       if (input.firstProduct !== undefined) {
         if (input.firstProduct.name !== undefined) first.name = normalizeString(input.firstProduct.name, 'first product name', 200)
         if (input.firstProduct.summary !== undefined) first.summary = normalizeMultilineString(input.firstProduct.summary, 'first product summary', 16_384)
         if (input.firstProduct.productRoot !== undefined) first.productRoot = normalizeWorkspaceRelative(workspace, input.firstProduct.productRoot, 'first_product.product_root')
         if (input.firstProduct.successCriteria !== undefined) first.successCriteria = normalizeList(input.firstProduct.successCriteria, 'first_product.success_criteria', 1, 256, 16_384)
-        if (input.firstProduct.tokenBudget !== undefined) first.tokenBudget = boundedTokenBudget(input.firstProduct.tokenBudget, state.tokenBudget.totalTokens, 'first_product.token_budget')
         if (input.firstProduct.budgetMicros !== undefined) first.budgetMicros = boundedMicros(input.firstProduct.budgetMicros, state.moneyBudget.totalMicros, 'first_product.budget_micros')
         first.updatedAt = Date.now()
       }
@@ -335,12 +405,25 @@ export class CompanyRuntime {
       this.assertSameCompany(located.state, state)
       this.assertFounderState(founder, state)
       if (!['operating', 'paused', 'halted'].includes(state.phase)) throw new Error('staffing requests begin only after the HR employee is provisioned')
+      const activeRequests = state.staffingRequests.filter((request) => !['rejected', 'applied'].includes(request.status)).length
+      if (activeRequests >= state.limits.maxPendingApprovals) throw new Error(`active staffing request cap ${state.limits.maxPendingApprovals} reached`)
       const hrEmployeeId = state.hrEmployeeId
       const hr = hrEmployeeId === undefined ? undefined : state.employees.find((employee) => employee.id === hrEmployeeId && employee.isHr === true && employee.status !== 'retired')
       if (hr === undefined) throw new Error('company has no active HR governance employee')
       if (input.action === 'hire' && input.candidateName === undefined) throw new Error('hire staffing request requires candidate_name')
       if (input.action !== 'hire' && input.employeeId === undefined) throw new Error(`${input.action} staffing request requires employee_id`)
-      if (input.employeeId !== undefined) requireEmployee(state, input.employeeId)
+      if (input.action === 'hire') {
+        const candidateName = normalizeString(input.candidateName!, 'candidate name', 200)
+        if (state.employees.some((employee) => employee.status !== 'retired' && employee.name.localeCompare(candidateName, undefined, { sensitivity: 'accent' }) === 0)) throw new Error(`active employee name ${JSON.stringify(candidateName)} already exists`)
+        const duplicate = state.staffingRequests.find((request) => request.action === 'hire' && request.candidateName?.localeCompare(candidateName, undefined, { sensitivity: 'accent' }) === 0 && !['rejected', 'applied'].includes(request.status))
+        if (duplicate !== undefined) throw new Error(`candidate ${JSON.stringify(candidateName)} already has active staffing request ${duplicate.id}`)
+      }
+      if (input.employeeId !== undefined) {
+        const target = requireEmployee(state, input.employeeId)
+        if (target.status === 'retired') throw new Error(`employee ${target.id} is already retired`)
+        const duplicate = state.staffingRequests.find((request) => request.employeeId === target.id && !['rejected', 'applied'].includes(request.status))
+        if (duplicate !== undefined) throw new Error(`employee ${target.id} already has active staffing request ${duplicate.id}`)
+      }
       state.counters.staffing += 1
       const now = Date.now()
       const request: StaffingRequest = {
@@ -364,6 +447,7 @@ export class CompanyRuntime {
   }
 
   async claimStaffingAssessment(caller: Agent, requestId: string): Promise<{ requestId: string; attemptId: string }> {
+    this.assertAdmission()
     const located = await this.requireParticipant(caller)
     if (located.actor.kind !== 'employee') throw new Error('only the designated HR employee can claim staffing assessments')
     const result = await this.store.transact(caller.session.header.cwd, {
@@ -378,6 +462,7 @@ export class CompanyRuntime {
       if (request.status !== 'pending') throw new Error(`staffing request ${request.id} is ${request.status}`)
       request.status = 'in_review'
       request.attemptId = randomUUID()
+      request.reviewDeliveryAttempts = 1
       request.updatedAt = Date.now()
       return { requestId: request.id, attemptId: request.attemptId }
     })
@@ -385,40 +470,62 @@ export class CompanyRuntime {
   }
 
   async submitStaffingAssessment(caller: Agent, input: StaffingAssessmentInput): Promise<StaffingRequest> {
+    this.assertAdmission()
     const located = await this.requireParticipant(caller)
     if (located.actor.kind !== 'employee') throw new Error('only the designated HR employee can submit staffing assessments')
+    const preview = requireStaffingRequest(located.state, input.requestId)
+    const retirement = preview.action === 'retire'
+    const target = !retirement || preview.employeeId === undefined ? undefined : requireEmployee(located.state, preview.employeeId)
+    if (target?.status === 'retired') throw new Error(`employee ${target.id} is already retired`)
+    if (!retirement && (input.provider === undefined || input.model === undefined || input.budgetMicros === undefined || input.orgPath === undefined || input.positionTitle === undefined || input.responsibilities === undefined)) {
+      throw new Error('hire/adjust staffing assessment requires provider, model, employee_budget, org_path, position_title, and responsibilities')
+    }
+    if ((input.provider === undefined) !== (input.model === undefined)) throw new Error('provider and model must be supplied together')
     const founder = this.liveFounder(located.state)
-    if (founder === undefined) throw new Error('founder session must be live to validate the recommended model route')
-    const selection = await resolveEmployeeSelection(this.ctx, founder, this.config, {
-      provider: input.provider, model: input.model, ...(input.reasoningEffort === undefined ? {} : { reasoningEffort: input.reasoningEffort }),
-    })
-    // Hiring draws only from models the founder enabled on the recruiting
-    // page: a route counts as enabled exactly when a complete three-rate
-    // price row (direct or provider wildcard) is configured for it.
-    if (matchModelPrice(located.state.moneyBudget.prices, selection.provider, selection.model) === undefined) {
+    if (founder === undefined) throw new Error('founder session must be live to validate staffing')
+    const targetRoute = target === undefined ? undefined : activeSelection(target.llm)
+    const selection = retirement
+      ? { provider: targetRoute!.provider, model: targetRoute!.model, ...(targetRoute!.reasoningEffort === undefined ? {} : { reasoningEffort: targetRoute!.reasoningEffort }) }
+      : await resolveEmployeeSelection(this.ctx, founder, this.config, {
+        provider: input.provider!, model: input.model!, ...(input.reasoningEffort === undefined ? {} : { reasoningEffort: input.reasoningEffort }),
+      })
+    // New/adjusted routes draw only from models enabled on the recruiting page.
+    // Retirement has no future model admission and must remain possible even if
+    // the old employee's provider or price row disappeared.
+    if (!retirement && matchModelPrice(located.state.moneyBudget.prices, selection.provider, selection.model) === undefined) {
       throw new CompanyUnpricedModelError(selection.provider, selection.model,
         'HR may only recommend models enabled (three-rate priced) on the recruiting page; ask the founder to enable this route first')
     }
+    const targetPosition = target?.positionId === undefined ? undefined : located.state.positions.find((position) => position.id === target.positionId)
+    const assessedBudget = retirement ? target?.budgetMicros ?? 0 : input.budgetMicros!
+    const assessedOrgPath = retirement ? orgPathForEmployee(located.state, target!) : input.orgPath!
+    const assessedPosition = retirement ? target?.role ?? 'Retiring employee' : input.positionTitle!
+    const assessedResponsibilities = retirement ? targetPosition?.responsibilities ?? ['Preserve handover and retirement record'] : input.responsibilities!
     const approvalUserMessage = latestGenuineUserMessage(founder)
     if (approvalUserMessage === undefined) throw new Error('staffing recommendations require a genuine founder-session user message anchor')
     const result = await this.store.transact(caller.session.header.cwd, {
       actor: located.actor.id, type: 'staffing.recommended', summary: `${located.actor.id} submitted staffing assessment ${input.requestId}`,
-    }, (state) => {
+    }, async (state, io) => {
       if (state.phase !== 'operating') throw new Error(`staffing assessments are paused while company is ${state.phase}`)
       const employee = requireEmployeeRunnable(state, located.actor.id)
       if (employee.isHr !== true || state.hrEmployeeId !== employee.id) throw new Error('caller is not the designated HR governance employee')
       const request = requireStaffingRequest(state, input.requestId)
       if (request.status !== 'in_review' || request.attemptId !== input.attemptId) throw new Error('stale staffing assessment capability')
+      if (request.action === 'retire' && input.designateAsHr === true) throw new Error('retirement recommendations cannot designate HR authority')
+      if (request.action !== 'retire' && matchModelPrice(state.moneyBudget.prices, selection.provider, selection.model) === undefined) {
+        throw new CompanyUnpricedModelError(selection.provider, selection.model, 'was disabled before the staffing recommendation committed; re-enable it and retry')
+      }
       request.recommendation = {
         difficulty: input.difficulty,
         provider: selection.provider,
         model: selection.model,
         ...(selection.reasoningEffort === undefined ? {} : { reasoningEffort: selection.reasoningEffort }),
-        budgetMicros: boundedMicros(input.budgetMicros ?? 0, state.moneyBudget.totalMicros, 'budget_micros'),
+        budgetMicros: boundedMicros(assessedBudget, state.moneyBudget.totalMicros, 'budget_micros'),
         rationale: normalizeMultilineString(input.rationale, 'staffing rationale', 16_384),
-        orgPath: normalizeList(input.orgPath, 'org_path', 1, 16, 200),
-        positionTitle: normalizeString(input.positionTitle, 'position title', 500),
-        responsibilities: normalizeList(input.responsibilities, 'responsibilities', 1, 128, 4096),
+        orgPath: normalizeList(assessedOrgPath, 'org_path', 1, 16, 200),
+        positionTitle: normalizeString(assessedPosition, 'position title', 500),
+        responsibilities: normalizeList(assessedResponsibilities, 'responsibilities', 1, 128, 4096),
+        ...(input.designateAsHr === undefined ? {} : { designateAsHr: input.designateAsHr }),
         assessedAt: Date.now(),
       }
       request.status = 'recommended'
@@ -427,21 +534,25 @@ export class CompanyRuntime {
       const approval = createApproval(state, employee.id, {
         kind: 'organization_change',
         summary: `Approve HR staffing recommendation ${request.id}: ${request.action}`,
-        detail: `HR recommends ${request.action === 'hire' ? 'hiring' : request.action} ${request.candidateName === undefined ? 'a team member' : request.candidateName} as ${request.recommendation?.positionTitle ?? 'an employee'} under ${(request.recommendation?.orgPath ?? []).join(' / ') || 'the company root'}${request.recommendation === undefined ? '' : `, running ${request.recommendation.provider}/${request.recommendation.model} with a ${(request.recommendation.budgetMicros ?? 0) / 1_000_000}-unit employee budget`}. Applying is a separate explicit step after approval.`,
-        payload: { action: request.action, staffingRequestId: request.id, ...(request.employeeId === undefined ? {} : { employeeId: request.employeeId }), ...(request.recommendation.budgetMicros === undefined ? {} : { budgetMicros: request.recommendation.budgetMicros }) },
-        risk: request.action === 'retire' ? 'high' : 'medium',
+        detail: request.action === 'retire'
+          ? `HR recommends retiring ${request.employeeId}. Rationale: ${request.recommendation.rationale}. Open work will be capability-revoked and requeued; applying is a separate explicit step after approval.`
+          : `HR recommends ${request.action === 'hire' ? 'hiring' : request.action} ${request.candidateName === undefined ? request.employeeId ?? 'a team member' : request.candidateName} as ${request.recommendation.positionTitle} under ${request.recommendation.orgPath.join(' / ') || 'the company root'}, running ${request.recommendation.provider}/${request.recommendation.model} with a ${(request.recommendation.budgetMicros ?? 0) / 1_000_000}-unit employee budget${request.recommendation.designateAsHr === true ? ', and transferring singleton HR governance authority after successful provisioning' : ''}. Applying is a separate explicit step after approval.`,
+        payload: { action: request.action, staffingRequestId: request.id, ...(request.employeeId === undefined ? {} : { employeeId: request.employeeId }), ...(request.recommendation.budgetMicros === undefined ? {} : { budgetMicros: request.recommendation.budgetMicros }), ...(request.recommendation.designateAsHr === true ? { designateAsHr: true } : {}) },
+        risk: request.action === 'retire' || request.recommendation.designateAsHr === true ? 'high' : 'medium',
         ...(approvalUserMessage === undefined ? {} : { requestedFromUserMessageId: String(approvalUserMessage.id) }),
       })
       request.approvalId = approval.id
+      await queueFounderNotification(state, io, employee.id, `HR completed staffing assessment ${request.id}. The recommendation is recorded as approval ${approval.id} and awaits the human decision; use company_status for the bounded details.`)
       return structuredClone(request)
     })
+    this.kick(caller.session.header.cwd, founder)
     return result.result
   }
 
   async addEmployee(founder: Agent, input: AddEmployeeInput, signal?: AbortSignal): Promise<Employee> {
     this.assertAdmission()
     const located = await this.requireFounder(founder)
-    const planned = input.staffingRequestId === undefined ? undefined : located.state.staffingRequests.find((request) => request.id === input.staffingRequestId)
+    const planned = located.state.staffingRequests.find((request) => request.id === input.staffingRequestId)
     if (planned === undefined || planned.action !== 'hire' || planned.recommendation === undefined) throw new Error('employee hiring requires a completed HR staffing recommendation')
     const recommendation = planned.recommendation
     const name = normalizeString(planned.candidateName ?? input.name, 'employee name', 200)
@@ -453,65 +564,100 @@ export class CompanyRuntime {
     }, signal)
     const executionPrompt = input.executionPrompt === undefined ? undefined : normalizeMultilineString(input.executionPrompt, 'execution_prompt', 16_384)
     let reservationId: string | undefined
-    const created = await this.store.transact(founder.session.header.cwd, {
-      actor: 'founder', type: 'employee.added', summary: `Applied HR hire ${planned.id} for ${name}`,
+    const prepared = await this.store.transact(founder.session.header.cwd, {
+      actor: 'founder', type: 'employee.provisioning_prepared', summary: `Prepared approved HR hire ${planned.id} for ${name}`,
     }, (state) => {
       this.assertSameCompany(located.state, state)
       this.assertFounderState(founder, state)
       if (state.phase !== 'operating') throw new Error(`cannot hire while company is ${state.phase}; resume first`)
-      if (state.employees.length >= Math.min(state.limits.maxEmployees, this.config.maxEmployees)) throw new Error('durable employee roster cap reached')
-      if (state.employees.some((employee) => employee.status !== 'retired' && employee.name.localeCompare(name, undefined, { sensitivity: 'accent' }) === 0)) throw new Error(`active employee name ${JSON.stringify(name)} already exists`)
       const request = requireStaffingRequest(state, planned.id)
-      if (request.status !== 'recommended' || request.approvalId !== input.approvalId) throw new Error('staffing recommendation is not ready for application')
-      const approval = requireApproved(state, input.approvalId, 'organization_change', (payload) => isRecord(payload) && payload.action === 'hire' && payload.staffingRequestId === request.id)
-      const orgUnit = ensureOrgPath(state, recommendation.orgPath)
-      const position = ensurePosition(state, orgUnit.id, recommendation.positionTitle, recommendation.responsibilities)
-      state.counters.employee += 1
-      const employee: Employee = {
-        id: `e${state.counters.employee}`, name, role, department: orgUnit.name, orgUnitId: orgUnit.id, positionId: position.id,
-        budgetMicros: recommendation.budgetMicros ?? input.budgetMicros ?? 0,
-        status: 'provisioning', sessionId: allocateEmployeeSessionId(), llm: selection,
-        ...(executionPrompt === undefined ? {} : { executionPrompt }),
+      if (request.approvalId !== input.approvalId || request.recommendation === undefined) throw new Error('staffing recommendation is not ready for application')
+      if (matchModelPrice(state.moneyBudget.prices, selection.provider, selection.model) === undefined) throw new CompanyUnpricedModelError(selection.provider, selection.model)
+
+      let employee: Employee
+      if (request.employeeId !== undefined) {
+        employee = requireEmployee(state, request.employeeId)
+        if (request.status === 'applied' && employee.status !== 'failed' && employee.status !== 'provisioning') return structuredClone(employee)
+        if (request.status !== 'approved' || employee.status !== 'failed') throw new Error('hire provisioning is not retryable in its current state')
+        const approval = state.approvals.find((candidate) => candidate.id === input.approvalId)
+        if (approval?.kind !== 'organization_change' || approval.status !== 'approved' || approval.consumedAt === undefined) throw new Error('hire retry lost its consumed organization approval')
+        releaseEmployeeMoneyReservations(state, employee.id)
+        employee.sessionId = allocateEmployeeSessionId()
+        employee.status = 'provisioning'
+        employee.failure = undefined
+        employee.llm = selection
+        employee.executionPrompt = executionPrompt
+      } else {
+        if (request.status !== 'approved') throw new Error('staffing recommendation must be human-approved before hiring')
+        const activeHeadcount = state.employees.filter((candidate) => candidate.status !== 'retired').length
+        if (activeHeadcount >= Math.min(state.limits.maxEmployees, this.config.maxEmployees)) throw new Error('active employee headcount cap reached')
+        if (state.employees.some((candidate) => candidate.status !== 'retired' && candidate.name.localeCompare(name, undefined, { sensitivity: 'accent' }) === 0)) throw new Error(`active employee name ${JSON.stringify(name)} already exists`)
+        const approval = requireApproved(state, input.approvalId, 'organization_change', (payload) => isRecord(payload) && payload.action === 'hire' && payload.staffingRequestId === request.id && (payload.designateAsHr === true) === (recommendation.designateAsHr === true))
+        const orgUnit = ensureOrgPath(state, recommendation.orgPath)
+        const position = ensurePosition(state, orgUnit.id, recommendation.positionTitle, recommendation.responsibilities)
+        state.counters.employee += 1
+        employee = {
+          id: `e${state.counters.employee}`, name, role, orgUnitId: orgUnit.id, positionId: position.id,
+          budgetMicros: recommendation.budgetMicros ?? 0,
+          ...(recommendation.designateAsHr === true ? { isHr: true } : {}),
+          status: 'provisioning', sessionId: allocateEmployeeSessionId(), llm: selection,
+          ...(executionPrompt === undefined ? {} : { executionPrompt }),
+        }
+        if ((employee.budgetMicros ?? 0) > state.moneyBudget.totalMicros) throw new Error('employee monetary ceiling exceeds company budget')
+        state.employees.push(employee)
+        request.employeeId = employee.id
+        consumeApproval(approval)
       }
-      if ((employee.budgetMicros ?? 0) > state.moneyBudget.totalMicros) throw new Error('employee monetary ceiling exceeds company budget')
-      state.employees.push(employee)
       reservationId = this.reserveEmployeeTurn(state, employee)
-      request.status = 'applied'
+      request.status = 'approved'
       request.updatedAt = Date.now()
-      consumeApproval(approval)
       return structuredClone(employee)
     })
-    const employee = created.state.employees.find((candidate) => candidate.id === created.result.id)!
+    const employee = prepared.result
+    if (employee.status !== 'provisioning') return employee
+    let childAccepted = false
     try {
-      await startEmployee(this.ctx, this.config, this.selections, founder, created.state, employee, signal ?? new AbortController().signal)
+      await startEmployee(this.ctx, this.config, this.selections, founder, prepared.state, employee, signal ?? new AbortController().signal)
+      childAccepted = true
       const accepted = await this.store.transact(founder.session.header.cwd, {
         actor: 'scheduler', type: 'employee.provisioned', summary: `Employee ${employee.id} continuable session accepted`,
       }, (state) => {
+        const request = requireStaffingRequest(state, planned.id)
         const current = requireEmployee(state, employee.id)
+        if (current.sessionId !== employee.sessionId || current.status !== 'provisioning') throw new Error('hire provisioning was superseded')
         current.status = state.phase === 'operating' ? 'idle' : 'paused'
-        current.joinedAt = Date.now()
+        current.joinedAt ??= Date.now()
         current.failure = undefined
+        this.applyHrSuccession(state, request, current)
+        request.status = 'applied'
+        request.updatedAt = Date.now()
         return structuredClone(current)
       })
       if (accepted.state.phase === 'operating') this.kick(founder.session.header.cwd, founder)
       return accepted.result
     } catch (error) {
+      if (childAccepted && employee.sessionId !== undefined) {
+        await this.ctx.subagents.drainContinuableChildren(founder, [SessionId(employee.sessionId)]).catch(() => undefined)
+        await this.store.recordRetiredSession(founder.session.header.cwd, employee.sessionId).catch(() => undefined)
+      }
       await this.store.transact(founder.session.header.cwd, {
-        actor: 'scheduler', type: 'employee.provisioning_failed', summary: `Employee ${employee.id} provisioning failed`,
+        actor: 'scheduler', type: 'employee.provisioning_failed', summary: `Employee ${employee.id} provisioning failed and remains retryable`,
       }, (state) => {
         releaseMoneyReservation(state, reservationId)
         const current = requireEmployee(state, employee.id)
-        current.status = 'failed'
-        current.failure = boundedError(error)
+        if (current.sessionId === employee.sessionId) {
+          current.status = 'failed'
+          current.failure = boundedError(error)
+        }
         const request = requireStaffingRequest(state, planned.id)
-        request.status = 'recommended'
+        request.status = 'approved'
         request.updatedAt = Date.now()
-      })
+      }).catch(() => undefined)
       throw error
     }
   }
 
-  async removeEmployee(founder: Agent, employeeId: string, reason: string, approvalId?: string, staffingRequestId?: string, signal?: AbortSignal): Promise<Employee> {
+  async removeEmployee(founder: Agent, employeeId: string, reason: string, approvalId: string, staffingRequestId: string, signal?: AbortSignal): Promise<Employee> {
     this.assertAdmission()
     const located = await this.requireFounder(founder)
     const normalizedReason = normalizeString(reason, 'removal reason', 4096)
@@ -528,22 +674,36 @@ export class CompanyRuntime {
       if (employee.status === 'retired') throw new Error(`employee ${employeeId} is already retired`)
       if (state.phase === 'staged' || state.phase === 'provisioning' || state.phase === 'provisioning_failed') throw new Error('the default HR employee is part of the formation plan; edit or discard the formation instead')
       if (employee.isHr === true && state.hrEmployeeId === employee.id) throw new Error('designate and provision a replacement HR governance employee before retiring the current one')
-      const staffing = staffingRequestId === undefined ? undefined : requireStaffingRequest(state, staffingRequestId)
-      if (staffing === undefined || staffing.action !== 'retire' || staffing.employeeId !== employeeId || staffing.status !== 'recommended' || staffing.approvalId !== approvalId) throw new Error('retirement requires the matching HR staffing recommendation')
+      const staffing = requireStaffingRequest(state, staffingRequestId)
+      if (staffing.action !== 'retire' || staffing.employeeId !== employeeId || staffing.status !== 'approved' || staffing.approvalId !== approvalId) throw new Error('retirement requires the matching approved HR staffing recommendation')
       const approval = requireApproved(state, approvalId, 'organization_change', (payload) => isRecord(payload) && payload.action === 'retire' && payload.employeeId === employeeId && payload.staffingRequestId === staffing.id)
       consumeApproval(approval)
       staffing.status = 'applied'
       staffing.updatedAt = Date.now()
       for (const work of state.workItems) {
-        if (work.assigneeId !== employeeId || !isOpenStatus(work.status)) continue
-        if (work.reservationId !== undefined) {
-        releaseMoneyReservation(state, work.reservationId)
-      }
-        invalidateAttempt(work, employeeId, normalizedReason)
+        if (work.assigneeId !== employeeId || ['completed', 'cancelled'].includes(work.status)) continue
+        if (work.reservationId !== undefined) releaseMoneyReservation(state, work.reservationId)
+        if (isOpenStatus(work.status)) invalidateAttempt(work, employeeId, normalizedReason)
         work.assigneeId = undefined
+        work.handoffId = undefined
         work.reassigning = false
+        work.reservationId = undefined
+        work.leaseAt = undefined
+        work.updatedAt = Date.now()
+        if (work.ticketId !== undefined) {
+          const ticket = state.tickets.find((candidate) => candidate.id === work.ticketId)
+          if (ticket !== undefined && ticket.status === 'dispatched') {
+            ticket.status = 'triaged'
+            ticket.assigneeId = undefined
+          }
+        }
       }
       releaseEmployeeMoneyReservations(state, employee.id)
+      for (const authorization of state.temporaryAuthorizations) {
+        if (authorization.employeeId === employee.id && authorization.revokedAt === undefined) revokeAuthorizationRecord(state, authorization.id, `Employee retired: ${normalizedReason.slice(0, 4_000)}`, Date.now())
+      }
+      if (state.supportEmployeeId === employee.id) state.supportEmployeeId = undefined
+      for (const unit of state.orgUnits) if (unit.managerEmployeeId === employee.id) unit.managerEmployeeId = undefined
       employee.status = 'retired'
       employee.retiredAt = Date.now()
       employee.failure = undefined
@@ -552,10 +712,12 @@ export class CompanyRuntime {
     if (previous?.sessionId !== undefined) {
       try {
         interruptEmployee(this.ctx, founder, previous)
-        await waitForEmployeeIdle(this.ctx, previous, signal)
-      } finally {
-        await this.store.recordRetiredSession(founder.session.header.cwd, previous.sessionId)
+        await waitForEmployeeIdle(this.ctx, previous, signal ?? AbortSignal.timeout(10_000))
+      } catch (error) {
+        this.ctx.logger.warn(`dsh-company retired ${employeeId} after best-effort idle wait failed: ${boundedError(error)}`)
       }
+      await this.store.recordRetiredSession(founder.session.header.cwd, previous.sessionId)
+        .catch((error) => this.ctx.logger.warn(`dsh-company retired-session index update failed for ${employeeId}: ${boundedError(error)}`))
     }
     this.kick(founder.session.header.cwd, founder)
     return revoked.result
@@ -577,11 +739,24 @@ export class CompanyRuntime {
     const prepared = await this.store.transact(founder.session.header.cwd, {
       actor: 'founder', type: 'staffing.adjustment_applied', summary: `Applied HR adjustment ${requestId}`,
     }, (state) => {
+      this.assertSameCompany(located.state, state)
+      this.assertFounderState(founder, state)
       if (state.phase !== 'operating') throw new Error(`cannot adjust staff while company is ${state.phase}; resume first`)
       const request = requireStaffingRequest(state, requestId)
-      if (request.status !== 'recommended' || request.approvalId !== approvalId || request.employeeId === undefined) throw new Error('staffing adjustment is not approved for application')
-      const approval = requireApproved(state, approvalId, 'organization_change', (payload) => isRecord(payload) && payload.action === 'adjust' && payload.staffingRequestId === request.id && payload.employeeId === request.employeeId)
+      if (request.approvalId !== approvalId || request.employeeId === undefined) throw new Error('staffing adjustment is not approved for application')
       const employee = requireEmployee(state, request.employeeId)
+      const approvalRecord = state.approvals.find((candidate) => candidate.id === approvalId)
+      if (request.status === 'approved' && employee.status === 'failed' && approvalRecord?.kind === 'organization_change' && approvalRecord.status === 'approved' && approvalRecord.consumedAt !== undefined) {
+        releaseEmployeeMoneyReservations(state, employee.id)
+        employee.sessionId = allocateEmployeeSessionId()
+        employee.status = 'provisioning'
+        employee.failure = undefined
+        reservationId = this.reserveEmployeeTurn(state, employee)
+        request.updatedAt = Date.now()
+        return structuredClone(employee)
+      }
+      if (request.status !== 'approved') throw new Error('staffing adjustment must be human-approved before application')
+      const approval = requireApproved(state, approvalId, 'organization_change', (payload) => isRecord(payload) && payload.action === 'adjust' && payload.staffingRequestId === request.id && payload.employeeId === request.employeeId && (payload.designateAsHr === true) === (recommendation.designateAsHr === true))
       if (employee.isHr === true) throw new Error('HR self-adjustment requires a separately designated HR reviewer')
       const unit = ensureOrgPath(state, recommendation.orgPath)
       const position = ensurePosition(state, unit.id, recommendation.positionTitle, recommendation.responsibilities)
@@ -599,9 +774,8 @@ export class CompanyRuntime {
       // time, so bumping it live is safe. Only a route or persona change
       // forces the retire-and-reprovision dance, because continuable
       // descriptors freeze agentProvider/agentModel and persona at creation.
-      if (routeUnchanged && personaUnchanged && employee.status !== 'failed' && employee.sessionId !== undefined) {
+      if (routeUnchanged && personaUnchanged && recommendation.designateAsHr !== true && employee.status !== 'failed' && employee.sessionId !== undefined) {
         employee.role = recommendation.positionTitle
-        employee.department = unit.name
         employee.orgUnitId = unit.id
         employee.positionId = position.id
         employee.budgetMicros = nextBudget
@@ -619,6 +793,7 @@ export class CompanyRuntime {
           }
         work.status = 'pending'
         work.attempt = Math.max(0, work.attempt - 1)
+        work.deliveryAttempts = 0
         work.attemptId = undefined
         work.reservationId = undefined
         work.leaseAt = undefined
@@ -628,16 +803,17 @@ export class CompanyRuntime {
         openWork: state.workItems.filter((work) => work.assigneeId === employee.id && work.status === 'pending').map((work) => `${work.id}: ${work.subject}`),
       }
       employee.role = recommendation.positionTitle
-      employee.department = unit.name
       employee.orgUnitId = unit.id
       employee.positionId = position.id
       employee.budgetMicros = nextBudget
       employee.llm = selection
+      if (recommendation.designateAsHr === true) employee.isHr = true
       employee.sessionId = allocateEmployeeSessionId()
       employee.status = 'provisioning'
+      if (state.supportEmployeeId === employee.id) state.supportEmployeeId = undefined
       employee.failure = undefined
       reservationId = this.reserveEmployeeTurn(state, employee)
-      request.status = 'applied'
+      request.status = 'approved'
       request.updatedAt = Date.now()
       consumeApproval(approval)
       return structuredClone(employee)
@@ -651,32 +827,47 @@ export class CompanyRuntime {
     if (oldSessionId !== undefined) {
       const previous = { ...prepared.result, sessionId: oldSessionId }
       interruptEmployee(this.ctx, founder, previous)
-      await waitForEmployeeIdle(this.ctx, previous, signal).catch(() => undefined)
+      await waitForEmployeeIdle(this.ctx, previous, signal ?? AbortSignal.timeout(10_000)).catch(() => undefined)
       await this.store.recordRetiredSession(founder.session.header.cwd, oldSessionId)
+        .catch((error) => this.ctx.logger.warn(`dsh-company adjusted employee retired-session index update failed: ${boundedError(error)}`))
     }
+    let childAccepted = false
     try {
       await startEmployee(this.ctx, this.config, this.selections, founder, prepared.state, prepared.result, signal ?? new AbortController().signal, handoff)
+      childAccepted = true
       const accepted = await this.store.transact(founder.session.header.cwd, {
         actor: 'scheduler', type: 'employee.reprovisioned', summary: `Employee ${prepared.result.id} accepted its adjusted route`,
       }, (state) => {
         const employee = requireEmployee(state, prepared.result.id)
+        if (employee.sessionId !== prepared.result.sessionId || employee.status !== 'provisioning') throw new Error('staffing reprovision was superseded')
         employee.status = state.phase === 'operating' ? 'idle' : 'paused'
         employee.joinedAt = Date.now()
+        employee.failure = undefined
+        const request = requireStaffingRequest(state, requestId)
+        this.applyHrSuccession(state, request, employee)
+        request.status = 'applied'
+        request.updatedAt = Date.now()
         return structuredClone(employee)
       })
       this.kick(founder.session.header.cwd, founder)
       return accepted.result
     } catch (error) {
+      if (childAccepted && prepared.result.sessionId !== undefined) {
+        await this.ctx.subagents.drainContinuableChildren(founder, [SessionId(prepared.result.sessionId)]).catch(() => undefined)
+        await this.store.recordRetiredSession(founder.session.header.cwd, prepared.result.sessionId).catch(() => undefined)
+      }
       await this.store.transact(founder.session.header.cwd, {
-        actor: 'scheduler', type: 'employee.reprovisioning_failed', summary: `Adjusted employee ${prepared.result.id} failed to start`,
+        actor: 'scheduler', type: 'employee.reprovisioning_failed', summary: `Adjusted employee ${prepared.result.id} failed to start and remains retryable`,
       }, (state) => {
         releaseMoneyReservation(state, reservationId)
         const employee = requireEmployee(state, prepared.result.id)
+        if (employee.sessionId !== prepared.result.sessionId || employee.status !== 'provisioning') return
         employee.status = 'failed'
         employee.failure = boundedError(error)
         const request = requireStaffingRequest(state, requestId)
-        request.status = 'recommended'
-      })
+        request.status = 'approved'
+        request.updatedAt = Date.now()
+      }).catch(() => undefined)
       throw error
     }
   }
@@ -689,10 +880,7 @@ export class CompanyRuntime {
     const summary = normalizeMultilineString(input.summary, 'product summary', 16_384)
     const productRoot = normalizeWorkspaceRelative(workspace, input.productRoot, 'product_root')
     const criteria = normalizeList(input.successCriteria, 'success_criteria', 1, 256, 16_384)
-    const requestedTokenBudget = input.tokenBudget ?? 0
-    const requestedBudgetMicros = input.budgetMicros ?? 0
-    boundedTokenBudget(requestedTokenBudget, this.config.maxTokenBudget, 'token_budget')
-    boundedMicros(requestedBudgetMicros, this.config.maxMoneyBudgetMicros, 'budget_micros')
+    const requestedBudgetMicros = boundedMicros(input.budgetMicros, this.config.maxMoneyBudgetMicros, 'budget_micros')
     const result = await this.store.transact(founder.session.header.cwd, {
       actor: 'founder',
       type: 'product.created',
@@ -703,9 +891,7 @@ export class CompanyRuntime {
       if (!['operating', 'paused', 'halted'].includes(state.phase)) throw new Error('the first product belongs to the formation decision; additional products may be created only after formation approval')
       if (state.products.length >= Math.min(state.limits.maxProducts, this.config.maxProducts)) throw new Error('product cap reached')
       if (state.products.some((product) => product.name === name || product.productRoot === productRoot)) throw new Error('product name and product_root must be unique')
-      const allocated = state.products.filter((product) => !['cancelled', 'retired'].includes(product.status)).reduce((sum, product) => sum + product.tokenBudget, 0)
-      if (allocated + requestedTokenBudget > state.tokenBudget.totalTokens) throw new Error('product token allocations exceed company token budget')
-      const moneyAllocated = state.products.filter((product) => !['cancelled', 'retired'].includes(product.status)).reduce((sum, product) => sum + (product.budgetMicros ?? 0), 0)
+      const moneyAllocated = state.products.filter((product) => !['cancelled', 'retired'].includes(product.status)).reduce((sum, product) => sum + product.budgetMicros, 0)
       if (moneyAllocated + requestedBudgetMicros > state.moneyBudget.totalMicros) throw new Error('product monetary allocations exceed company budget')
       state.counters.product += 1
       const now = Date.now()
@@ -716,8 +902,6 @@ export class CompanyRuntime {
         status: 'proposed',
         productRoot,
         successCriteria: criteria,
-        budgetCredits: 0,
-        tokenBudget: boundedTokenBudget(requestedTokenBudget, state.tokenBudget.totalTokens, 'token_budget'),
         budgetMicros: boundedMicros(requestedBudgetMicros, state.moneyBudget.totalMicros, 'budget_micros'),
         createdAt: now,
         updatedAt: now,
@@ -735,8 +919,6 @@ export class CompanyRuntime {
       status?: ProductStatus
       summary?: string
       successCriteria?: string[]
-      tokenBudget?: number
-      budgetMicros?: number
       approvalId?: string
     },
   ): Promise<Product> {
@@ -750,7 +932,7 @@ export class CompanyRuntime {
       this.assertSameCompany(located.state, state)
       this.assertFounderState(founder, state)
       const product = requireProduct(state, input.productId)
-      if (['released', 'retired', 'cancelled'].includes(product.status) && (input.summary !== undefined || input.successCriteria !== undefined || input.tokenBudget !== undefined || input.budgetMicros !== undefined)) {
+      if (['released', 'retired', 'cancelled'].includes(product.status) && (input.summary !== undefined || input.successCriteria !== undefined)) {
         throw new Error(`terminal product ${product.id} metadata is immutable`)
       }
       if (input.summary !== undefined) {
@@ -758,21 +940,6 @@ export class CompanyRuntime {
         product.summary = normalizeMultilineString(input.summary, 'product summary', 16_384)
       }
       if (input.successCriteria !== undefined) product.successCriteria = normalizeList(input.successCriteria, 'success_criteria', 1, 256, 16_384)
-      if (input.tokenBudget !== undefined) {
-        const next = boundedTokenBudget(input.tokenBudget, state.tokenBudget.totalTokens, 'token_budget')
-        const other = state.products.filter((candidate) => candidate.id !== product.id && !['cancelled', 'retired'].includes(candidate.status)).reduce((sum, candidate) => sum + candidate.tokenBudget, 0)
-        if (other + next > state.tokenBudget.totalTokens) throw new Error('product allocations exceed company token budget')
-        product.tokenBudget = next
-      }
-      if (input.budgetMicros !== undefined) {
-        const next = boundedMicros(input.budgetMicros, state.moneyBudget.totalMicros, 'budget_micros')
-        const totals = state.moneyBudget.usage.filter((entry) => entry.productId === product.id).reduce((sum, entry) => sum + entry.costMicros, 0)
-          + state.moneyBudget.reservations.filter((entry) => entry.productId === product.id).reduce((sum, entry) => sum + entry.remainingMicros, 0)
-        if (next < totals) throw new Error('product monetary budget is below spent plus reserved micros')
-        const other = state.products.filter((candidate) => candidate.id !== product.id && !['cancelled', 'retired'].includes(candidate.status)).reduce((sum, candidate) => sum + (candidate.budgetMicros ?? 0), 0)
-        if (other + next > state.moneyBudget.totalMicros) throw new Error('product monetary allocations exceed company budget')
-        product.budgetMicros = next
-      }
       if (input.status !== undefined && input.status !== product.status) this.transitionProduct(state, product, input.status, input.approvalId)
       product.updatedAt = Date.now()
       return structuredClone(product)
@@ -874,7 +1041,7 @@ export class CompanyRuntime {
       const work = requireWork(state, workId)
       if (work.status === 'completed') throw new Error('completed work is immutable')
       if (assigneeId !== 'founder') requireEmployeeRunnable(state, assigneeId)
-      if (work.assigneeId !== undefined && work.assigneeId !== 'founder') oldEmployee = structuredClone(requireEmployee(state, work.assigneeId))
+      if (isOpenStatus(work.status) && work.assigneeId !== undefined && work.assigneeId !== 'founder') oldEmployee = structuredClone(requireEmployee(state, work.assigneeId))
       if (work.reservationId !== undefined) {
         releaseMoneyReservation(state, work.reservationId)
       }
@@ -885,7 +1052,7 @@ export class CompanyRuntime {
     if (oldEmployee !== undefined) {
       try {
         interruptEmployee(this.ctx, founder, oldEmployee)
-        await waitForEmployeeIdle(this.ctx, oldEmployee, signal)
+        await waitForEmployeeIdle(this.ctx, oldEmployee, signal ?? AbortSignal.timeout(10_000))
       } catch (error) {
         waitError = error
       }
@@ -900,7 +1067,7 @@ export class CompanyRuntime {
       return structuredClone(work)
     })
     this.kick(founder.session.header.cwd, founder)
-    if (waitError !== undefined) throw waitError
+    if (waitError !== undefined) this.ctx.logger.warn(`dsh-company reassignment ${workId} completed after best-effort idle wait failed: ${boundedError(waitError)}`)
     return finished.result ?? invalidated.result
   }
 
@@ -938,16 +1105,22 @@ export class CompanyRuntime {
       actor: located.actor.id,
       type: 'work.updated',
       summary: `${located.actor.id} updated work ${input.workId} to ${input.status ?? 'unchanged status'}`,
-    }, (state) => {
+    }, async (state, io) => {
       const actor = this.actorFor(state, caller)
       const owner = actor.kind === 'founder' ? 'founder' : actor.id
       const work = updateWork(state, workspace, owner, input)
-      if (work.ticketId !== undefined && ['completed', 'failed', 'cancelled'].includes(work.status)) {
+      const terminalStatus = work.status
+      const terminalOutput = work.output
+      const terminalUpdate = ['completed', 'failed', 'cancelled'].includes(terminalStatus)
+      if (work.ticketId !== undefined && terminalUpdate) {
         syncTicketResolution(state, work)
       }
-      if (actor.kind === 'employee' && ['completed', 'failed', 'cancelled'].includes(work.status)) {
+      if (actor.kind === 'employee' && terminalUpdate) {
         const employee = requireEmployee(state, actor.id)
         if (employee.status !== 'retired' && state.phase === 'operating') employee.status = 'idle'
+        if (work.ticketId === undefined || terminalStatus !== 'completed') {
+          await queueFounderNotification(state, io, actor.id, `Employee ${actor.id} finished work ${work.id} with status ${terminalStatus}. Recorded output: ${terminalOutput ?? '(none)'}`)
+        }
       }
       return structuredClone(work)
     })
@@ -956,7 +1129,7 @@ export class CompanyRuntime {
     return result.result
   }
 
-  async reprobeModels(founder: Agent, expectedRevision?: number): Promise<CompanyState['modelCatalog']> {
+  async reprobeModels(founder: Agent, expectedRevision?: number, signal?: AbortSignal): Promise<CompanyState['modelCatalog']> {
     this.assertAdmission()
     const located = await this.requireFounder(founder)
     const topologyEpoch = this.modelTopologyEpoch
@@ -972,7 +1145,7 @@ export class CompanyRuntime {
     for (const route of requiredRoutes) if (!seed.models.some((candidate) => candidate.provider === route.provider && candidate.model === route.model)) {
       seed.models.push({ provider: route.provider, model: route.model, name: route.model, advertised: false, available: false })
     }
-    const probed = await probeRegisteredModels(this.ctx, seed)
+    const probed = await probeRegisteredModels(this.ctx, seed, signal)
     if (this.modelTopologyEpoch !== topologyEpoch) throw new Error('model topology changed during reprobe; retry against the new adapter/settings generation')
     if ((probed.probedAt ?? 0) <= topologyChangedAt) probed.probedAt = topologyChangedAt + 1
     const result = await this.store.transact(founder.session.header.cwd, {
@@ -982,7 +1155,6 @@ export class CompanyRuntime {
       this.assertFounderState(founder, state)
       if (this.modelTopologyEpoch !== topologyEpoch) throw new Error('model topology changed before reprobe commit; retry')
       state.modelCatalog = structuredClone(probed)
-      state.moneyBudget.prices = mergeDiscoveredPriceRows(state.moneyBudget.prices, probed, state.moneyBudget.pricingRevision, probed.probedAt ?? Date.now())
       return structuredClone(state.modelCatalog)
     })
     return result.result
@@ -1092,7 +1264,7 @@ export class CompanyRuntime {
     }, (state) => {
       this.assertSameCompany(located.state, state)
       this.assertFounderState(founder, state)
-      const approval = input.approvalId === undefined ? undefined : requireApproved(state, input.approvalId, 'temporary_authorization', (payload) => isRecord(payload)
+      const approval = requireApproved(state, input.approvalId, 'temporary_authorization', (payload) => isRecord(payload)
         && payload.action === 'grant'
         && payload.employeeId === input.employeeId
         && payload.reason === reason
@@ -1104,9 +1276,9 @@ export class CompanyRuntime {
         reason,
         ...(input.startsAt === undefined ? {} : { startsAt: input.startsAt }),
         expiresAt: input.expiresAt,
-        ...(approval === undefined ? {} : { approvalId: approval.id }),
+        approvalId: approval.id,
       }, { maxMs: this.config.maxTemporaryAuthorizationMs }, now)
-      if (approval !== undefined) consumeApproval(approval)
+      consumeApproval(approval)
       return structuredClone(authorization)
     })
     this.kick(founder.session.header.cwd, founder)
@@ -1123,12 +1295,12 @@ export class CompanyRuntime {
     }, (state) => {
       this.assertSameCompany(located.state, state)
       this.assertFounderState(founder, state)
-      const approval = input.approvalId === undefined ? undefined : requireApproved(state, input.approvalId, 'temporary_authorization', (payload) => isRecord(payload)
+      const approval = requireApproved(state, input.approvalId, 'temporary_authorization', (payload) => isRecord(payload)
         && payload.action === 'revoke'
         && payload.authorizationId === input.authorizationId
         && payload.reason === reason)
       const authorization = revokeAuthorizationRecord(state, input.authorizationId, reason, Date.now())
-      if (approval !== undefined) consumeApproval(approval)
+      consumeApproval(approval)
       return structuredClone(authorization)
     })
     return result.result
@@ -1153,12 +1325,12 @@ export class CompanyRuntime {
       actor: located.actor.id,
       type: 'approval.requested',
       summary: `${located.actor.id} requested ${input.kind} approval`,
-    }, (state) => {
+    }, async (state, io) => {
       const actor = this.actorFor(state, caller)
       if (actor.kind !== 'founder' && ['budget_change', 'pricing_change', 'governance_change', 'temporary_authorization'].includes(input.kind)) {
         throw new Error(`${input.kind} requests are founder-only governance operations`)
       }
-      return structuredClone(createApproval(state, actor.id, {
+      const approval = createApproval(state, actor.id, {
         kind: input.kind,
         summary: input.summary,
         ...(input.detail === undefined ? {} : { detail: input.detail }),
@@ -1166,8 +1338,11 @@ export class CompanyRuntime {
         ...(input.risk === undefined ? {} : { risk: input.risk }),
         ...(input.expiresAt === undefined ? {} : { expiresAt: input.expiresAt }),
         ...(latestUser === undefined ? {} : { requestedFromUserMessageId: String(latestUser.id) }),
-      }))
+      })
+      if (actor.kind === 'employee') await queueFounderNotification(state, io, actor.id, `Employee ${actor.id} opened ${input.kind} approval ${approval.id}: ${approval.summary}. The request awaits a human decision.`)
+      return structuredClone(approval)
     })
+    if (located.actor.kind === 'employee') this.kick(caller.session.header.cwd, founder)
     return result.result
   }
 
@@ -1193,6 +1368,29 @@ export class CompanyRuntime {
         humanStatement: input.humanStatement,
         ...(input.note === undefined ? {} : { note: input.note }),
       })
+      if (resolved.approval.kind === 'organization_change' && isRecord(resolved.approval.payload)) {
+        const requestId = resolved.approval.payload.staffingRequestId
+        const request = typeof requestId === 'string' ? state.staffingRequests.find((candidate) => candidate.id === requestId && candidate.approvalId === resolved.approval.id) : undefined
+        if (request !== undefined) {
+          request.status = resolved.approval.status === 'approved' ? 'approved' : 'rejected'
+          request.updatedAt = Date.now()
+        }
+      }
+      if (source === 'ui' && resolved.approval.kind === 'temporary_authorization' && resolved.approval.status === 'approved' && isRecord(resolved.approval.payload)) {
+        const payload = resolved.approval.payload
+        if (payload.action === 'grant') {
+          createTemporaryAuthorization(state, {
+            approvalId: resolved.approval.id,
+            employeeId: String(payload.employeeId),
+            reason: String(payload.reason),
+            ...(payload.startsAt === undefined ? {} : { startsAt: Number(payload.startsAt) }),
+            expiresAt: Number(payload.expiresAt),
+          }, { maxMs: this.config.maxTemporaryAuthorizationMs }, Date.now())
+        } else if (payload.action === 'revoke') {
+          revokeAuthorizationRecord(state, String(payload.authorizationId), String(payload.reason), Date.now())
+        }
+        consumeApproval(resolved.approval)
+      }
       if (input.decision === 'approved' && resolved.applied && resolved.approval.kind === 'governance_change') {
         const changed = ['slogan', 'mission', 'charter'].filter((field) => isRecord(resolved.approval.payload) && resolved.approval.payload[field] !== undefined)
         state.governanceNotifications.push({
@@ -1263,69 +1461,16 @@ export class CompanyRuntime {
       state.formation.status = 'approved'
       state.formation.approvedAt = state.approvedAt
       state.health = { status: 'healthy', resumable: true }
-      state.planReviewState = undefined
       state.provisioning = { id: generationId, startedAt: Date.now(), approvalId: approval.id, employeeIds, reservationIds }
       return { generationId, employeeIds, reservationIds }
     })
-    const generation = prepared.result
-    for (let index = 0; index < generation.employeeIds.length; index += 1) {
-      const employeeId = generation.employeeIds[index]!
-      const reservationId = generation.reservationIds[index]!
-      let state = await this.requireActiveState(founder)
-      let employee = requireEmployee(state, employeeId)
-      try {
-        try {
-          await startEmployee(this.ctx, this.config, this.selections, founder, state, employee, new AbortController().signal)
-        } catch (error) {
-          if (!isFallbackEligible(error) || employee.llm.fallback === undefined) throw error
-          const fallbackState = await this.store.transact(founder.session.header.cwd, {
-            actor: 'scheduler',
-            type: 'employee.fallback_activated',
-            summary: `Activated one-time fallback for employee ${employee.id}`,
-          }, (fresh) => {
-            const current = requireEmployee(fresh, employeeId)
-            if (!activateFallback(current)) throw error
-            return structuredClone(current)
-          })
-          state = fallbackState.state
-          employee = fallbackState.result
-          await startEmployee(this.ctx, this.config, this.selections, founder, state, employee, new AbortController().signal)
-        }
-        await this.store.transact(founder.session.header.cwd, {
-          actor: 'scheduler',
-          type: 'employee.provisioned',
-          summary: `Employee ${employeeId} accepted initial continuable turn`,
-        }, (fresh) => {
-          if (fresh.provisioning?.id !== generation.generationId) throw new Error('provisioning generation was superseded')
-          const current = requireEmployee(fresh, employeeId)
-          current.status = 'idle'
-          current.joinedAt ??= Date.now()
-          current.failure = undefined
-        })
-      } catch (error) {
-        await this.failProvisioning(founder, generation.generationId, employeeId, error)
-        return this.requireActiveState(founder)
-      }
-    }
-    const operating = await this.store.transact(founder.session.header.cwd, {
-      actor: 'scheduler',
-      type: 'company.operating',
-      summary: 'All planned employees provisioned; company is operating',
-    }, (state) => {
-      if (state.provisioning?.id !== generation.generationId || state.phase !== 'provisioning') throw new Error('provisioning generation is no longer current')
-      if (state.employees.some((employee) => employee.status === 'provisioning' || employee.status === 'planned' || employee.status === 'failed')) throw new Error('not every employee finished provisioning')
-      state.phase = 'operating'
-      state.provisioning = undefined
-      for (const product of state.products) if (product.status === 'approved') product.status = 'active'
-    })
-    this.kick(founder.session.header.cwd, founder)
-    return operating.state
+    return this.continueBootstrapProvisioning(founder, prepared.result.generationId)
   }
 
   async sendMessage(caller: Agent, to: 'founder' | string, content: string, signal?: AbortSignal): Promise<CompanyMessage> {
     this.assertAdmission()
     const located = await this.requireParticipant(caller)
-    const normalized = normalizeString(content, 'message content', located.state.limits.maxMessageChars)
+    const normalized = normalizeMultilineString(content, 'message content', located.state.limits.maxMessageChars)
     let reservationId: string | undefined
     const queued = await this.store.transact(caller.session.header.cwd, {
       actor: located.actor.id,
@@ -1339,7 +1484,7 @@ export class CompanyRuntime {
       }
       if (to === actor.id) throw new Error('company messages must target another participant')
       const messages = await io.readMailbox(to)
-      if (messages.length >= state.limits.maxMailboxMessages) throw new Error(`recipient mailbox is full (${state.limits.maxMailboxMessages})`)
+      makeMailboxRoom(messages, state.limits.maxMailboxMessages)
       const message: CompanyMessage = {
         id: randomUUID(),
         from: actor.id,
@@ -1452,10 +1597,16 @@ export class CompanyRuntime {
           if (changed) await io.writeMailbox(employee.id, messages)
         }
         for (const request of state.staffingRequests) {
-          if (request.status !== 'in_review') continue
-          request.status = 'pending'
-          request.attemptId = undefined
-          request.updatedAt = Date.now()
+          if (request.reservationId !== undefined) releaseMoneyReservation(state, request.reservationId)
+          request.reservationId = undefined
+          request.leaseAt = undefined
+          if (request.status === 'in_review') {
+            request.status = 'pending'
+            request.attemptId = undefined
+            request.reviewDeliveryAttempts = 0
+            request.lastDeliveredAt = undefined
+            request.updatedAt = Date.now()
+          }
         }
         for (const work of state.workItems) {
           if (!isOpenStatus(work.status)) continue
@@ -1503,21 +1654,22 @@ export class CompanyRuntime {
     }
     if (action === 'discard_staged') {
       if (located.state.phase !== 'staged') throw new Error('discard_staged applies only to a staged company')
-      return this.store.archive(founder.session.header.cwd, expectedRevision)
+      return this.store.archive(founder.session.header.cwd, expectedRevision, undefined, { companyId: located.state.id, reason: normalizedReason, stagedOnly: true })
     }
     const unfinished = located.state.workItems.filter((work) => !['completed', 'cancelled'].includes(work.status))
-    // The forced_archive approval is validated and consumed inside the archive
-    // transaction itself (store.archive) so a failed rename can never burn it.
+    // Validate before interrupting anyone; the Store revalidates and consumes in
+    // the same archive transaction after the bounded quiescence wait.
+    if (unfinished.length > 0) requireApproved(located.state, approvalId, 'forced_archive', (payload) => isRecord(payload) && payload.reason === normalizedReason)
     for (const employee of located.state.employees) if (employee.status !== 'retired') interruptEmployee(this.ctx, founder, employee)
-    for (const employee of located.state.employees) await waitForEmployeeIdle(this.ctx, employee).catch(() => undefined)
-    return this.store.archive(founder.session.header.cwd, expectedRevision, unfinished.length > 0 ? approvalId : undefined)
+    for (const employee of located.state.employees) await waitForEmployeeIdle(this.ctx, employee, AbortSignal.timeout(10_000)).catch(() => undefined)
+    return this.store.archive(founder.session.header.cwd, expectedRevision, approvalId, { companyId: located.state.id, reason: normalizedReason })
   }
 
   async handleUiAction(founder: Agent, request: CompanyActionRequest): Promise<CompanySnapshot> {
     if (String(founder.id) !== request.sessionId) throw new Error('UI action sessionId does not identify the exact live founder')
     const located = await this.requireFounder(founder)
     if (located.state.id !== request.companyId) throw new Error('UI action companyId does not match the active company')
-    const action = legacyUiAction(request.action, request.payload)
+    const action = parseUiAction(request.action, request.payload)
     let archived = false
     let ticketNotice: string | undefined
     switch (action.type) {
@@ -1537,7 +1689,7 @@ export class CompanyRuntime {
         }, 'ui')
         break
       case 'file_ticket': {
-        const ticket = await this.fileTicket(founder, action.input)
+        const ticket = await this.fileTicket(founder, action.input, request.expectedRevision)
         ticketNotice = `ticket ${ticket.id} (${ticket.title}) filed for product ${ticket.productId}; awaiting your triage (company_triage_ticket) and dispatch (company_dispatch_ticket), or delegate to the designated support engineer`
         break
       }
@@ -1550,11 +1702,37 @@ export class CompanyRuntime {
       case 'request_budget_change':
         await this.requestBudgetChange(founder, action.input, request.expectedRevision, 'ui')
         break
-      case 'grant_temporary_authorization':
-        await this.grantTemporaryAuthorization(founder, action.input, request.expectedRevision)
+      case 'grant_temporary_authorization': {
+        const now = Date.now()
+        const startsAt = action.input.startsAt ?? now
+        requireEmployeeRunnable(located.state, action.input.employeeId)
+        if (!Number.isSafeInteger(startsAt) || !Number.isSafeInteger(action.input.expiresAt) || startsAt < 0 || action.input.expiresAt <= startsAt || action.input.expiresAt - startsAt > this.config.maxTemporaryAuthorizationMs) {
+          throw new Error(`temporary authorization must have a positive duration no greater than ${this.config.maxTemporaryAuthorizationMs}ms`)
+        }
+        await this.requestApproval(founder, {
+          kind: 'temporary_authorization',
+          summary: `Authorize temporary admission for ${action.input.employeeId}`,
+          detail: `Grant a bounded temporary authorization to ${action.input.employeeId} until epoch ${action.input.expiresAt}. It may bypass internal monetary admission and pending product/model approvals, but never Host permissions or protected external-effect/release decisions.`,
+          payload: {
+            action: 'grant',
+            employeeId: action.input.employeeId,
+            reason: action.input.reason,
+            ...(action.input.startsAt === undefined ? {} : { startsAt: action.input.startsAt }),
+            expiresAt: action.input.expiresAt,
+          },
+          risk: 'high',
+          expiresAt: action.input.expiresAt,
+        }, request.expectedRevision, 'ui')
         break
+      }
       case 'revoke_temporary_authorization':
-        await this.revokeTemporaryAuthorization(founder, action.input, request.expectedRevision)
+        await this.requestApproval(founder, {
+          kind: 'temporary_authorization',
+          summary: `Revoke temporary authorization ${action.input.authorizationId}`,
+          detail: `Revoke ${action.input.authorizationId} with the recorded reason. The revocation takes effect atomically when this approval is resolved.`,
+          payload: { action: 'revoke', authorizationId: action.input.authorizationId, reason: action.input.reason },
+          risk: 'high',
+        }, request.expectedRevision, 'ui')
         break
       case 'pause':
       case 'resume':
@@ -1597,13 +1775,14 @@ export class CompanyRuntime {
   }
 
   /** File a human ticket from the Web console: one ticket plus one linked, unassigned repair work item. */
-  async fileTicket(founder: Agent, input: FileTicketInput): Promise<Ticket> {
+  async fileTicket(founder: Agent, input: FileTicketInput, expectedRevision?: number): Promise<Ticket> {
     this.assertAdmission()
     const located = await this.requireFounder(founder)
     const workspace = (await this.store.pathsForCwd(founder.session.header.cwd, false)).workspace.canonicalPath
     const title = normalizeString(input.title, 'ticket title', 200)
     const description = normalizeMultilineString(input.description, 'ticket description', 16_384)
     const result = await this.store.transact(founder.session.header.cwd, {
+      ...(expectedRevision === undefined ? {} : { expectedRevision }),
       actor: 'founder',
       type: 'ticket.filed',
       summary: `Filed ticket ${title}`,
@@ -1669,7 +1848,7 @@ export class CompanyRuntime {
       type: 'ticket.triaged',
       summary: `Triaged ticket ${input.ticketId} as ${severity}`,
     }, (state) => {
-      const actor = this.requireTicketDecider(state, caller)
+      this.requireTicketDecider(state, caller)
       const ticket = requireTicket(state, input.ticketId)
       if (ticket.status !== 'filed' && ticket.status !== 'triaged') throw new Error(`ticket ${ticket.id} is ${ticket.status} and cannot be triaged`)
       ticket.severity = severity
@@ -1695,7 +1874,8 @@ export class CompanyRuntime {
       const employee = requireEmployeeRunnable(state, input.assigneeId)
       if (ticket.workItemId === undefined) throw new Error(`ticket ${ticket.id} has no linked work item`)
       const work = requireWork(state, ticket.workItemId)
-      if (work.status !== 'pending' || work.attempt !== 0) throw new Error('dispatch requires the linked work item to be pending and never attempted')
+      if (work.status !== 'pending' || work.reassigning === true || work.attempt >= state.limits.maxAttemptsPerWork) throw new Error('dispatch requires retryable pending repair work')
+      if (!canEmployeeOwn(state, { ...work, assigneeId: employee.id }, employee.id)) throw new Error(`employee ${employee.id} is not eligible for ticket repair ${work.id}`)
       work.assigneeId = employee.id
       work.updatedAt = Date.now()
       ticket.assigneeId = employee.id
@@ -1793,13 +1973,54 @@ export class CompanyRuntime {
     subject: { workId?: string; messageId?: string } = {},
     now = Date.now(),
   ): string {
+    const route = activeSelection(employee.llm)
     return reserveMoneyTurn(state, {
       employeeId: employee.id,
-      provider: employee.llm.provider,
-      model: employee.llm.model,
+      provider: route.provider,
+      model: route.model,
       ...(employee.llm.fallback === undefined ? {} : { fallback: employee.llm.fallback }),
       ...subject,
     }, now)
+  }
+
+  private applyHrSuccession(state: CompanyState, request: StaffingRequest, employee: Employee): void {
+    if (request.recommendation?.designateAsHr !== true || state.hrEmployeeId === employee.id) return
+    const previousId = state.hrEmployeeId
+    const previous = previousId === undefined ? undefined : state.employees.find((candidate) => candidate.id === previousId)
+    if (previous !== undefined) previous.isHr = false
+    employee.isHr = true
+    state.hrEmployeeId = employee.id
+    for (const pending of state.staffingRequests) {
+      if (pending.id === request.id || ['rejected', 'applied'].includes(pending.status)) continue
+      // Accepted HR deliveries clear their preparation pointer, but retain
+      // the turn reservation in the ledger until the old HR session idles.
+      for (const reservation of [...state.moneyBudget.reservations]) {
+        if (reservation.staffingRequestId === pending.id) releaseMoneyReservation(state, reservation.id)
+      }
+      if (pending.reservationId !== undefined) releaseMoneyReservation(state, pending.reservationId)
+      pending.reservationId = undefined
+      pending.leaseAt = undefined
+      pending.hrEmployeeId = employee.id
+      if (pending.status === 'in_review') {
+        pending.status = 'pending'
+        pending.attemptId = undefined
+        pending.reviewDeliveryAttempts = 0
+      }
+      pending.lastDeliveredAt = undefined
+      pending.updatedAt = Date.now()
+    }
+    for (const unit of state.orgUnits) {
+      if (unit.managerEmployeeId === previousId && /human resources|people|人力资源|hr/iu.test(unit.name)) unit.managerEmployeeId = employee.id
+    }
+    const recipients = [previous?.id, employee.id].filter((id): id is string => id !== undefined)
+    state.governanceNotifications.push({
+      id: randomUUID(),
+      governanceRevision: state.governanceRevision,
+      employeeIds: recipients,
+      deliveredEmployeeIds: [],
+      content: `HR governance succession approved through staffing request ${request.id}. ${employee.name} (${employee.id}) is now the singleton HR/model-governance lead${previous === undefined ? '' : `; ${previous.name} (${previous.id}) no longer holds HR authority`}. Runtime authorization follows durable company state immediately.`,
+      createdAt: Date.now(),
+    })
   }
 
   private transitionProduct(state: CompanyState, product: Product, next: ProductStatus, approvalId?: string): void {
@@ -1822,11 +2043,14 @@ export class CompanyRuntime {
     } else if (current === 'validating' && next === 'released') {
       const approval = requireApproved(state, approvalId ?? product.releaseApprovalId, 'release', (payload) => isRecord(payload) && payload.productId === product.id)
       const work = state.workItems.filter((item) => item.productId === product.id && item.status !== 'cancelled')
-      if (work.some((item) => item.status !== 'completed')) throw new Error('all required product work must complete before release')
+      const releaseWork = work.filter((item) => item.kind !== 'operations')
+      if (releaseWork.some((item) => item.status !== 'completed')) throw new Error('all pre-release and release work must complete before release')
       if (!work.some((item) => item.kind === 'verification' && item.status === 'completed')) throw new Error('release requires completed verification')
-      const independentReview = work.some((item) => item.kind === 'review' && item.status === 'completed' && item.verdict === 'pass'
-        && item.reviewedWorkId !== undefined
-        && state.workItems.find((candidate) => candidate.id === item.reviewedWorkId)?.assigneeId !== item.assigneeId)
+      const independentReview = work.some((item) => {
+        if (item.kind !== 'review' || item.status !== 'completed' || item.verdict !== 'pass' || item.assigneeId === undefined) return false
+        const reviewed = work.find((candidate) => candidate.id === item.reviewedWorkId)
+        return reviewed?.status === 'completed' && reviewed.assigneeId !== undefined && reviewed.assigneeId !== item.assigneeId
+      })
       if (!independentReview) throw new Error('release requires an independent passing review')
       consumeApproval(approval)
       product.releaseApprovalId = approval.id
@@ -1838,6 +2062,123 @@ export class CompanyRuntime {
       throw new Error(`product cannot move from ${current} to ${next}`)
     }
     product.status = next
+  }
+
+  private async knownEmployeeSessions(founder: Agent, state: CompanyState): Promise<Set<string>> {
+    const known = new Set(state.employees.flatMap((employee) => employee.sessionId !== undefined && this.ctx.agents.get(SessionId(employee.sessionId)) !== undefined ? [employee.sessionId] : []))
+    const listChildren = (this.ctx.subagents as unknown as { listChildren?: ListChildren }).listChildren
+    if (typeof listChildren !== 'function') return known
+    const entries = await listChildren.call(this.ctx.subagents, SessionId(String(founder.id)))
+    for (const entry of entries) {
+      if (entry.kind !== 'child' || entry.mode !== 'continuable') continue
+      const employee = state.employees.find((candidate) => candidate.sessionId === String(entry.id))
+      if (employee !== undefined && entry.label === employeeLabel(state.id, employee.id)) known.add(String(entry.id))
+    }
+    return known
+  }
+
+  private async continueBootstrapProvisioning(founder: Agent, generationId: string): Promise<CompanyState> {
+    let state = await this.requireActiveState(founder)
+    if (state.phase !== 'provisioning' || state.provisioning?.id !== generationId) return state
+    const known = await this.knownEmployeeSessions(founder, state)
+    const employeeIds = [...state.provisioning.employeeIds]
+    for (const employeeId of employeeIds) {
+      state = await this.requireActiveState(founder)
+      if (state.phase !== 'provisioning' || state.provisioning?.id !== generationId) return state
+      let employee = requireEmployee(state, employeeId)
+      if (employee.status === 'idle') continue
+      try {
+        if (employee.sessionId !== undefined && !known.has(employee.sessionId)) {
+          try {
+            await startEmployee(this.ctx, this.config, this.selections, founder, state, employee, new AbortController().signal)
+          } catch (error) {
+            if (!isFallbackEligible(error) || employee.llm.fallback === undefined) throw error
+            const fallbackState = await this.store.transact(founder.session.header.cwd, {
+              actor: 'scheduler', type: 'employee.fallback_activated', summary: `Activated one-time fallback for employee ${employee.id}`,
+            }, (fresh) => {
+              if (fresh.provisioning?.id !== generationId) throw new Error('provisioning generation was superseded')
+              const current = requireEmployee(fresh, employeeId)
+              if (!activateFallback(current)) throw error
+              return structuredClone(current)
+            })
+            state = fallbackState.state
+            employee = fallbackState.result
+            await startEmployee(this.ctx, this.config, this.selections, founder, state, employee, new AbortController().signal)
+          }
+        }
+        await this.store.transact(founder.session.header.cwd, {
+          actor: 'scheduler', type: 'employee.provisioned', summary: `Employee ${employeeId} continuable session is durable`,
+        }, (fresh) => {
+          if (fresh.provisioning?.id !== generationId) throw new Error('provisioning generation was superseded')
+          const current = requireEmployee(fresh, employeeId)
+          current.status = 'idle'
+          current.joinedAt ??= Date.now()
+          current.failure = undefined
+        })
+      } catch (error) {
+        await this.failProvisioning(founder, generationId, employeeId, error)
+        return this.requireActiveState(founder)
+      }
+    }
+    const operating = await this.store.transact(founder.session.header.cwd, {
+      actor: 'scheduler', type: 'company.operating', summary: 'All planned employees provisioned; company is operating',
+    }, (fresh) => {
+      if (fresh.provisioning?.id !== generationId || fresh.phase !== 'provisioning') throw new Error('provisioning generation is no longer current')
+      if (fresh.employees.some((employee) => employee.status === 'provisioning' || employee.status === 'planned' || employee.status === 'failed')) throw new Error('not every employee finished provisioning')
+      fresh.phase = 'operating'
+      fresh.provisioning = undefined
+      for (const product of fresh.products) if (product.status === 'approved') product.status = 'active'
+    })
+    this.kick(founder.session.header.cwd, founder)
+    return operating.state
+  }
+
+  private async continueStaffingProvisioning(founder: Agent, employeeId: string, requestId: string, sessionExists: boolean): Promise<void> {
+    const state = await this.requireActiveState(founder)
+    const employee = requireEmployee(state, employeeId)
+    if (state.phase !== 'operating' || employee.status !== 'provisioning') return
+    const reservationId = activeMoneyReservation(state, employee.id)?.id
+    let childAccepted = sessionExists
+    try {
+      if (!sessionExists) {
+        await startEmployee(this.ctx, this.config, this.selections, founder, state, employee, new AbortController().signal)
+        childAccepted = true
+      }
+      await this.store.transact(founder.session.header.cwd, {
+        actor: 'scheduler', type: 'employee.provisioning_recovered', summary: `Recovered staffing provisioning for ${employee.id}`,
+      }, (fresh) => {
+        this.assertSameCompany(state, fresh)
+        this.assertFounderState(founder, fresh)
+        const current = requireEmployee(fresh, employee.id)
+        const request = requireStaffingRequest(fresh, requestId)
+        if (current.sessionId !== employee.sessionId || current.status !== 'provisioning' || request.status !== 'approved') throw new Error('staffing provisioning recovery was superseded')
+        current.status = fresh.phase === 'operating' ? 'idle' : 'paused'
+        current.joinedAt ??= Date.now()
+        current.failure = undefined
+        this.applyHrSuccession(fresh, request, current)
+        request.status = 'applied'
+        request.updatedAt = Date.now()
+      })
+    } catch (error) {
+      if (childAccepted && !sessionExists && employee.sessionId !== undefined) {
+        await this.ctx.subagents.drainContinuableChildren(founder, [SessionId(employee.sessionId)]).catch(() => undefined)
+        await this.store.recordRetiredSession(founder.session.header.cwd, employee.sessionId).catch(() => undefined)
+      }
+      await this.store.transact(founder.session.header.cwd, {
+        actor: 'scheduler', type: 'employee.provisioning_recovery_failed', summary: `Staffing provisioning recovery failed for ${employee.id}`,
+      }, (fresh) => {
+        this.assertSameCompany(state, fresh)
+        releaseMoneyReservation(fresh, reservationId)
+        const current = requireEmployee(fresh, employee.id)
+        const request = requireStaffingRequest(fresh, requestId)
+        if (current.sessionId !== employee.sessionId || current.status !== 'provisioning' || request.status !== 'approved') return
+        current.status = 'failed'
+        if (fresh.supportEmployeeId === current.id) fresh.supportEmployeeId = undefined
+        current.failure = boundedError(error)
+        request.status = 'approved'
+        request.updatedAt = Date.now()
+      }).catch(() => undefined)
+    }
   }
 
   private async failProvisioning(founder: Agent, generationId: string, failedEmployeeId: string, error: unknown): Promise<void> {
@@ -1868,6 +2209,9 @@ export class CompanyRuntime {
         }
       }
       state.phase = 'provisioning_failed'
+      state.provisioning = undefined
+      state.formation.status = 'draft'
+      state.formation.approvedAt = undefined
       return accepted
     })
     for (const employee of failed.result) interruptEmployee(this.ctx, founder, employee)
@@ -1900,7 +2244,8 @@ export class CompanyRuntime {
       const messages = await io.readMailbox(to)
       const message = messages.find((candidate) => candidate.id === messageId)
       if (message !== undefined) {
-        message.deliveryState = 'queued'
+        message.attempts = (message.attempts ?? 0) + 1
+        message.deliveryState = message.attempts >= MAX_MESSAGE_DELIVERY_ATTEMPTS ? 'dead' : 'queued'
         message.reservationId = undefined
         message.leaseAt = undefined
         await io.writeMailbox(to, messages)
@@ -2089,9 +2434,23 @@ function syncTicketResolution(state: CompanyState, work: WorkItem): void {
     }
   } else if (work.status === 'failed' || work.status === 'cancelled') {
     if (ticket.status === 'dispatched' || ticket.status === 'resolved') {
-      // A failed repair returns to triaged (severity kept) for re-dispatch.
+      // Preserve the terminal attempt in attemptHistory, then make the linked
+      // repair work retryable for an explicit new dispatch decision.
       ticket.status = 'triaged'
+      ticket.assigneeId = undefined
       ticket.resolvedAt = undefined
+      const reservation = work.assigneeId === undefined || work.assigneeId === 'founder' ? undefined : activeMoneyReservation(state, work.assigneeId)
+      if (reservation?.workId === work.id) releaseMoneyReservation(state, reservation.id)
+      work.status = 'pending'
+      work.assigneeId = undefined
+      work.output = undefined
+      work.verdict = undefined
+      work.findings = undefined
+      work.evidence = undefined
+      work.attemptId = undefined
+      work.reservationId = undefined
+      work.leaseAt = undefined
+      work.updatedAt = Date.now()
     }
   }
 }
@@ -2119,7 +2478,7 @@ function normalizeWorkPlan(workspace: string, input: CreateWorkInput): Omit<Work
     productId: input.productId,
     kind,
     subject: normalizeString(input.subject, 'work subject', 500),
-    objective: normalizeString(input.objective, 'work objective', 32_768),
+    objective: normalizeMultilineString(input.objective, 'work objective', 32_768),
     ...(input.assigneeId === undefined ? {} : { assigneeId: input.assigneeId }),
     ...(input.eligibleEmployeeIds === undefined ? {} : { eligibleEmployeeIds: unique(input.eligibleEmployeeIds, 'eligible_employee_ids') }),
     ...(input.eligibleOrgUnitIds === undefined ? {} : { eligibleOrgUnitIds: unique(input.eligibleOrgUnitIds, 'eligible_org_unit_ids') }),
@@ -2150,7 +2509,8 @@ function validateWorkReferences(state: CompanyState, work: Pick<WorkItem, 'produ
     if (work.reviewedWorkId === undefined) throw new Error('review work requires reviewed_work_id')
     const reviewed = state.workItems.find((candidate) => candidate.id === work.reviewedWorkId)
     if (reviewed === undefined) throw new Error(`reviewed work ${work.reviewedWorkId} does not exist`)
-    if (work.assigneeId !== undefined && work.assigneeId !== 'founder' && reviewed.assigneeId === work.assigneeId) throw new Error('review assignee must differ from reviewed work assignee')
+    if (reviewed.productId !== work.productId) throw new Error('reviewed work must belong to the same product')
+    if (work.assigneeId !== undefined && reviewed.assigneeId === work.assigneeId) throw new Error('review assignee must differ from reviewed work assignee')
   } else if (work.reviewedWorkId !== undefined) {
     throw new Error('reviewed_work_id is valid only for review work')
   }
@@ -2165,11 +2525,6 @@ function validateWorkReferences(state: CompanyState, work: Pick<WorkItem, 'produ
   if (work.kind === 'operations' && !approvalDependencies.some((approval) => approval?.kind === 'external_effect')) {
     throw new Error('operations work requires an external_effect approval dependency')
   }
-}
-
-function boundedTokenBudget(value: number, maximum: number, label: string): number {
-  if (!Number.isSafeInteger(value) || value < 1 || value > maximum) throw new Error(`${label} must be a safe integer in 1..${maximum}`)
-  return value
 }
 
 function boundedMicros(value: number, maximum: number, label: string): number {
@@ -2188,6 +2543,19 @@ function requireStaffingRequest(state: CompanyState, requestId: string): Staffin
   return request
 }
 
+function orgPathForEmployee(state: CompanyState, employee: Employee): string[] {
+  const path: string[] = []
+  let unit = employee.orgUnitId === undefined ? undefined : state.orgUnits.find((candidate) => candidate.id === employee.orgUnitId)
+  const seen = new Set<string>()
+  while (unit !== undefined && !seen.has(unit.id)) {
+    seen.add(unit.id)
+    path.push(unit.name)
+    unit = unit.parentId === undefined ? undefined : state.orgUnits.find((candidate) => candidate.id === unit!.parentId)
+  }
+  path.reverse()
+  return path.length === 0 ? [state.name] : path
+}
+
 function ensureOrgPath(state: CompanyState, path: string[]): CompanyState['orgUnits'][number] {
   const root = state.orgUnits.find((unit) => unit.parentId === undefined)
   if (root === undefined) throw new Error('organization has no root unit')
@@ -2201,7 +2569,7 @@ function ensureOrgPath(state: CompanyState, path: string[]): CompanyState['orgUn
       unit = {
         id: `ou${state.counters.orgUnit}`,
         name,
-        kind: index === 0 ? 'division' : index === segments.length - 1 ? 'team' : 'department',
+        kind: segments.length === 1 ? 'department' : index === segments.length - 1 ? 'team' : index === 0 && segments.length > 2 ? 'division' : 'department',
         parentId: parent.id,
         createdAt: Date.now(),
       }
@@ -2218,8 +2586,8 @@ function ensurePosition(state: CompanyState, orgUnitId: string, title: string, r
     state.counters.position += 1
     position = { id: `pos${state.counters.position}`, title, orgUnitId, responsibilities: [...responsibilities], createdAt: Date.now() }
     state.positions.push(position)
-  } else {
-    position.responsibilities = [...responsibilities]
+  } else if (position.responsibilities.length !== responsibilities.length || position.responsibilities.some((item, index) => item !== responsibilities[index])) {
+    throw new Error(`position ${JSON.stringify(title)} already exists in this org unit with different responsibilities; use a distinct position title`)
   }
   return position
 }
@@ -2239,44 +2607,37 @@ function fileScopeMinimum(kind: WorkKind): number {
   return ['implementation', 'repair', 'integration', 'release', 'operations'].includes(kind) ? 1 : 0
 }
 
-function legacyUiAction(type: CompanyUiAction['type'], payload: JsonValue): CompanyUiAction {
+function parseUiAction(type: CompanyUiAction['type'], payload: JsonValue): CompanyUiAction {
   const value = isRecord(payload) ? payload : {}
   switch (type) {
     case 'approve_bootstrap':
       return { type, confirmation: typeof value.confirmation === 'string' ? value.confirmation : 'Approved and started from the company UI.' }
     case 'edit_formation': {
       const product = isRecord(value.first_product) ? value.first_product : undefined
-      const prices = Array.isArray(value.prices) ? value.prices.filter((price): price is { [key: string]: JsonValue } => isRecord(price)).map((price) => ({
-        provider: price.provider as string, model: price.model as string,
-        inputPerMillion: price.input_per_million as number, cacheReadPerMillion: price.cache_read_per_million as number,
-        cacheWritePerMillion: price.cache_write_per_million as number, outputPerMillion: price.output_per_million as number,
-        ...(price.reasoning_per_million === undefined ? {} : { reasoningPerMillion: price.reasoning_per_million as number }),
-      })) : undefined
       const modelPrices = parseHumanModelPrices(value.model_prices)
       return { type, input: {
         ...(typeof value.name === 'string' ? { name: value.name } : {}),
         ...(typeof value.slogan === 'string' ? { slogan: value.slogan } : {}),
         ...(typeof value.mission === 'string' ? { mission: value.mission } : {}),
         ...(typeof value.charter === 'string' ? { charter: value.charter } : {}),
-        ...(value.total_budget !== undefined ? { totalBudgetMicros: currencyUnitsToMicros(value.total_budget, 'total_budget') }
-          : typeof value.total_budget_micros === 'number' ? { totalBudgetMicros: value.total_budget_micros } : {}),
-        ...(typeof value.total_token_budget === 'number' ? { totalTokenBudget: value.total_token_budget } : {}),
+        ...(value.total_budget === undefined ? {} : { totalBudgetMicros: currencyUnitsToMicros(value.total_budget, 'total_budget') }),
         ...(typeof value.currency === 'string' ? { currency: value.currency } : {}),
         ...(modelPrices === undefined ? {} : { modelPrices }),
-        ...(prices === undefined ? {} : { prices }),
+        ...(typeof value.hr_name === 'string' ? { hrName: value.hr_name } : {}),
+        ...(typeof value.hr_provider === 'string' ? { hrProvider: value.hr_provider } : {}),
+        ...(typeof value.hr_model === 'string' ? { hrModel: value.hr_model } : {}),
+        ...(typeof value.hr_reasoning_effort === 'string' ? { hrReasoningEffort: value.hr_reasoning_effort } : {}),
         ...(product === undefined ? {} : { firstProduct: {
           ...(typeof product.name === 'string' ? { name: product.name } : {}),
           ...(typeof product.summary === 'string' ? { summary: product.summary } : {}),
           ...(typeof product.product_root === 'string' ? { productRoot: product.product_root } : {}),
           ...(Array.isArray(product.success_criteria) ? { successCriteria: product.success_criteria as string[] } : {}),
-          ...(product.product_budget !== undefined ? { budgetMicros: currencyUnitsToMicros(product.product_budget, 'first_product.product_budget') }
-            : typeof product.budget_micros === 'number' ? { budgetMicros: product.budget_micros } : {}),
-          ...(typeof product.token_budget === 'number' ? { tokenBudget: product.token_budget } : {}),
+          ...(product.product_budget === undefined ? {} : { budgetMicros: currencyUnitsToMicros(product.product_budget, 'first_product.product_budget') }),
         } }),
       } }
     }
     case 'resolve_approval': {
-      const approvalId = typeof value.approval_id === 'string' ? value.approval_id : value.approvalId
+      const approvalId = value.approval_id
       if (typeof approvalId !== 'string' || (value.decision !== 'approved' && value.decision !== 'rejected')) throw new Error('resolve_approval payload requires approval_id and decision')
       return {
         type,
@@ -2313,10 +2674,8 @@ function legacyUiAction(type: CompanyUiAction['type'], payload: JsonValue): Comp
       } }
     }
     case 'grant_temporary_authorization': {
-      const approvalId = typeof value.approval_id === 'string' ? value.approval_id : value.approvalId
       if (typeof value.employee_id !== 'string' || typeof value.reason !== 'string' || typeof value.expires_at !== 'number') throw new Error('grant_temporary_authorization payload requires employee_id, reason, and expires_at')
       return { type, input: {
-        ...(typeof approvalId === 'string' ? { approvalId } : {}),
         employeeId: value.employee_id,
         reason: value.reason,
         ...(typeof value.starts_at === 'number' ? { startsAt: value.starts_at } : {}),
@@ -2324,16 +2683,15 @@ function legacyUiAction(type: CompanyUiAction['type'], payload: JsonValue): Comp
       } }
     }
     case 'revoke_temporary_authorization': {
-      const approvalId = typeof value.approval_id === 'string' ? value.approval_id : value.approvalId
       if (typeof value.authorization_id !== 'string' || typeof value.reason !== 'string') throw new Error('revoke_temporary_authorization payload requires authorization_id and reason')
-      return { type, input: { ...(typeof approvalId === 'string' ? { approvalId } : {}), authorizationId: value.authorization_id, reason: value.reason } }
+      return { type, input: { authorizationId: value.authorization_id, reason: value.reason } }
     }
     case 'pause':
     case 'resume':
     case 'discard_staged':
       return { type, reason: typeof value.reason === 'string' ? value.reason : `Requested from company UI: ${type}` }
     case 'archive': {
-      const approvalId = typeof value.approval_id === 'string' ? value.approval_id : value.approvalId
+      const approvalId = value.approval_id
       return {
         type,
         reason: typeof value.reason === 'string' ? value.reason : 'Requested from company UI: archive',
@@ -2348,13 +2706,12 @@ function parseHumanModelPrices(value: JsonValue | undefined): NonNullable<Budget
   if (!Array.isArray(value)) throw new Error('model_prices must be an array')
   return value.map((raw, index) => {
     if (!isRecord(raw) || typeof raw.provider !== 'string' || typeof raw.model !== 'string') throw new Error(`model_prices[${index}] requires provider and model`)
-    const rate = (humanKey: string, legacyKey: string): number | undefined => {
-      if (raw[humanKey] !== undefined) return currencyUnitsToMicros(raw[humanKey], `model_prices[${index}].${humanKey}`)
-      return typeof raw[legacyKey] === 'number' ? raw[legacyKey] as number : undefined
-    }
-    const miss = rate('input_cache_miss_per_million', 'input_cache_miss_micros_per_million')
-    const hit = rate('input_cache_hit_per_million', 'input_cache_hit_micros_per_million')
-    const output = rate('output_per_million', 'output_micros_per_million')
+    const rate = (humanKey: string): number | undefined => raw[humanKey] === undefined
+      ? undefined
+      : currencyUnitsToMicros(raw[humanKey], `model_prices[${index}].${humanKey}`)
+    const miss = rate('input_cache_miss_per_million')
+    const hit = rate('input_cache_hit_per_million')
+    const output = rate('output_per_million')
     return {
       provider: raw.provider,
       model: raw.model,
@@ -2363,6 +2720,26 @@ function parseHumanModelPrices(value: JsonValue | undefined): NonNullable<Budget
       ...(output === undefined ? {} : { outputMicrosPerMillion: output }),
     }
   })
+}
+
+async function queueFounderNotification(
+  state: CompanyState,
+  io: MutationContext,
+  from: string,
+  content: string,
+): Promise<void> {
+  const messages = await io.readMailbox('founder')
+  makeMailboxRoom(messages, state.limits.maxMailboxMessages)
+  const boundedContent = content.normalize('NFC').replace(/\0/gu, '').trim().slice(0, state.limits.maxMessageChars)
+  messages.push({
+    id: randomUUID(),
+    from,
+    to: 'founder',
+    content: boundedContent === '' ? 'Company event recorded; use company_status for details.' : boundedContent,
+    createdAt: Date.now(),
+    deliveryState: 'queued',
+  })
+  await io.writeMailbox('founder', messages)
 }
 
 function directMessagePrompt(message: CompanyMessage): string {
@@ -2398,9 +2775,9 @@ function consoleDecisionDetail(action: CompanyUiAction): string | undefined {
     case 'request_budget_change':
       return 'budget/pricing approval(s) opened; they still await a human decision in the approvals tab'
     case 'grant_temporary_authorization':
-      return `temporary authorization granted to ${action.input.employeeId}${action.input.reason === undefined ? '' : ` (${action.input.reason})`}`
+      return `temporary authorization request opened for ${action.input.employeeId} (${action.input.reason}); it still awaits approval`
     case 'revoke_temporary_authorization':
-      return `temporary authorization ${action.input.authorizationId} revoked (${action.input.reason})`
+      return `revocation request opened for temporary authorization ${action.input.authorizationId} (${action.input.reason}); it still awaits approval`
     case 'pause':
     case 'resume':
     case 'archive':

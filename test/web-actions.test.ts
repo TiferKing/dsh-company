@@ -13,6 +13,12 @@ test('remote sockets are classified independently of the transport gate', () => 
   assert.equal(isRemoteUiRequest({ socket: { remoteAddress: '::1' } }), false)
   assert.equal(isRemoteUiRequest({ socket: { remoteAddress: '::ffff:127.0.0.1' } }), false)
   assert.equal(isRemoteUiRequest({ socket: { remoteAddress: '192.168.1.5' } }), true)
+  assert.equal(isRemoteUiRequest({ socket: { remoteAddress: '127.0.0.1' }, headers: { 'x-forwarded-for': '203.0.113.5, 127.0.0.1' } }), true)
+  assert.equal(isRemoteUiRequest({ socket: { remoteAddress: '127.0.0.1' }, headers: { forwarded: 'for="[::1]";proto=http' } }), false)
+  assert.equal(isRemoteUiRequest({ socket: { remoteAddress: '127.0.0.1' }, headers: { 'x-forwarded-for': '127.0.0.1, 203.0.113.5' } }), true, 'a forged loopback first hop cannot hide the actual remote client appended by a proxy')
+  assert.equal(isRemoteUiRequest({ socket: { remoteAddress: '127.0.0.1' }, headers: { 'x-forwarded-for': ['127.0.0.1', '203.0.113.5'] } }), true)
+  assert.equal(isRemoteUiRequest({ socket: { remoteAddress: '127.0.0.1' }, headers: { forwarded: 'for=127.0.0.1;proto=http, for=203.0.113.5' } }), true)
+  assert.equal(isRemoteUiRequest({ socket: { remoteAddress: '127.0.0.1' }, headers: { 'x-forwarded-for': '127.attacker.example' } }), true, 'a loopback-looking hostname is not a loopback IP')
   assert.equal(isRemoteUiRequest({ socket: { remoteAddress: undefined } }), true)
 })
 
@@ -57,8 +63,8 @@ test('web mutations execute and persist for loopback pages, fail closed for anyt
   try {
     const staged = await harness.runtime.bootstrap(harness.founder, {
       name: 'Draft Co', mission: 'Build one bounded tool.', charter: '1. Original clause.',
-      firstProduct: { name: 'Tool', summary: 'One tool.', productRoot: 'tool', successCriteria: ['Tests pass'], budgetMicros: 1_000_000, tokenBudget: 500_000 },
-      totalBudgetMicros: 1_000_000, totalTokenBudget: 1_000_000, currency: 'CNY', draftedBy: 'ai',
+      firstProduct: { name: 'Tool', summary: 'One tool.', productRoot: 'tool', successCriteria: ['Tests pass'], budgetMicros: 1_000_000 },
+      totalBudgetMicros: 1_000_000, currency: 'CNY', draftedBy: 'ai',
     })
 
     // Remote clients never mutate, regardless of payload quality.
@@ -118,13 +124,46 @@ test('web mutations execute and persist for loopback pages, fail closed for anyt
 })
 
 
+test('Web temporary authorization follows request → approval → atomic grant', async () => {
+  const harness = await buildHarness()
+  try {
+    await harness.runtime.bootstrap(harness.founder, {
+      name: 'Approval Co', mission: 'Test authorization governance.', charter: '1. Human approval is required.',
+      firstProduct: { name: 'Tool', summary: 'One tool.', productRoot: 'tool', successCriteria: ['Tests pass'], budgetMicros: 1_000_000 },
+      totalBudgetMicros: 1_000_000, currency: 'CNY', draftedBy: 'ai',
+      modelPrices: [{ provider: 'mock', model: 'mock-model', inputCacheMissMicrosPerMillion: 0, inputCacheHitMicrosPerMillion: 0, outputMicrosPerMillion: 0 }],
+    })
+    await harness.runtime.approveBootstrap(harness.founder, 'Approved and start.', { source: 'ui' })
+    let state = (await harness.store.readActive(harness.workspace))!
+    const requested = await executeUiAction(harness.ctx, harness.runtime, {
+      sessionId: 'founder-session', companyId: state.id, expectedRevision: state.revision,
+      action: 'grant_temporary_authorization',
+      payload: { employee_id: 'e1', reason: 'Bounded unknown-cost investigation.', expires_at: Date.now() + 60_000 },
+    }, { remote: false })
+    assert.equal(requested.temporary_authorizations.length, 0, 'confirmation alone cannot bypass typed approval')
+    const approval = requested.approvals.find((candidate) => candidate.kind === 'temporary_authorization' && candidate.status === 'pending')
+    assert.ok(approval)
+
+    const granted = await executeUiAction(harness.ctx, harness.runtime, {
+      sessionId: 'founder-session', companyId: state.id, expectedRevision: requested.revision,
+      action: 'resolve_approval', payload: { approval_id: approval.id, decision: 'approved', human_statement: 'I approve this bounded temporary authorization.' },
+    }, { remote: false })
+    assert.equal(granted.temporary_authorizations.length, 1)
+    state = (await harness.store.readActive(harness.workspace))!
+    assert.equal(state.temporaryAuthorizations[0]?.approvalId, approval.id)
+    assert.notEqual(state.approvals.find((candidate) => candidate.id === approval.id)?.consumedAt, undefined)
+  } finally {
+    await harness.cleanup()
+  }
+})
+
 test('web budget/pricing requests work without any founder chat anchor', async () => {
   const harness = await buildHarness()
   try {
     await harness.runtime.bootstrap(harness.founder, {
       name: 'Draft Co', mission: 'Build one bounded tool.', charter: '1. Original clause.',
-      firstProduct: { name: 'Tool', summary: 'One tool.', productRoot: 'tool', successCriteria: ['Tests pass'], budgetMicros: 1_000_000, tokenBudget: 500_000 },
-      totalBudgetMicros: 1_000_000, totalTokenBudget: 1_000_000, currency: 'CNY', draftedBy: 'ai',
+      firstProduct: { name: 'Tool', summary: 'One tool.', productRoot: 'tool', successCriteria: ['Tests pass'], budgetMicros: 1_000_000 },
+      totalBudgetMicros: 1_000_000, currency: 'CNY', draftedBy: 'ai',
       modelPrices: [{ provider: 'mock', model: 'mock-model', inputCacheMissMicrosPerMillion: 0, inputCacheHitMicrosPerMillion: 0, outputMicrosPerMillion: 0 }],
     })
     await harness.runtime.approveBootstrap(harness.founder, 'Approved and start.', { source: 'ui' })

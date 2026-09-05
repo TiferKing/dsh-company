@@ -90,7 +90,7 @@ function ApprovalCard(props: {
             </span>
             {approval.expires_at === undefined ? null : (
               <span title={formatAbsolute(approval.expires_at, locale)}>
-                {t('approvals.expires', { time: formatRelative(approval.expires_at, t) })}
+                {t('approvals.expires', { time: formatAbsolute(approval.expires_at, locale) })}
               </span>
             )}
           </div>

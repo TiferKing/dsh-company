@@ -3,15 +3,11 @@
 export type JsonPrimitive = string | number | boolean | null
 export type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue }
 
-export type CompanyPhase =
-  | 'staged'
-  | 'provisioning'
-  | 'provisioning_failed'
-  | 'operating'
-  | 'paused'
-  | 'halted'
-  | 'closing'
-  | 'archived'
+export const COMPANY_STATE_SCHEMA_VERSION = 2 as const
+export const COMPANY_SNAPSHOT_SCHEMA_VERSION = 5 as const
+
+export const COMPANY_PHASES = ['staged', 'provisioning', 'provisioning_failed', 'operating', 'paused', 'halted', 'archived'] as const
+export type CompanyPhase = (typeof COMPANY_PHASES)[number]
 
 export interface CompanyConfig {
   stateRoot?: string
@@ -27,18 +23,8 @@ export interface CompanyConfig {
   maxAuditBytes?: number
   maxMessageChars?: number
   maxOutputChars?: number
-  defaultBudgetCredits?: number
-  maxBudgetCredits?: number
-  /** @deprecated v0.1 activation-credit compatibility only. */
-  defaultActivationCredits?: number
-  /** @deprecated v0.1 activation-credit compatibility only. */
-  routeCosts?: Record<string, number>
-  defaultTokenBudget?: number
-  maxTokenBudget?: number
   defaultCurrency?: string
-  tokenPrices?: TokenPriceInput[]
-  /** v0.3 currency-first defaults, stored as integer micro-currency units. */
-  defaultMoneyBudgetMicros?: number
+  /** Currency-first defaults, stored as integer micro-currency units. */
   maxMoneyBudgetMicros?: number
   modelPrices?: ModelPriceInput[]
   maxTemporaryAuthorizationMs?: number
@@ -64,15 +50,7 @@ export interface ResolvedCompanyConfig {
   maxAuditBytes: number
   maxMessageChars: number
   maxOutputChars: number
-  defaultBudgetCredits: number
-  maxBudgetCredits: number
-  defaultActivationCredits: number
-  routeCosts: Record<string, number>
-  defaultTokenBudget: number
-  maxTokenBudget: number
   defaultCurrency: string
-  tokenPrices: TokenPrice[]
-  defaultMoneyBudgetMicros: number
   maxMoneyBudgetMicros: number
   modelPrices: ModelPrice3[]
   maxTemporaryAuthorizationMs: number
@@ -95,102 +73,6 @@ export interface LimitsSnapshot {
   maxMessageChars: number
   maxOutputChars: number
   memberMaxDepth: number
-}
-
-export type BudgetEntryKind = 'reserve' | 'commit' | 'release' | 'increase' | 'decrease'
-export type BudgetReason =
-  | 'employee-onboarding'
-  | 'work-dispatch'
-  | 'message-delivery'
-  | 'human-adjustment'
-  | 'recovery'
-
-export interface BudgetEntry {
-  id: string
-  kind: BudgetEntryKind
-  credits: number
-  reason: BudgetReason
-  employeeId?: string
-  workId?: string
-  messageId?: string
-  approvalId?: string
-  reservationId?: string
-  at: number
-}
-
-export interface CompanyBudget {
-  unit: 'activation-credit'
-  totalCredits: number
-  reservedCredits: number
-  spentCredits: number
-  warningAtCredits?: number
-  entries: BudgetEntry[]
-}
-
-/** Human-facing prices per one million tokens. Values are normalized to integer micro-currency units. */
-export interface TokenPriceInput {
-  provider: string
-  model: string
-  inputPerMillion?: number
-  cacheReadPerMillion?: number
-  cacheWritePerMillion?: number
-  outputPerMillion?: number
-  reasoningPerMillion?: number
-}
-
-export interface TokenPrice {
-  provider: string
-  model: string
-  inputMicrosPerMillion: number
-  cacheReadMicrosPerMillion: number
-  cacheWriteMicrosPerMillion: number
-  outputMicrosPerMillion: number
-  reasoningMicrosPerMillion?: number
-}
-
-export interface TokenUsageEntry {
-  id: string
-  sessionId: string
-  eventSeq: number
-  turn: number
-  step: number
-  employeeId: string
-  workId?: string
-  provider: string
-  model: string
-  inputTokens: number
-  outputTokens: number
-  cacheReadTokens: number
-  cacheWriteTokens: number
-  reasoningTokens: number
-  totalTokens: number
-  costMicros: number
-  priced: boolean
-  at: number
-}
-
-export interface TokenReservation {
-  id: string
-  employeeId: string
-  workId?: string
-  messageId?: string
-  limitTokens: number
-  remainingTokens: number
-  createdAt: number
-}
-
-export interface TokenBudget {
-  unit: 'token'
-  currency: string
-  totalTokens: number
-  reservedTokens: number
-  usedTokens: number
-  warningAtTokens?: number
-  totalCostMicros: number
-  prices: TokenPrice[]
-  usage: TokenUsageEntry[]
-  reservations: TokenReservation[]
-  legacyActivationCredits?: number
 }
 
 export type ModelPriceSource = 'manual' | 'catalog' | 'legacy'
@@ -260,6 +142,7 @@ export interface MoneyReservation {
   workId?: string
   productId?: string
   messageId?: string
+  staffingRequestId?: string
   limitTokens: number
   remainingTokens: number
   reservedMicros: number
@@ -283,7 +166,16 @@ export interface LegacyV02Finance {
   usedTokens: number
   reservedTokens: number
   totalCostMicros: number
-  prices: TokenPrice[]
+  /** Preserved source rows from the retired four-rate token ledger. */
+  prices: Array<{
+    provider: string
+    model: string
+    inputMicrosPerMillion: number
+    cacheReadMicrosPerMillion: number
+    cacheWriteMicrosPerMillion: number
+    outputMicrosPerMillion: number
+    reasoningMicrosPerMillion?: number
+  }>
   treatment: 'unverified' | 'accepted'
 }
 
@@ -344,7 +236,7 @@ export interface TemporaryAuthorization {
   id: string
   employeeId: string
   reason: string
-  approvalId?: string
+  approvalId: string
   authorizedBy: 'founder'
   startsAt: number
   expiresAt: number
@@ -355,7 +247,7 @@ export interface TemporaryAuthorization {
   uses: TemporaryAuthorizationUse[]
 }
 
-export type OperationalBlockKind = 'network' | 'quota' | 'rate_limit' | 'money_budget' | 'unpriced_model' | 'token_budget' | 'turn_limit' | 'session_unrecoverable' | 'provider' | 'unknown'
+export type OperationalBlockKind = 'network' | 'quota' | 'rate_limit' | 'money_budget' | 'unpriced_model' | 'session_unrecoverable' | 'provider' | 'unknown'
 
 export interface OperationalBlock {
   kind: OperationalBlockKind
@@ -402,8 +294,10 @@ export interface FormationPlan {
   approvedAt?: number
 }
 
-export type StaffingAction = 'hire' | 'adjust' | 'retire'
-export type StaffingStatus = 'pending' | 'in_review' | 'recommended' | 'approved' | 'rejected' | 'applied'
+export const STAFFING_ACTIONS = ['hire', 'adjust', 'retire'] as const
+export type StaffingAction = (typeof STAFFING_ACTIONS)[number]
+export const STAFFING_STATUSES = ['pending', 'in_review', 'recommended', 'approved', 'rejected', 'applied'] as const
+export type StaffingStatus = (typeof STAFFING_STATUSES)[number]
 
 export interface StaffingRecommendation {
   difficulty: 'low' | 'medium' | 'high' | 'critical'
@@ -415,6 +309,8 @@ export interface StaffingRecommendation {
   orgPath: string[]
   positionTitle: string
   responsibilities: string[]
+  /** Human-approved transfer of the singleton HR governance authority. */
+  designateAsHr?: boolean
   assessedAt: number
 }
 
@@ -429,20 +325,18 @@ export interface StaffingRequest {
   constraints?: string
   hrEmployeeId: string
   attemptId?: string
+  reviewDeliveryAttempts?: number
   recommendation?: StaffingRecommendation
   approvalId?: string
+  lastDeliveredAt?: number
+  reservationId?: string
+  leaseAt?: number
   createdAt: number
   updatedAt: number
 }
 
-export type EmployeeStatus =
-  | 'planned'
-  | 'provisioning'
-  | 'idle'
-  | 'working'
-  | 'paused'
-  | 'failed'
-  | 'retired'
+export const EMPLOYEE_STATUSES = ['planned', 'provisioning', 'idle', 'working', 'paused', 'failed', 'retired'] as const
+export type EmployeeStatus = (typeof EMPLOYEE_STATUSES)[number]
 
 export interface EmployeeLlmSelection {
   provider: string
@@ -457,14 +351,12 @@ export interface EmployeeLlmSelection {
 export interface Employee {
   id: string
   name: string
-  /** The staffed position/title for this employee in v0.1. */
+  /** Staffed position/title for this employee. */
   role: string
-  /** Legacy flat organizational label retained for v0.1 migration. */
-  department?: string
   orgUnitId?: string
   positionId?: string
   isHr?: boolean
-  /** Per-turn safety ceiling retained independently of monetary authority. */
+  /** Employee-wide monetary ceiling; migration fills zero for legacy rows. */
   budgetMicros?: number
   operationalBlock?: OperationalBlock
   status: EmployeeStatus
@@ -476,15 +368,8 @@ export interface Employee {
   executionPrompt?: string
 }
 
-export type ProductStatus =
-  | 'proposed'
-  | 'approved'
-  | 'active'
-  | 'paused'
-  | 'validating'
-  | 'released'
-  | 'retired'
-  | 'cancelled'
+export const PRODUCT_STATUSES = ['proposed', 'approved', 'active', 'paused', 'validating', 'released', 'retired', 'cancelled'] as const
+export type ProductStatus = (typeof PRODUCT_STATUSES)[number]
 
 export interface Product {
   id: string
@@ -493,34 +378,17 @@ export interface Product {
   status: ProductStatus
   productRoot: string
   successCriteria: string[]
-  /** @deprecated legacy activation-credit allocation. */
-  budgetCredits: number
-  /** @deprecated v0.2 token allocation retained for migration telemetry. */
-  tokenBudget: number
-  budgetMicros?: number
+  budgetMicros: number
   createdAt: number
   updatedAt: number
   releaseApprovalId?: string
 }
 
-export type WorkKind =
-  | 'discovery'
-  | 'design'
-  | 'implementation'
-  | 'verification'
-  | 'review'
-  | 'repair'
-  | 'integration'
-  | 'release'
-  | 'operations'
+export const WORK_KINDS = ['discovery', 'design', 'implementation', 'verification', 'review', 'repair', 'integration', 'release', 'operations'] as const
+export type WorkKind = (typeof WORK_KINDS)[number]
 
-export type WorkStatus =
-  | 'pending'
-  | 'claimed'
-  | 'in_progress'
-  | 'completed'
-  | 'failed'
-  | 'cancelled'
+export const WORK_STATUSES = ['pending', 'claimed', 'in_progress', 'completed', 'failed', 'cancelled'] as const
+export type WorkStatus = (typeof WORK_STATUSES)[number]
 
 export interface ReviewFinding {
   id: string
@@ -572,6 +440,8 @@ export interface WorkItem {
   reassigning?: boolean
   reservationId?: string
   leaseAt?: number
+  /** Number of accepted prompts for the current fenced attempt. */
+  deliveryAttempts?: number
   output?: string
   verdict?: 'pass' | 'needs_revision' | 'reject'
   findings?: ReviewFinding[]
@@ -581,20 +451,11 @@ export interface WorkItem {
   updatedAt: number
 }
 
-export type ApprovalKind =
-  | 'bootstrap'
-  | 'budget_change'
-  | 'pricing_change'
-  | 'governance_change'
-  | 'temporary_authorization'
-  | 'organization_change'
-  | 'product_scope'
-  | 'model_route'
-  | 'release'
-  | 'external_effect'
-  | 'forced_archive'
+export const APPROVAL_KINDS = ['bootstrap', 'budget_change', 'pricing_change', 'governance_change', 'temporary_authorization', 'organization_change', 'product_scope', 'model_route', 'release', 'external_effect', 'forced_archive'] as const
+export type ApprovalKind = (typeof APPROVAL_KINDS)[number]
 
-export type ApprovalStatus = 'pending' | 'approved' | 'rejected' | 'cancelled' | 'expired'
+export const APPROVAL_STATUSES = ['pending', 'approved', 'rejected', 'cancelled', 'expired'] as const
+export type ApprovalStatus = (typeof APPROVAL_STATUSES)[number]
 
 export interface ApprovalRequest {
   id: string
@@ -619,7 +480,8 @@ export interface ApprovalRequest {
   }
 }
 
-export type MessageDeliveryState = 'queued' | 'reserved' | 'accepted' | 'read' | 'held_budget' | 'dead'
+export const MESSAGE_DELIVERY_STATES = ['queued', 'reserved', 'accepted', 'held_budget', 'dead'] as const
+export type MessageDeliveryState = (typeof MESSAGE_DELIVERY_STATES)[number]
 
 export interface CompanyMessage {
   id: string
@@ -633,7 +495,6 @@ export interface CompanyMessage {
   reservationId?: string
   leaseAt?: number
   acceptedAt?: number
-  readAt?: number
 }
 
 export interface GovernanceNotification {
@@ -697,7 +558,7 @@ export interface FileTicketInput {
 }
 
 export interface CompanyState {
-  schemaVersion: 1
+  schemaVersion: typeof COMPANY_STATE_SCHEMA_VERSION
   revision: number
   id: string
   name: string
@@ -708,7 +569,6 @@ export interface CompanyState {
   founderSessionId: string
   stagedFromUserMessageId: string
   phase: CompanyPhase
-  planReviewState?: 'awaiting_review' | 'awaiting_feedback'
   createdAt: number
   updatedAt: number
   approvedAt?: number
@@ -727,9 +587,6 @@ export interface CompanyState {
     authorization: number
     ticket: number
   }
-  /** Legacy v0.1 ledger retained only for migration/audit compatibility. */
-  budget: CompanyBudget
-  tokenBudget: TokenBudget
   moneyBudget: MoneyBudget
   modelCatalog: ModelCatalogState
   temporaryAuthorizations: TemporaryAuthorization[]
@@ -764,6 +621,7 @@ export interface WorkspacePaths {
   activeDir: string
   stateFile: string
   auditFile: string
+  transactionFile: string
   mailboxDir: string
   archiveDir: string
   retiredSessionsFile: string
@@ -882,11 +740,8 @@ export interface SafeProductView {
   status: ProductStatus
   product_root: string
   success_criteria: string[]
-  budget_credits: number
-  token_budget: number
   token_used: number
-  cost_micros: number
-  budget_micros?: number
+  budget_micros: number
   spent_micros?: number
   reserved_micros?: number
   available_micros?: number
@@ -917,6 +772,7 @@ export interface SafeWorkView {
   blocked: boolean
   blocked_reasons: string[]
   assignee_id?: string | 'founder'
+  ticket_id?: string
   dependencies: string[]
   approval_dependencies: string[]
   attempt: number
@@ -959,15 +815,15 @@ export interface SafeMessageView {
   to: 'founder' | string
   content: string
   created_at: number
+  attempts?: number
   delivery_state: MessageDeliveryState
-  read_at?: number
 }
 
 export interface SafeTemporaryAuthorizationView {
   id: string
   employee_id: string
   reason: string
-  approval_id?: string
+  approval_id: string
   authorized_by: 'founder'
   starts_at: number
   expires_at: number
@@ -1024,7 +880,7 @@ export interface SafeModelCatalogView {
 
 /** Canonical Host/Web wire projection. */
 export interface CompanySnapshot {
-  schema_version: 4
+  schema_version: typeof COMPANY_SNAPSHOT_SCHEMA_VERSION
   revision: number
   viewer: {
     role: 'founder' | 'employee'
@@ -1041,7 +897,6 @@ export interface CompanySnapshot {
     governance_revision: number
     formation_status: 'draft' | 'approved'
     phase: CompanyPhase
-    plan_review_state?: 'awaiting_review' | 'awaiting_feedback'
     updated_at: number
     founder_session_id?: string
     health: CompanyHealth
@@ -1124,8 +979,8 @@ export type CompanyUiAction =
   | { type: 'reprobe_models' }
   | { type: 'request_governance_change'; input: GovernanceChangeInput }
   | { type: 'request_budget_change'; input: BudgetChangeInput }
-  | { type: 'grant_temporary_authorization'; input: GrantTemporaryAuthorizationInput }
-  | { type: 'revoke_temporary_authorization'; input: RevokeTemporaryAuthorizationInput }
+  | { type: 'grant_temporary_authorization'; input: Omit<GrantTemporaryAuthorizationInput, 'approvalId'> }
+  | { type: 'revoke_temporary_authorization'; input: Omit<RevokeTemporaryAuthorizationInput, 'approvalId'> }
   | { type: 'pause'; reason: string }
   | { type: 'resume'; reason: string }
   | { type: 'archive'; reason: string; approvalId?: string }
@@ -1133,7 +988,7 @@ export type CompanyUiAction =
 
 export type CompanyUiActionName = CompanyUiAction['type']
 
-/** Canonical v0.1 browser action envelope; payload is validated per action by the Host. */
+/** Canonical browser action envelope; payload is validated per action by the Host. */
 export interface CompanyActionRequest {
   sessionId: string
   companyId: string
@@ -1142,20 +997,12 @@ export interface CompanyActionRequest {
   payload: JsonValue
 }
 
-export interface CompanyActionResponse {
-  ok: true
-  revision: number
-  snapshot?: CompanySnapshot
-}
-
 export interface FormationProductInput {
   name: string
   summary: string
   productRoot: string
   successCriteria: string[]
-  budgetMicros?: number
-  /** @deprecated v0.2 compatibility input. */
-  tokenBudget?: number
+  budgetMicros: number
 }
 
 export interface BootstrapInput {
@@ -1164,13 +1011,9 @@ export interface BootstrapInput {
   mission: string
   charter: string
   firstProduct: FormationProductInput
-  totalBudgetMicros?: number
-  /** @deprecated v0.2 compatibility input. */
-  totalTokenBudget?: number
+  totalBudgetMicros: number
   currency: string
   modelPrices?: ModelPriceInput[]
-  /** @deprecated v0.2 compatibility input. */
-  prices?: TokenPriceInput[]
   draftedBy?: 'ai' | 'user'
   hrName?: string
   hrProvider?: string
@@ -1185,12 +1028,12 @@ export interface EditFormationInput {
   charter?: string
   firstProduct?: Partial<FormationProductInput>
   totalBudgetMicros?: number
-  /** @deprecated v0.2 compatibility input. */
-  totalTokenBudget?: number
   currency?: string
   modelPrices?: ModelPriceInput[]
-  /** @deprecated v0.2 compatibility input. */
-  prices?: TokenPriceInput[]
+  hrName?: string
+  hrProvider?: string
+  hrModel?: string
+  hrReasoningEffort?: string
 }
 
 export interface GovernanceChangeInput {
@@ -1208,7 +1051,7 @@ export interface BudgetChangeInput {
 }
 
 export interface GrantTemporaryAuthorizationInput {
-  approvalId?: string
+  approvalId: string
   employeeId: string
   reason: string
   startsAt?: number
@@ -1216,7 +1059,7 @@ export interface GrantTemporaryAuthorizationInput {
 }
 
 export interface RevokeTemporaryAuthorizationInput {
-  approvalId?: string
+  approvalId: string
   authorizationId: string
   reason: string
 }
@@ -1233,29 +1076,23 @@ export interface StaffingAssessmentInput {
   requestId: string
   attemptId: string
   difficulty: StaffingRecommendation['difficulty']
-  provider: string
-  model: string
+  provider?: string
+  model?: string
   reasoningEffort?: string
   budgetMicros?: number
   rationale: string
-  orgPath: string[]
-  positionTitle: string
-  responsibilities: string[]
+  orgPath?: string[]
+  positionTitle?: string
+  responsibilities?: string[]
+  designateAsHr?: boolean
 }
 
 export interface AddEmployeeInput {
   name: string
   role: string
-  department?: string
-  provider?: string
-  model?: string
-  reasoningEffort?: string
-  fallbackProvider?: string
-  fallbackModel?: string
   executionPrompt?: string
-  budgetMicros?: number
-  approvalId?: string
-  staffingRequestId?: string
+  approvalId: string
+  staffingRequestId: string
 }
 
 export interface CreateProductInput {
@@ -1263,9 +1100,7 @@ export interface CreateProductInput {
   summary: string
   productRoot: string
   successCriteria: string[]
-  budgetMicros?: number
-  /** @deprecated v0.2 compatibility input. */
-  tokenBudget?: number
+  budgetMicros: number
 }
 
 export interface CreateWorkInput {

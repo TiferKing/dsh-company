@@ -1,4 +1,4 @@
-import { useEffect, useId, useMemo, useRef, useState } from 'react'
+import { useEffect, useId, useRef, useState } from 'react'
 import type { CompanyTranslate } from '../locales.js'
 import type { CompanySnapshot, SafeCharterClauseView, SafeModelPriceView } from '../types.js'
 import { ChevronIcon, InfoIcon, RefreshIcon, UsersIcon, WalletIcon, WarningIcon } from '../icons.js'
@@ -24,8 +24,8 @@ export interface OverviewViewProps {
   busy?: boolean
   /** Charter clause paths (`'0'`, `'0/1'`, …) that start expanded (tests / future preference). */
   initialExpandedClauses?: readonly string[]
-  onEditFormation?(payload: Record<string, unknown>): Promise<boolean>
-  onRequestGovernance?(payload: Record<string, unknown>): Promise<boolean>
+  onEditFormation?(payload: Record<string, unknown>, expectedRevision: number): Promise<boolean>
+  onRequestGovernance?(payload: Record<string, unknown>, expectedRevision: number): Promise<boolean>
   onReprobe?(): Promise<boolean>
   onOpenApprovals?(): void
 }
@@ -104,7 +104,6 @@ export function buildPriceDrafts(snapshot: CompanySnapshot): PriceDraft[] {
     .sort((left, right) => left.provider.localeCompare(right.provider) || left.model.localeCompare(right.model))
     .map((model) => {
       const price = prices.get(`${model.provider}\u0000${model.model}`)
-        ?? (model.model === '*' ? undefined : prices.get(`${model.provider}\u0000*`))
       return {
         provider: model.provider,
         model: model.model,
@@ -329,6 +328,7 @@ function CharterList(props: {
 export function OverviewView(props: OverviewViewProps): React.JSX.Element {
   const { snapshot, t, locale, busy = false } = props
   const firstProduct = snapshot.products[0]
+  const hrEmployee = snapshot.employees.find((employee) => employee.is_hr === true)
   const [name, setName] = useState(snapshot.company.name)
   const [slogan, setSlogan] = useState(snapshot.company.slogan)
   const [mission, setMission] = useState(snapshot.company.mission)
@@ -340,6 +340,10 @@ export function OverviewView(props: OverviewViewProps): React.JSX.Element {
   const [productBudget, setProductBudget] = useState(microsToInput(firstProduct?.budget_micros))
   const [totalBudget, setTotalBudget] = useState(microsToInput(snapshot.budget.total_micros))
   const [currency, setCurrency] = useState(snapshot.budget.currency)
+  const [hrName, setHrName] = useState(hrEmployee?.name ?? '')
+  const [hrProvider, setHrProvider] = useState(hrEmployee?.llm?.provider ?? '')
+  const [hrModel, setHrModel] = useState(hrEmployee?.llm?.model ?? '')
+  const [hrReasoningEffort, setHrReasoningEffort] = useState(hrEmployee?.llm?.reasoning_effort ?? 'default')
   const [priceRows, setPriceRows] = useState<PriceDraft[]>(() => buildPriceDrafts(snapshot))
   const [editError, setEditError] = useState<string>()
   const [governanceEditing, setGovernanceEditing] = useState(false)
@@ -348,6 +352,8 @@ export function OverviewView(props: OverviewViewProps): React.JSX.Element {
   const missionDetailId = useId()
   const formationDirty = useRef(false)
   const pricesDirty = useRef(false)
+  const draftRevision = useRef(snapshot.revision)
+  const draftGovernanceRevision = useRef(snapshot.company.governance_revision)
   const previousCompanyId = useRef(snapshot.company.id)
 
   useEffect(() => {
@@ -358,9 +364,13 @@ export function OverviewView(props: OverviewViewProps): React.JSX.Element {
       previousCompanyId.current = snapshot.company.id
       formationDirty.current = false
       pricesDirty.current = false
+      draftRevision.current = snapshot.revision
+      draftGovernanceRevision.current = snapshot.company.governance_revision
       setExpandedClauses(new Set())
     }
     if (!formationDirty.current) {
+      draftRevision.current = snapshot.revision
+      draftGovernanceRevision.current = snapshot.company.governance_revision
       setName(snapshot.company.name)
       setSlogan(snapshot.company.slogan)
       setMission(snapshot.company.mission)
@@ -372,6 +382,11 @@ export function OverviewView(props: OverviewViewProps): React.JSX.Element {
       setProductBudget(microsToInput(product?.budget_micros))
       setTotalBudget(microsToInput(snapshot.budget.total_micros))
       setCurrency(snapshot.budget.currency)
+      const nextHr = snapshot.employees.find((employee) => employee.is_hr === true)
+      setHrName(nextHr?.name ?? '')
+      setHrProvider(nextHr?.llm?.provider ?? '')
+      setHrModel(nextHr?.llm?.model ?? '')
+      setHrReasoningEffort(nextHr?.llm?.reasoning_effort ?? 'default')
       setEditError(undefined)
     }
     const freshPrices = buildPriceDrafts(snapshot)
@@ -406,6 +421,17 @@ export function OverviewView(props: OverviewViewProps): React.JSX.Element {
         }
       : row))
   }
+  const changeCurrency = (next: string): void => {
+    const normalized = next.toUpperCase()
+    markFormationDirty()
+    if (normalized !== currency) {
+      // Rates are denominated in the company currency. Never silently relabel
+      // an old numeric matrix as a new currency.
+      pricesDirty.current = true
+      setPriceRows((rows) => rows.map((row) => ({ ...row, enabled: false, miss: '', hit: '', output: '' })))
+    }
+    setCurrency(normalized)
+  }
 
   const submitFormation = async (): Promise<void> => {
     if (props.onEditFormation === undefined || firstProduct === undefined) return
@@ -414,6 +440,7 @@ export function OverviewView(props: OverviewViewProps): React.JSX.Element {
     if (totalBudgetUnits === undefined) { setEditError(t('formation.invalidMoney', { field: t('formation.companyBudget') })); return }
     if (productBudgetUnits === undefined) { setEditError(t('formation.invalidMoney', { field: t('formation.productBudget') })); return }
     if (slogan.trim().length === 0 || slogan.trim().length > 160) { setEditError(t('formation.invalidSlogan')); return }
+    if (hrName.trim() === '' || hrProvider.trim() === '' || hrModel.trim() === '') { setEditError(t('formation.invalidHr')); return }
     if (priceProblems.length > 0) {
       const row = priceProblems[0]
       if (row !== undefined) {
@@ -428,8 +455,6 @@ export function OverviewView(props: OverviewViewProps): React.JSX.Element {
       return
     }
     setEditError(undefined)
-    formationDirty.current = false
-    pricesDirty.current = false
     const succeeded = await props.onEditFormation({
       name,
       slogan,
@@ -438,6 +463,10 @@ export function OverviewView(props: OverviewViewProps): React.JSX.Element {
       total_budget: totalBudgetUnits,
       currency,
       model_prices: modelPrices,
+      hr_name: hrName,
+      hr_provider: hrProvider,
+      hr_model: hrModel,
+      hr_reasoning_effort: hrReasoningEffort,
       first_product: {
         name: productName,
         summary: productSummary,
@@ -445,10 +474,10 @@ export function OverviewView(props: OverviewViewProps): React.JSX.Element {
         success_criteria: criteria.split('\n').map((row) => row.trim()).filter(Boolean),
         product_budget: productBudgetUnits,
       },
-    })
-    if (!succeeded) {
-      formationDirty.current = true
-      pricesDirty.current = true
+    }, draftRevision.current)
+    if (succeeded) {
+      formationDirty.current = false
+      pricesDirty.current = false
     }
   }
 
@@ -460,15 +489,16 @@ export function OverviewView(props: OverviewViewProps): React.JSX.Element {
       return
     }
     setEditError(undefined)
-    formationDirty.current = false
     const succeeded = await props.onRequestGovernance({
       slogan,
       mission,
       charter,
-      expected_governance_revision: snapshot.company.governance_revision,
-    })
-    if (succeeded) setGovernanceEditing(false)
-    else formationDirty.current = true
+      expected_governance_revision: draftGovernanceRevision.current,
+    }, draftRevision.current)
+    if (succeeded) {
+      formationDirty.current = false
+      setGovernanceEditing(false)
+    }
   }
 
   const done = completedWorkCount(snapshot.work.map((item) => item.status))
@@ -477,7 +507,7 @@ export function OverviewView(props: OverviewViewProps): React.JSX.Element {
   const activeEmployees = snapshot.employees.filter((employee) => employee.status === 'working' || employee.activity?.state === 'running')
   const pendingApprovals = snapshot.approvals.filter((approval) => approval.status === 'pending')
   const governancePending = pendingApprovals.some((approval) => approval.kind === 'governance_change')
-  const messages = snapshot.inbox.filter((message) => message.delivery_state !== 'read').sort((left, right) => right.created_at - left.created_at).slice(0, 5)
+  const messages = [...snapshot.inbox].sort((left, right) => right.created_at - left.created_at).slice(0, 5)
 
   return (
     <div className="dsh-company-view dsh-company-overview">
@@ -540,10 +570,19 @@ export function OverviewView(props: OverviewViewProps): React.JSX.Element {
                 <legend>{t('formation.identity')}</legend>
                 <div className="dsh-company-formation-grid">
                   <label className="dsh-company-field" data-span="8"><span>{t('formation.companyName')}</span><input value={name} onChange={(event) => { markFormationDirty(); setName(event.currentTarget.value) }} /></label>
-                  <label className="dsh-company-field" data-span="4"><span>{t('formation.currency')}</span><input value={currency} maxLength={16} onChange={(event) => { markFormationDirty(); setCurrency(event.currentTarget.value.toUpperCase()) }} /></label>
+                  <label className="dsh-company-field" data-span="4"><span>{t('formation.currency')}</span><input value={currency} maxLength={16} onChange={(event) => changeCurrency(event.currentTarget.value)} /></label>
                   <label className="dsh-company-field" data-span="12"><span>{t('formation.slogan')}</span><input value={slogan} maxLength={160} onChange={(event) => { markFormationDirty(); setSlogan(event.currentTarget.value) }} /></label>
                   <label className="dsh-company-field" data-span="12"><span>{t('formation.mission')}</span><textarea rows={5} value={mission} onChange={(event) => { markFormationDirty(); setMission(event.currentTarget.value) }} /></label>
                   <label className="dsh-company-field" data-span="12"><span>{t('formation.charter')}</span><textarea rows={7} value={charter} onChange={(event) => { markFormationDirty(); setCharter(event.currentTarget.value) }} /></label>
+                </div>
+              </fieldset>
+              <fieldset className="dsh-company-fieldset">
+                <legend>{t('formation.hr')}</legend>
+                <div className="dsh-company-formation-grid">
+                  <label className="dsh-company-field" data-span="6"><span>{t('formation.hrName')}</span><input value={hrName} onChange={(event) => { markFormationDirty(); setHrName(event.currentTarget.value) }} /></label>
+                  <label className="dsh-company-field" data-span="6"><span>{t('formation.hrReasoning')}</span><input value={hrReasoningEffort} onChange={(event) => { markFormationDirty(); setHrReasoningEffort(event.currentTarget.value) }} /></label>
+                  <label className="dsh-company-field" data-span="6"><span>{t('formation.hrProvider')}</span><input value={hrProvider} onChange={(event) => { markFormationDirty(); setHrProvider(event.currentTarget.value) }} /></label>
+                  <label className="dsh-company-field" data-span="6"><span>{t('formation.hrModel')}</span><input value={hrModel} onChange={(event) => { markFormationDirty(); setHrModel(event.currentTarget.value) }} /></label>
                 </div>
               </fieldset>
               <fieldset className="dsh-company-fieldset">

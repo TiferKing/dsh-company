@@ -5,11 +5,11 @@
 
 > 面向 [DeepSeek Harness](https://github.com/deepseek-ai)（DSH）的决策驱动 AI 软件公司编排插件 —— HR 治理、货币预算、工作 DAG、工单、审批与完整 Web 控制台。
 
-`dsh-company` 把当前根会话变成**创始人（Founder）**，把持久 continuable 子代理变成**员工**，用一家真正的公司来组织软件开发：分阶段成立方案 + 人类审批、HR 先行的招聘治理、多级组织树、以货币计价的预算体系、三档费率模型价格矩阵、带尝试栅栏的依赖 DAG 工作项、人类工单、类型化审批，以及不可变审计账本。
+`dsh-company` 把当前根会话变成**创始人（Founder）**，把持久 continuable 子代理变成**员工**，用一家真正的公司来组织软件开发：分阶段成立方案 + 人类审批、HR 先行的招聘治理、多级组织树、以货币计价的单一权威账本、三档费率模型价格矩阵、带尝试栅栏的依赖 DAG 工作项、人类工单、类型化审批，以及可崩溃恢复的有界滚动审计。
 
-目标宿主：`@deepseek-ai/dsh@0.1.1-rc.2`（DSH rc.2）。
+目标宿主：`@deepseek-ai/dsh@0.1.1-rc.2`（精确测试版本）；当前插件版本 `0.16.0`。
 
-[English documentation](README.en.md)
+[English documentation](README.en.md) · [架构：核心逻辑与工作模式](docs/architecture.md)
 
 ---
 
@@ -32,27 +32,28 @@ dsh-company 用一家**真正的公司**来回答这些问题：你出决策，�
 ## 特性亮点
 
 - **决策先行** —— AI 起草名称/标语/使命/章程/首款产品/预算/价格；人类编辑并明确批准后才启动。成立批准只配额一名 HR 负责人。
-- **HR 治理** —— 每次招聘、路线变更或退休都从 HR 评估开始（难度、provider/model、推理强度、员工预算、组织路径、岗位），再经人类批准的 `organization_change`。
+- **HR 治理** —— 招聘/调整由 HR 评估难度、provider/model、推理强度、员工预算、组织路径与岗位；退休只需难度和理由，当前人员事实由 Host 推导。所有变更再经过人类批准的 `organization_change`。
 - **章程即结构化数据** —— 宿主把章程文本解析为条款树（`company.charter_outline`）；Web 端零解析直接渲染为可展开树。
 - **招聘页** —— 逐模型启用开关（默认关 = 未启用）把住招聘入口：HR 只能推荐已启用（三档定价完整）的路线。内置 OpenAI / DeepSeek / 智谱 BigModel 常见模型官方价目预设（按公司币种匹配 USD/CNY），打开开关自动预填——预设绝不自动启用任何路线。
 - **工单** —— 人类从 Web 控制台提交产品问题工单；创始人（或派驻支持工程师）分级、派发；关联修复工作完成即自动 resolved；关闭时回复人类。
-- **货币优先记账** —— 整数微货币是唯一权威；Web 端收人类单位（最多 6 位小数），在宿主边界一次转换。BigInt 汇总后统一一次半向上舍入；reasoning token 绝不重复计费。
-- **审计** —— 公司/产品预算、支出/预留/可用、按 provider/model 分色的全生命周期开销图表，以及基于只追加事件日志的有界审计明细窗口。
-- **Web 控制台与设置页同权** —— 回环同源页面即命名会话的参与者（编辑/审批/派发，直接落盘）；远程客户端严格只读。每次控制台决策都会向创始人会话注入权威记录（steer）。
-- **冷恢复纪律** —— 员工是持久 continuable 会话；宿主重启后调度器以同一 attempt 恢复未完成工作。创始人策略明确禁止复刻员工身份。
+- **单一货币账本** —— 整数微货币是唯一权威；员工执行与 Founder 管理调用都进入同一 usage ledger，Token 统计由此推导。历史 activation-credit/Token 镜像账本已迁出当前 schema。BigInt 汇总只做一次半向上舍入，reasoning 不重复计费；未定价的 Founder 调用记作未知成本而不阻断人机对话。
+- **可恢复事务与审计** —— WAL 把 state/audit/mailbox 组成一个可恢复提交；审计是明确有大小上限、会淘汰最旧行的滚动窗口，而不是无限增长的法律账本。
+- **Web 控制台** —— 回环同源页面即命名会话的参与者；写请求有 Origin、revision 与精确 live-Agent 栅栏，远程客户端严格只读。临时授权的 Web 确认只会创建审批，批准后才原子生效。
+- **冷恢复纪律** —— 员工是持久 continuable 会话；宿主重启后恢复 provisioning、staffing、handoff 与同一 work attempt。每个 attempt 最多投递三次，避免无终态更新时无限烧预算。
+- **HR 可继任** —— HR 推荐可显式指定 `designate_as_hr`；新员工成功启动后才转移 singleton HR 权限，旧 HR 随后可正常退休。
 
 ## 安装
 
-要求：Node `^22.19.0 || >=24`、pnpm、运行中的 DSH rc.2 宿主。
+运行已打包插件要求 Node `^22.19.0 || >=24`；从源码构建因 `tsdown` 要求 Node `>=24.11`。另需 pnpm 与 DSH rc.2 宿主。
 
 ```bash
-git clone https://github.com/<you>/dsh-company.git
+git clone https://github.com/TiferKing/dsh-company.git
 cd dsh-company
 pnpm install
 pnpm verify        # typecheck + test + build + package:check
-pnpm pack          # 产出 dsh-company-<version>.tgz
+npm pack --ignore-scripts  # 复用已验证 build，产出 dsh-company-<version>.tgz
 
-dsh plugin --profile/web add /absolute/path/to/dsh-company-<version>.tgz
+dsh plugin --profile web add /absolute/path/to/dsh-company-<version>.tgz
 ```
 
 重启原有 DSH Web 进程并刷新原 URL——不要另起替代服务器。
@@ -77,7 +78,7 @@ dsh plugin --profile/web add /absolute/path/to/dsh-company-<version>.tgz
 
 - **概览** —— 标语与使命、章程树、阻塞事项、实时活动。
 - **组织** —— 可折叠组织树（负载分带、内联成员、部门子树金额与模型分布、负责人归属、员工详情与授权面板）。
-- **工单** —— 人类提交表单 + 状态分组（待分级/待派发、已解决待关闭、已关闭含回复）。
+- **工单** —— Web 提交表单 + 状态分组（待分级/待派发、已解决待关闭、已关闭含回复）；分级、派发与关闭由 Founder/支持工程师工具执行。
 - **招聘** —— 上文所述的启用开关价格矩阵。
 - **审计** —— 金额统计、用量成本图表、有界审计明细。
 - **审批** —— 决策卡：审批内容常显，范围摘要与详细信息默认折叠。
@@ -90,15 +91,18 @@ dsh plugin --profile/web add /absolute/path/to/dsh-company-<version>.tgz
 |---|---|---|
 | `company_bootstrap` / `company_edit_formation` / `company_approve` | 创始人 | 起草 / 编辑 / 批准成立方案 |
 | `company_request_staffing` / `company_claim_staffing_assessment` / `company_submit_staffing_assessment` | 创始人 / HR | HR 治理招聘流水线 |
-| `company_add_employee` / `company_remove_employee` / `company_apply_staffing_adjustment` | 创始人 | 应用已批准的组织变更 |
+| `company_add_employee` / `company_remove_employee` / `company_apply_staffing_adjustment` | 创始人 | 应用已批准的组织变更与可重试 provisioning |
+| `company_create_product` / `company_update_product` | 创始人 | 创建产品与受控生命周期转换 |
 | `company_create_work` / `company_edit_work` / `company_reassign_work` | 创始人 | 工作 DAG 规划 |
 | `company_claim_work` / `company_update_work` | 员工 | 尝试栅栏下的执行与举证 |
 | `company_send_message` | 参与者 | 持久跨参与者消息（不可信数据框架） |
 | `company_request_approval` / `company_resolve_approval` | 参与者 / 创始人 | 类型化人类审批 |
 | `company_request_budget_change` / `company_request_governance_change` / `company_reprobe_models` | 创始人 | 预算与价格审批、目录重探测 |
 | `company_triage_ticket` / `company_dispatch_ticket` / `company_close_ticket` / `company_designate_support` | 创始人 / 支持 | 工单生命周期 |
-| `company_grant_temporary_authorization` / `company_revoke_temporary_authorization` | 创始人 | 有界未知成本授权 |
-| `company_control` / `company_status` | 创始人 / 参与者 | 暂停/恢复/归档；角色过滤快照 |
+| `company_grant_temporary_authorization` / `company_revoke_temporary_authorization` | 创始人 | 消费已批准请求后应用/撤销有界授权 |
+| `company_control` / `company_status` | 创始人 / 参与者 | 暂停/恢复/归档；角色过滤概览与分区分页查询 |
+
+`company_status` 默认返回经营概览；查询任务可用 `{"section":"work","id":"w1"}`，查询待审批可用 `{"section":"approvals","status":"pending"}`，列表使用 `offset` / `limit` 分页。工具结果不再是整份 CompanySnapshot；已有程序化调用需改用分区查询。Web 的 HTTP 快照契约保持不变。
 
 ## 状态与数据
 
@@ -106,8 +110,9 @@ dsh plugin --profile/web add /absolute/path/to/dsh-company-<version>.tgz
 ~/.dsh/dsh-company/v1/workspaces/<工作区哈希>/
 ├── identity.json      # 工作区锚点（规范路径 + sha256）
 ├── active/            # 运营中的公司
-│   ├── company.json   # 全量状态（schemaVersion 1）
-│   ├── events.jsonl   # 只追加审计账本（每次变更一行）
+│   ├── company.json   # 全量状态（schemaVersion 2，旧 v1 原位迁移）
+│   ├── events.jsonl   # 有界滚动审计窗口（每次变更一行，超限淘汰最旧行）
+│   ├── transaction.json # 仅提交/崩溃恢复期间存在的 WAL
 │   └── mailboxes/     # 每参与者持久收件箱
 └── archive/<id>/      # 归档公司（同构布局）
 ```
@@ -117,7 +122,7 @@ dsh plugin --profile/web add /absolute/path/to/dsh-company-<version>.tgz
 ## 宿主/Web 契约与安全
 
 - `GET /plugins/dsh-company/state?sessionId=…` —— snake_case 投影。回环同源页面获得该会话真实参与者视图（创始人得到可编辑的 founder 视图）；远程客户端（仅 `allowRemoteUi` 开启后可达）获得降级只读视图，私有证据全部剥离。
-- `POST /plugins/dsh-company/action` —— 回环页面以命名会话参与者身份执行（修订栅栏；运行时二次校验精确在世创始人与公司绑定）。远程客户端固定拒绝（`403 web_mutations_require_loopback`）。成功的控制台决策会 steer 创始人会话。
+- `POST /plugins/dsh-company/action` —— 回环页面以命名会话参与者身份执行（必须有同源 `Origin`；修订栅栏；运行时二次校验精确在世创始人与公司绑定）。`Forwarded`/`X-Forwarded-For` 只会让请求降级为 remote，远程客户端固定拒绝（`403 web_mutations_require_loopback`）。
 - 快照永不携带 attempt capability、执行 prompt、凭据或私有工作证据。临时授权绝不改变 DSH 工具权限或沙箱。
 
 ## 开发
@@ -133,9 +138,9 @@ CI 在每次 push 和 PR 上运行同一 `pnpm verify` 门禁（见 `.github/wor
 ### 发布
 
 1. 同时改 `package.json` 与 `scripts/verify-package.mjs` 中的版本断言。
-2. 运行 `pnpm verify && pnpm pack`。
+2. 运行 `pnpm verify && npm pack --ignore-scripts`，避免 prepack 重复构建。
 3. 打 `v<version>` 标签并推送；release 工作流校验后把 tarball 附到 GitHub Release。
-4. 用 `dsh plugin --profile/web add <tarball>` 安装。
+4. 用 `dsh plugin --profile web add <tarball>` 安装。
 
 ## 许可证
 

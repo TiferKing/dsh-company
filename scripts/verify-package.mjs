@@ -13,7 +13,7 @@ const exists = async (path) => {
 
 const manifest = JSON.parse(await read('package.json'))
 assert.equal(manifest.name, 'dsh-company')
-assert.equal(manifest.version, '0.15.1')
+assert.equal(manifest.version, '0.16.0')
 assert.equal(manifest.type, 'module')
 assert.equal(manifest.main, 'lib/index.js')
 assert.equal(manifest.exports?.['./client']?.default, './lib/client.js')
@@ -36,6 +36,7 @@ for (const unused of [
 for (const entry of manifest.files ?? []) {
   assert.doesNotMatch(entry, /^(?:\.tmp|\.pnpm-cache|\.pnpm-store|node_modules)(?:\/|$)/)
 }
+assert.equal(manifest.files.includes('scripts/verify-package.mjs'), false, 'repository-only verifier must not be shipped without src/')
 
 for (const file of [
   'lib/index.js',
@@ -44,16 +45,19 @@ for (const file of [
   'lib/types/client/index.d.ts',
   'cordis.patch.yml',
   'README.md',
+  'README.en.md',
   'LICENSE',
   'docs/architecture.md',
 ]) await exists(file)
+for (const map of ['lib/index.js.map', 'lib/client.js.map', 'lib/types/index.d.ts.map', 'lib/types/client/index.d.ts.map']) {
+  await assert.rejects(stat(join(root, map)), /ENOENT/, `${map} must not inflate the production package`)
+}
 
 const patch = await read('cordis.patch.yml')
 assert.match(patch, /^- insert:\s*$/m)
 assert.match(patch, /^\s+- id: dsh-company\s*$/m)
 assert.match(patch, /^\s+name: dsh-company\s*$/m)
 assert.match(patch, /^\s+defaultCurrency: [A-Z][A-Z0-9_-]{2,11}\s*$/m)
-assert.match(patch, /^\s+defaultMoneyBudgetMicros: \d+\s*$/m)
 assert.match(patch, /^\s+maxMoneyBudgetMicros: \d+\s*$/m)
 assert.match(patch, /^\s+modelPrices: \[\]\s*$/m)
 assert.match(patch, /^\s+maxTemporaryAuthorizationMs: \d+\s*$/m)

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { beginWorkAttempt, canEmployeeOwn, invalidateAttempt, isDescendantOrgUnit, selectReadyWork, StaleAttemptError, updateWork } from '../src/work.js'
+import { beginWorkAttempt, canEmployeeOwn, invalidateAttempt, isDescendantOrgUnit, selectReadyWork, StaleAttemptError, updateWork, workBlockedReasons } from '../src/work.js'
 import { companyState } from './fixtures.js'
 
 
@@ -74,6 +74,22 @@ test('work attempt ids fence stale updates after reassignment', () => {
   assert.throws(() => updateWork(state, '/workspace', 'e1', { workId: work.id, attemptId: first, status: 'failed', output: 'stale' }), StaleAttemptError)
 })
 
+test('implementation completion supports Node glob semantics for common brace scopes', () => {
+  const state = withImplementationWork()
+  const work = state.workItems[0]!
+  work.inScope = ['product/**/*.{ts,tsx}']
+  const attempt = beginWorkAttempt(state, work, 'e1')
+  updateWork(state, '/workspace', 'e1', { workId: work.id, attemptId: attempt, status: 'in_progress' })
+  assert.doesNotThrow(() => updateWork(state, '/workspace', 'e1', {
+    workId: work.id,
+    attemptId: attempt,
+    status: 'completed',
+    output: 'Implemented.',
+    changedPaths: ['product/components/widget.tsx'],
+    acceptanceResults: ['pass'],
+  }))
+})
+
 test('implementation completion enforces changed-path and acceptance evidence', () => {
   const state = withImplementationWork()
   const work = state.workItems[0]!
@@ -91,6 +107,39 @@ test('implementation completion enforces changed-path and acceptance evidence', 
   })
   assert.equal(completed.status, 'completed')
   assert.equal(completed.attemptId, undefined)
+})
+
+test('exhausted pending work does not starve later eligible work', () => {
+  const state = withImplementationWork()
+  const exhausted = state.workItems[0]!
+  exhausted.attempt = state.limits.maxAttemptsPerWork
+  state.workItems.push({ ...structuredClone(exhausted), id: 'w2', attempt: 0, createdAt: exhausted.createdAt + 1 })
+  assert.ok(workBlockedReasons(state, exhausted, 'e1').includes('attempts_exhausted'))
+  assert.equal(selectReadyWork(state, 'e1')?.id, 'w2')
+})
+
+test('progress patches retain evidence for a later terminal update', () => {
+  const state = withImplementationWork()
+  const work = state.workItems[0]!
+  const attemptId = beginWorkAttempt(state, work, 'e1')
+  updateWork(state, '/workspace', 'e1', { workId: work.id, attemptId, status: 'in_progress', changedPaths: ['product/index.ts'], commandsRun: ['node --test'] })
+  updateWork(state, '/workspace', 'e1', { workId: work.id, attemptId, output: 'Implemented and tested.', acceptanceResults: ['Tests pass'] })
+  assert.deepEqual(work.evidence, { changedPaths: ['product/index.ts'], commandsRun: ['node --test'], acceptanceResults: ['Tests pass'] })
+  updateWork(state, '/workspace', 'e1', { workId: work.id, attemptId, status: 'completed' })
+  assert.equal(work.status, 'completed')
+})
+
+test('review completion may use a previously reported verdict', () => {
+  const state = withImplementationWork()
+  const reviewed = state.workItems[0]!
+  reviewed.status = 'completed'
+  reviewed.assigneeId = 'e2'
+  state.workItems.push({ ...structuredClone(reviewed), id: 'w2', kind: 'review', reviewedWorkId: reviewed.id, status: 'pending', assigneeId: 'e1' })
+  const review = state.workItems[1]!
+  const attemptId = beginWorkAttempt(state, review, 'e1')
+  updateWork(state, '/workspace', 'e1', { workId: review.id, attemptId, status: 'in_progress', verdict: 'pass', output: 'Reviewed implementation.' })
+  updateWork(state, '/workspace', 'e1', { workId: review.id, attemptId, status: 'completed' })
+  assert.equal(review.status, 'completed')
 })
 
 function withImplementationWork() {

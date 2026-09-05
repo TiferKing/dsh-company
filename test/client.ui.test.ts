@@ -5,12 +5,11 @@ import { COMPANY_STYLES } from '../src/client/styles.js'
 import { enablePreset, modelPricePreset } from '../src/client/model-presets.js'
 import { decimalMoneyToMicros, decimalMoneyToUnits, governanceDraftProblem, mergeModelPriceDrafts, modelPriceDraftPayload } from '../src/client/views/OverviewView.js'
 
-test('model price presets match the model id only, ignoring the route provider', () => {
-  // Arbitrary provider prefixes resolve the same model preset.
+test('model price presets apply only to recognized direct providers', () => {
   assert.deepEqual(modelPricePreset('deepseek-official', 'deepseek-v4-flash', 'USD'), { miss: '0.44', hit: '0.014', output: '1.32' })
-  assert.deepEqual(modelPricePreset('opencode-go', 'deepseek-v4-pro', 'USD'), { miss: '1.32', hit: '0.044', output: '3.96' })
-  assert.deepEqual(modelPricePreset('whatever-relay', 'gpt-5.1', 'USD'), { miss: '1.25', hit: '0.125', output: '10' })
-  assert.deepEqual(modelPricePreset('zai-coding-cn', 'glm-4.6', 'CNY'), { miss: '2', hit: '0.2', output: '8' })
+  assert.equal(modelPricePreset('opencode-go', 'deepseek-v4-pro', 'USD'), undefined, 'subscription routes must not inherit direct API pricing')
+  assert.equal(modelPricePreset('whatever-relay', 'gpt-5.1', 'USD'), undefined)
+  assert.deepEqual(modelPricePreset('bigmodel', 'glm-4.6', 'CNY'), { miss: '2', hit: '0.2', output: '8' })
   // Dated snapshot suffixes fall back to the most specific base model.
   assert.deepEqual(modelPricePreset('deepseek-official', 'deepseek-v4-flash-0731', 'USD'), { miss: '0.44', hit: '0.014', output: '1.32' })
   assert.deepEqual(modelPricePreset('openai', 'gpt-4o-2024-08-06', 'USD'), { miss: '2.5', hit: '1.25', output: '10' })
@@ -18,7 +17,7 @@ test('model price presets match the model id only, ignoring the route provider',
   assert.deepEqual(modelPricePreset('openai', 'gpt-4o-mini', 'USD'), { miss: '0.15', hit: '0.075', output: '0.6' })
   // Currency still gates the lookup.
   assert.equal(modelPricePreset('openai', 'gpt-5.1', 'CNY'), undefined)
-  assert.deepEqual(modelPricePreset('zai-coding-cn', 'glm-4.6', 'USD'), { miss: '0.6', hit: '0.11', output: '2.2' }, 'international USD list exists for glm-4.6')
+  assert.deepEqual(modelPricePreset('bigmodel', 'glm-4.6', 'USD'), { miss: '0.6', hit: '0.11', output: '2.2' }, 'international USD list exists for glm-4.6')
   assert.equal(modelPricePreset('mock', 'mock-model', 'USD'), undefined)
   assert.deepEqual(modelPricePreset('deepseek-official', 'deepseek-chat', 'CNY'), { miss: '2', hit: '0.2', output: '3' })
 })

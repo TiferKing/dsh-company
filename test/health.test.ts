@@ -33,7 +33,7 @@ test('terminal quota failure blocks same-route staff, halts globally, requeues, 
     const state = companyState({ workspaceHash: paths.workspace.sha256 })
     state.employees[0]!.status = 'working'
     state.employees.push({
-      id: 'e2', name: 'Reviewer', role: 'Reviewer', department: 'Engineering', orgUnitId: 'ou2',
+      id: 'e2', name: 'Reviewer', role: 'Reviewer', orgUnitId: 'ou2',
       positionId: 'pos1', status: 'idle', sessionId: 'employee-session-2', joinedAt: Date.now(),
       llm: { provider: 'mock', model: 'mock-model', activeProvider: 'mock', activeModel: 'mock-model' },
     })

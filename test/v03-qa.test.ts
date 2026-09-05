@@ -9,10 +9,9 @@ import {
   reserveMoneyTurn,
   resolveRateSnapshot,
 } from '../src/money.js'
-import { mergeDiscoveredPriceRows, probeRegisteredModels } from '../src/models.js'
+import { probeRegisteredModels } from '../src/models.js'
 import {
   TEMP_AUTH_INTERNAL_WORK_KINDS,
-  createTemporaryAuthorization,
   isTemporaryAuthorizationActive,
   resolveAuthorizationAdmission,
   revokeTemporaryAuthorization,
@@ -22,8 +21,8 @@ import { createApproval, resolveApproval } from '../src/approvals.js'
 import { assertCompanyState, normalizeModelPrices, resolveConfig } from '../src/schemas.js'
 import { buildSnapshot } from '../src/snapshot.js'
 import { updateWork, workBlockedReasons } from '../src/work.js'
-import type { CompanyState, MoneyRateSnapshot, WorkItem, WorkKind } from '../src/types.js'
-import { companyState } from './fixtures.js'
+import type { CompanyState, MoneyRateSnapshot, WorkItem } from '../src/types.js'
+import { approvedTemporaryAuthorization, companyState } from './fixtures.js'
 
 const config = resolveConfig({ stateRoot: '/tmp/dsh-company-v03-qa' })
 
@@ -71,7 +70,7 @@ test('three-rate money uses one aggregate BigInt half-up rounding and never doub
   })
 })
 
-test('blank exact rows cannot shadow wildcard prices and discovery never mutates the independent price matrix', () => {
+test('blank exact rows cannot shadow wildcard prices', () => {
   const state = companyState()
   state.moneyBudget.prices = [
     { provider: 'mock', model: 'm', source: 'catalog', revision: 1, updatedAt: 1 },
@@ -86,12 +85,6 @@ test('blank exact rows cannot shadow wildcard prices and discovery never mutates
   ], 'manual', 2, 2)
   assert.deepEqual(normalized.map((row) => row.model), ['*'])
   assert.equal(resolveRateSnapshot({ ...state, moneyBudget: { ...state.moneyBudget, prices: normalized, pricingRevision: 2 } }, 'mock', 'anything').outputMicrosPerMillion, 0)
-
-  const merged = mergeDiscoveredPriceRows(normalized, {
-    stale: false, generation: 2, probedAt: 2, errors: [],
-    models: [{ provider: 'mock', model: 'new', name: 'New', advertised: true, available: true }],
-  }, 2, 2)
-  assert.deepEqual(merged, normalized)
 })
 
 test('reservation captures immutable historical rates and actual settlement preserves the snapshot', () => {
@@ -126,11 +119,8 @@ test('persisted priced usage is rejected when cost disagrees with its immutable 
   recordMoneyUsage(state, { sessionId: 'employee-session', eventSeq: 7, turn: 1, step: 1, employeeId: 'e1', provider: 'mock', model: 'mock-model', usage: { inputTokens: 1, outputTokens: 0 }, at: 2 })
   releaseMoneyReservation(state, reservationId)
   const money = state.moneyBudget.usage[0]!
-  const legacy = state.tokenBudget.usage[0]!
   money.costMicros = 0
-  legacy.costMicros = 0
   state.moneyBudget.spentMicros = 0
-  state.tokenBudget.totalCostMicros = 0
   assert.throws(() => assertCompanyState(state, state.workspaceHash), /cost does not match its immutable rate snapshot/)
 })
 
@@ -177,7 +167,7 @@ test('temporary authorization has exact work/approval fences, strict time bounds
   const productScope = createApproval(state, 'founder', { kind: 'product_scope', summary: 'Pending scope', payload: { action: 'update', productId: 'p1' } })
   const modelRoute = createApproval(state, 'founder', { kind: 'model_route', summary: 'Pending route', payload: { employeeId: 'e1', provider: 'mock', model: 'mock-model' } })
   const budget = createApproval(state, 'founder', { kind: 'budget_change', summary: 'Pending budget', payload: { newTotalMicros: 100_000_000, expectedTotalMicros: 100_000_000 } })
-  const authorization = createTemporaryAuthorization(state, { employeeId: 'e1', reason: 'Bounded exception', startsAt: now, expiresAt: now + 1_000 }, { maxMs: 5_000 }, now)
+  const authorization = approvedTemporaryAuthorization(state, { employeeId: 'e1', reason: 'Bounded exception', startsAt: now, expiresAt: now + 1_000 }, { maxMs: 5_000 }, now)
 
   assert.equal(temporaryAuthorizationStatus(authorization, now - 1), 'scheduled')
   assert.equal(temporaryAuthorizationStatus(authorization, now), 'active')
@@ -194,10 +184,10 @@ test('temporary authorization has exact work/approval fences, strict time bounds
   assert.deepEqual(resolveAuthorizationAdmission(state, 'e1', workItem({ approvalDependencies: [productScope.id] }), now)?.bypassedApprovalIds, [])
   productScope.status = 'cancelled'
   assert.deepEqual(resolveAuthorizationAdmission(state, 'e1', workItem({ approvalDependencies: [productScope.id] }), now)?.bypassedApprovalIds, [])
-  assert.throws(() => createTemporaryAuthorization(state, { employeeId: 'e1', reason: 'Overlap', startsAt: now + 500, expiresAt: now + 1_500 }, { maxMs: 5_000 }, now), /overlapping/)
+  assert.throws(() => approvedTemporaryAuthorization(state, { employeeId: 'e1', reason: 'Overlap', startsAt: now + 500, expiresAt: now + 1_500 }, { maxMs: 5_000 }, now), /overlapping/)
   revokeTemporaryAuthorization(state, authorization.id, 'No longer needed', now + 200)
   assert.equal(temporaryAuthorizationStatus(authorization, now + 200), 'revoked')
-  assert.doesNotThrow(() => createTemporaryAuthorization(state, { employeeId: 'e1', reason: 'Replacement', startsAt: now + 500, expiresAt: now + 1_500 }, { maxMs: 5_000 }, now + 200))
+  assert.doesNotThrow(() => approvedTemporaryAuthorization(state, { employeeId: 'e1', reason: 'Replacement', startsAt: now + 500, expiresAt: now + 1_500 }, { maxMs: 5_000 }, now + 200))
 })
 
 test('release and operations work require exact protected approval kinds and cannot use unrelated approvals', () => {
@@ -321,7 +311,7 @@ test('Host department load oracle reconciles nested subtree evidence and exact f
 test('Host employee projection exposes priced/unpriced counts so unknown cost is never inferred as zero', () => {
   const state = companyState()
   state.moneyBudget.prices = []
-  const authorization = createTemporaryAuthorization(state, { employeeId: 'e1', reason: 'Unpriced bounded work', expiresAt: Date.now() + 60_000 }, { maxMs: 120_000 }, Date.now())
+  const authorization = approvedTemporaryAuthorization(state, { employeeId: 'e1', reason: 'Unpriced bounded work', expiresAt: Date.now() + 60_000 }, { maxMs: 120_000 }, Date.now())
   reserveMoneyTurn(state, {
     employeeId: 'e1', provider: 'unknown', model: 'model',
     bypass: { authorizationId: authorization.id, bypassCompany: true, bypassProduct: true, bypassEmployee: true },

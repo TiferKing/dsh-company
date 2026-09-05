@@ -1,6 +1,6 @@
 import type { CompanyTranslate } from '../locales.js'
 import type { CompanySnapshot } from '../types.js'
-import { InfoIcon, PackageIcon } from '../icons.js'
+import { PackageIcon } from '../icons.js'
 import { completedWorkCount, formatMoneyMicros, percent, productStatusLabel, productTone, StatusBadge } from '../ui.js'
 
 export interface ProductsViewProps {
@@ -74,7 +74,7 @@ export function ProductsView({ snapshot, t, locale }: ProductsViewProps): React.
                 <footer className="dsh-company-product__footer">
                   <span>{product.id}</span>
                   <span>{t('products.moneyBudget')}: {formatMoneyMicros(product.budget_micros, snapshot.budget.currency, locale)} · {t('products.moneySpent')}: {formatMoneyMicros(product.spent_micros, snapshot.budget.currency, locale)} · {t('products.moneyAvailable')}: {formatMoneyMicros(product.available_micros, snapshot.budget.currency, locale)}</span>
-                  <span>{t('products.tokenAnalytics')}: {product.token_used.toLocaleString(locale)} / {product.token_budget.toLocaleString(locale)} tokens</span>
+                  <span>{t('products.tokenAnalytics')}: {product.token_used.toLocaleString(locale)} tokens</span>
                 </footer>
               </article>
             )

@@ -1,88 +1,33 @@
 /** Browser-safe wire contract for the dsh-company HTTP snapshot. */
 
+import {
+  APPROVAL_KINDS,
+  APPROVAL_STATUSES,
+  COMPANY_PHASES,
+  COMPANY_SNAPSHOT_SCHEMA_VERSION,
+  EMPLOYEE_STATUSES,
+  MESSAGE_DELIVERY_STATES,
+  PRODUCT_STATUSES,
+  STAFFING_ACTIONS,
+  STAFFING_STATUSES,
+  WORK_KINDS,
+  WORK_STATUSES,
+  type ApprovalKind,
+  type ApprovalStatus,
+  type CompanyPhase,
+  type CompanyUiActionName,
+  type CompanyActionRequest as HostCompanyActionRequest,
+  type EmployeeStatus,
+  type ProductStatus,
+  type WorkKind,
+  type WorkStatus,
+} from '../types.js'
 import { DEPARTMENT_LOAD_BANDS, type DepartmentLoadBand } from './load.js'
+export { APPROVAL_KINDS, APPROVAL_STATUSES, COMPANY_PHASES, EMPLOYEE_STATUSES, MESSAGE_DELIVERY_STATES, PRODUCT_STATUSES, STAFFING_ACTIONS, STAFFING_STATUSES, WORK_KINDS, WORK_STATUSES }
+export type { ApprovalKind, ApprovalStatus, CompanyPhase, EmployeeStatus, ProductStatus, WorkKind, WorkStatus }
 export { DEPARTMENT_LOAD_BANDS, departmentLoadPresentation } from './load.js'
 export type { DepartmentLoadBand, DepartmentLoadTone } from './load.js'
 
-export const COMPANY_PHASES = [
-  'staged',
-  'provisioning',
-  'provisioning_failed',
-  'operating',
-  'paused',
-  'halted',
-  'closing',
-  'archived',
-] as const
-
-export type CompanyPhase = (typeof COMPANY_PHASES)[number]
-
-export const EMPLOYEE_STATUSES = [
-  'planned',
-  'provisioning',
-  'idle',
-  'working',
-  'paused',
-  'failed',
-  'retired',
-] as const
-
-export type EmployeeStatus = (typeof EMPLOYEE_STATUSES)[number]
-
-export const PRODUCT_STATUSES = [
-  'proposed',
-  'approved',
-  'active',
-  'paused',
-  'validating',
-  'released',
-  'retired',
-  'cancelled',
-] as const
-
-export type ProductStatus = (typeof PRODUCT_STATUSES)[number]
-
-export const WORK_KINDS = [
-  'discovery',
-  'design',
-  'implementation',
-  'verification',
-  'review',
-  'repair',
-  'integration',
-  'release',
-  'operations',
-] as const
-
-export type WorkKind = (typeof WORK_KINDS)[number]
-
-export const WORK_STATUSES = [
-  'pending',
-  'claimed',
-  'in_progress',
-  'completed',
-  'failed',
-  'cancelled',
-] as const
-
-export type WorkStatus = (typeof WORK_STATUSES)[number]
-
-export const APPROVAL_KINDS = [
-  'bootstrap',
-  'budget_change',
-  'pricing_change',
-  'governance_change',
-  'temporary_authorization',
-  'organization_change',
-  'product_scope',
-  'model_route',
-  'release',
-  'external_effect',
-  'forced_archive',
-] as const
-
-export type ApprovalKind = (typeof APPROVAL_KINDS)[number]
-export type ApprovalStatus = 'pending' | 'approved' | 'rejected' | 'cancelled' | 'expired'
 export type RiskLevel = 'low' | 'medium' | 'high'
 
 export interface SafeModelRoute {
@@ -214,11 +159,8 @@ export interface SafeProductView {
   status: ProductStatus
   product_root: string
   success_criteria: string[]
-  budget_credits: number
-  token_budget: number
   token_used: number
-  cost_micros: number
-  budget_micros?: number
+  budget_micros: number
   spent_micros?: number
   reserved_micros?: number
   available_micros?: number
@@ -242,7 +184,6 @@ export interface SafeWorkEvidence {
   changed_paths: string[]
   acceptance_results: string[]
   commands_run: string[]
-  deliverables: string[]
 }
 
 export interface SafeWorkView {
@@ -258,6 +199,9 @@ export interface SafeWorkView {
   approval_dependencies: string[]
   blocked: boolean
   blocked_reasons: string[]
+  acceptance?: string[]
+  verify?: string[]
+  deliverables?: string[]
   attempt?: number
   output_summary?: string
   verdict?: 'pass' | 'needs_revision' | 'reject'
@@ -381,6 +325,7 @@ export interface SafeTemporaryAuthorizationView {
   id: string
   employee_id: string
   reason: string
+  approval_id: string
   authorized_by: 'founder'
   starts_at: number
   expires_at: number
@@ -420,12 +365,11 @@ export interface SafeMessageView {
   content: string
   created_at: number
   attempts?: number
-  delivery_state: 'queued' | 'reserved' | 'accepted' | 'read' | 'held_budget' | 'dead'
-  read_at?: number
+  delivery_state: 'queued' | 'reserved' | 'accepted' | 'held_budget' | 'dead'
 }
 
 export interface CompanySnapshot {
-  schema_version: 4
+  schema_version: typeof COMPANY_SNAPSHOT_SCHEMA_VERSION
   revision: number
   viewer: {
     role: 'founder' | 'employee'
@@ -445,7 +389,6 @@ export interface CompanySnapshot {
     health: { status: 'healthy' | 'degraded' | 'manual_pause' | 'halted'; reason?: string; detail?: string; detectedAt?: number; resumable: boolean }
     updated_at: number
     founder_session_id?: string
-    plan_review_state?: 'awaiting_review' | 'awaiting_feedback'
   }
   org_units: SafeOrgUnitView[]
   positions: SafePositionView[]
@@ -463,26 +406,9 @@ export interface CompanySnapshot {
   poll_after_ms?: number
 }
 
-export type CompanyAction =
-  | 'approve_bootstrap'
-  | 'edit_formation'
-  | 'file_ticket'
-  | 'resolve_approval'
-  | 'reprobe_models'
-  | 'request_governance_change'
-  | 'request_budget_change'
-  | 'grant_temporary_authorization'
-  | 'revoke_temporary_authorization'
-  | 'pause'
-  | 'resume'
-  | 'archive'
-  | 'discard_staged'
+export type CompanyAction = CompanyUiActionName
 
-export interface CompanyActionRequest {
-  sessionId: string
-  companyId: string
-  expectedRevision: number
-  action: CompanyAction
+export interface CompanyActionRequest extends Omit<HostCompanyActionRequest, 'payload'> {
   payload: unknown
 }
 
@@ -492,13 +418,9 @@ export class SnapshotValidationError extends Error {
 
 type JsonRecord = Record<string, unknown>
 
-const APPROVAL_STATUSES = ['pending', 'approved', 'rejected', 'cancelled', 'expired'] as const
 const RISKS = ['low', 'medium', 'high'] as const
 const ACTIVITY_STATES = ['idle', 'running', 'ready', 'cold', 'unavailable', 'retired'] as const
 const ORG_UNIT_KINDS = ['company', 'division', 'department', 'team'] as const
-const STAFFING_ACTIONS = ['hire', 'adjust', 'retire'] as const
-const STAFFING_STATUSES = ['pending', 'in_review', 'recommended', 'approved', 'rejected', 'applied'] as const
-const MESSAGE_STATES = ['queued', 'reserved', 'accepted', 'read', 'held_budget', 'dead'] as const
 const VERDICTS = ['pass', 'needs_revision', 'reject'] as const
 const FINDING_SEVERITIES = ['low', 'medium', 'high', 'blocker'] as const
 const MODEL_PRICE_SOURCES = ['manual', 'catalog', 'legacy'] as const
@@ -705,15 +627,9 @@ function parseDepartmentLoad(value: unknown, path: string): SafeDepartmentLoadVi
   if (people > 0 && (average !== effectiveSum / people || openWork > effectiveSum || maxEffective > effectiveSum || maxEffective < average)) {
     fail(path, 'internally consistent Host load evidence')
   }
-  const expectedBand: DepartmentLoadBand = people === 0 || effectiveSum === 0
-    ? 'very_idle'
-    : maxEffective >= 4 || effectiveSum > 3 * people
-      ? 'pressure'
-      : maxEffective >= 2 || effectiveSum > people
-        ? 'busy'
-        : 'normal'
+  // The Host owns workload policy and may evolve band thresholds independently;
+  // the client validates evidence shape but never re-implements that policy.
   const band = enumValue(input.band, DEPARTMENT_LOAD_BANDS, `${path}.band`)
-  if (band !== expectedBand) fail(`${path}.band`, `Host-derived ${expectedBand} for the supplied evidence`)
   return {
     band,
     people,
@@ -773,11 +689,8 @@ function parseProduct(value: unknown, path: string): SafeProductView {
     status: enumValue(input.status, PRODUCT_STATUSES, `${path}.status`),
     product_root: string(input.product_root, `${path}.product_root`, 4_096),
     success_criteria: strings(input.success_criteria, `${path}.success_criteria`, 256),
-    budget_credits: integer(input.budget_credits, `${path}.budget_credits`),
-    token_budget: integer(input.token_budget, `${path}.token_budget`),
     token_used: integer(input.token_used, `${path}.token_used`),
-    cost_micros: integer(input.cost_micros, `${path}.cost_micros`),
-    budget_micros: optionalInteger(input.budget_micros, `${path}.budget_micros`),
+    budget_micros: integer(input.budget_micros, `${path}.budget_micros`),
     spent_micros: optionalInteger(input.spent_micros, `${path}.spent_micros`),
     reserved_micros: optionalInteger(input.reserved_micros, `${path}.reserved_micros`),
     available_micros: optionalInteger(input.available_micros, `${path}.available_micros`),
@@ -807,22 +720,20 @@ function parseEvidence(value: unknown, path: string): SafeWorkEvidence {
     changed_paths: strings(input.changed_paths ?? [], `${path}.changed_paths`, 1_000),
     acceptance_results: strings(input.acceptance_results ?? [], `${path}.acceptance_results`, 1_000),
     commands_run: strings(input.commands_run ?? [], `${path}.commands_run`, 1_000),
-    deliverables: strings(input.deliverables ?? [], `${path}.deliverables`, 1_000),
   }
 }
 
 function parseWork(value: unknown, path: string): SafeWorkView {
   const input = record(value, path)
   const blockedReasons = strings(input.blocked_reasons ?? [], `${path}.blocked_reasons`, 1_000)
-  const hasFlatEvidence = input.acceptance !== undefined || input.verify !== undefined || input.deliverables !== undefined
+  const hasFlatEvidence = input.changed_paths !== undefined || input.acceptance_results !== undefined || input.commands_run !== undefined
   const evidence = input.evidence === undefined
     ? hasFlatEvidence
-      ? {
-          changed_paths: [],
-          acceptance_results: strings(input.acceptance ?? [], `${path}.acceptance`, 1_000),
-          commands_run: strings(input.verify ?? [], `${path}.verify`, 1_000),
-          deliverables: strings(input.deliverables ?? [], `${path}.deliverables`, 1_000),
-        }
+      ? parseEvidence({
+          changed_paths: input.changed_paths,
+          acceptance_results: input.acceptance_results,
+          commands_run: input.commands_run,
+        }, `${path}.evidence`)
       : undefined
     : parseEvidence(input.evidence, `${path}.evidence`)
   return compactOptional({
@@ -838,6 +749,9 @@ function parseWork(value: unknown, path: string): SafeWorkView {
     approval_dependencies: strings(input.approval_dependencies ?? [], `${path}.approval_dependencies`, 1_000),
     blocked: input.blocked === undefined ? blockedReasons.length > 0 : boolean(input.blocked, `${path}.blocked`),
     blocked_reasons: blockedReasons,
+    acceptance: input.acceptance === undefined ? undefined : strings(input.acceptance, `${path}.acceptance`, 1_000),
+    verify: input.verify === undefined ? undefined : strings(input.verify, `${path}.verify`, 1_000),
+    deliverables: input.deliverables === undefined ? undefined : strings(input.deliverables, `${path}.deliverables`, 1_000),
     attempt: optionalInteger(input.attempt, `${path}.attempt`),
     output_summary: optionalString(input.output_summary ?? input.output, `${path}.output_summary`, 65_536),
     verdict: optionalEnum(input.verdict, VERDICTS, `${path}.verdict`),
@@ -1026,6 +940,7 @@ function parseTemporaryAuthorization(value: unknown, path: string): SafeTemporar
     id: nonBlankString(input.id, `${path}.id`, 128),
     employee_id: nonBlankString(input.employee_id, `${path}.employee_id`, 128),
     reason: nonBlankString(input.reason, `${path}.reason`, 4_096),
+    approval_id: nonBlankString(input.approval_id, `${path}.approval_id`, 128),
     authorized_by: enumValue(input.authorized_by, ['founder'] as const, `${path}.authorized_by`),
     starts_at: startsAt,
     expires_at: expiresAt,
@@ -1104,8 +1019,8 @@ function parseMessage(value: unknown, path: string): SafeMessageView {
     to: optionalString(input.to, `${path}.to`, 128),
     content: string(input.content, `${path}.content`, 65_536),
     created_at: integer(input.created_at, `${path}.created_at`),
-    delivery_state: enumValue(input.delivery_state, MESSAGE_STATES, `${path}.delivery_state`),
-    read_at: optionalInteger(input.read_at, `${path}.read_at`),
+    attempts: optionalInteger(input.attempts, `${path}.attempts`),
+    delivery_state: enumValue(input.delivery_state, MESSAGE_DELIVERY_STATES, `${path}.delivery_state`),
   })
 }
 
@@ -1178,13 +1093,13 @@ function parseCharterOutline(value: unknown, path: string): SafeCharterClauseVie
 /** Validate and copy a Host snapshot, dropping every unknown field. */
 export function parseCompanySnapshot(value: unknown): CompanySnapshot {
   const input = record(unwrapSnapshot(value), 'snapshot')
-  if (input.schema_version !== 4) fail('snapshot.schema_version', '4')
+  if (input.schema_version !== COMPANY_SNAPSHOT_SCHEMA_VERSION) fail('snapshot.schema_version', String(COMPANY_SNAPSHOT_SCHEMA_VERSION))
 
   const viewer = record(input.viewer, 'snapshot.viewer')
   const company = record(input.company, 'snapshot.company')
   const budget = parseBudget(input.budget, 'snapshot.budget')
   const employees = uniqueIds(
-    array(input.employees, 'snapshot.employees', 32).map((item, index) =>
+    array(input.employees, 'snapshot.employees', 256).map((item, index) =>
       parseEmployee(item, `snapshot.employees[${index}]`),
     ),
     'snapshot.employees',
@@ -1263,7 +1178,7 @@ export function parseCompanySnapshot(value: unknown): CompanySnapshot {
   }
 
   return compactOptional({
-    schema_version: 4 as const,
+    schema_version: COMPANY_SNAPSHOT_SCHEMA_VERSION,
     revision: integer(input.revision, 'snapshot.revision'),
     viewer: {
       role: enumValue(viewer.role, ['founder', 'employee'] as const, 'snapshot.viewer.role'),
@@ -1283,11 +1198,6 @@ export function parseCompanySnapshot(value: unknown): CompanySnapshot {
       health: parseHealth(company.health, 'snapshot.company.health'),
       updated_at: integer(company.updated_at, 'snapshot.company.updated_at'),
       founder_session_id: optionalString(company.founder_session_id, 'snapshot.company.founder_session_id', 256),
-      plan_review_state: optionalEnum(
-        company.plan_review_state,
-        ['awaiting_review', 'awaiting_feedback'] as const,
-        'snapshot.company.plan_review_state',
-      ),
     }),
     org_units: orgUnits,
     positions,
@@ -1304,10 +1214,4 @@ export function parseCompanySnapshot(value: unknown): CompanySnapshot {
     warnings: strings(input.warnings, 'snapshot.warnings', 1_000),
     poll_after_ms: optionalInteger(input.poll_after_ms, 'snapshot.poll_after_ms'),
   })
-}
-
-export function isCompanyLive(snapshot: CompanySnapshot): boolean {
-  if (['provisioning', 'operating', 'closing'].includes(snapshot.company.phase)) return true
-  if (snapshot.employees.some((employee) => employee.status === 'working')) return true
-  return snapshot.work.some((item) => item.status === 'claimed' || item.status === 'in_progress')
 }

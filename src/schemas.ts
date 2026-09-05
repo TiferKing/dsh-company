@@ -1,4 +1,5 @@
 import { resolveStateRoot } from './paths.js'
+import { COMPANY_PHASES, COMPANY_STATE_SCHEMA_VERSION } from './types.js'
 import type {
   ApprovalKind,
   CompanyConfig,
@@ -9,8 +10,6 @@ import type {
   ModelPriceInput,
   MoneyRateSnapshot,
   ResolvedCompanyConfig,
-  TokenPrice,
-  TokenPriceInput,
   WorkItem,
 } from './types.js'
 
@@ -48,30 +47,13 @@ export function resolveConfig(config: CompanyConfig = {}): ResolvedCompanyConfig
     maxAuditBytes: boundedInteger(config.maxAuditBytes ?? 10_485_760, 'maxAuditBytes', 1024, 104_857_600),
     maxMessageChars: boundedInteger(config.maxMessageChars ?? 16_384, 'maxMessageChars', 64, 131_072),
     maxOutputChars: boundedInteger(config.maxOutputChars ?? 65_536, 'maxOutputChars', 256, 1_048_576),
-    defaultBudgetCredits: boundedInteger(config.defaultBudgetCredits ?? 50, 'defaultBudgetCredits', 0, config.maxBudgetCredits ?? 1000),
-    maxBudgetCredits: boundedInteger(config.maxBudgetCredits ?? 1000, 'maxBudgetCredits', 1, 1_000_000),
-    defaultActivationCredits: boundedInteger(config.defaultActivationCredits ?? 1, 'defaultActivationCredits', 1, 10_000),
-    routeCosts: normalizeRouteCosts(config.routeCosts ?? {}),
-    defaultTokenBudget: boundedInteger(config.defaultTokenBudget ?? 20_000_000, 'defaultTokenBudget', 1, config.maxTokenBudget ?? 1_000_000_000),
-    maxTokenBudget: boundedInteger(config.maxTokenBudget ?? 1_000_000_000, 'maxTokenBudget', 1, 1_000_000_000_000),
     defaultCurrency: normalizeCurrency(config.defaultCurrency ?? 'USD'),
-    tokenPrices: normalizeTokenPrices(config.tokenPrices ?? []),
-    defaultMoneyBudgetMicros: boundedInteger(config.defaultMoneyBudgetMicros ?? 100_000_000, 'defaultMoneyBudgetMicros', 0, config.maxMoneyBudgetMicros ?? 1_000_000_000_000_000),
     maxMoneyBudgetMicros: boundedInteger(config.maxMoneyBudgetMicros ?? 1_000_000_000_000_000, 'maxMoneyBudgetMicros', 1, Number.MAX_SAFE_INTEGER),
     modelPrices: normalizeModelPrices(config.modelPrices ?? [], 'manual', 1, 0),
     maxTemporaryAuthorizationMs: boundedInteger(config.maxTemporaryAuthorizationMs ?? 86_400_000, 'maxTemporaryAuthorizationMs', 1, 31_536_000_000),
     promptSectionOrder: boundedInteger(config.promptSectionOrder ?? 118, 'promptSectionOrder', 0, 10_000),
-    uiPollMs: boundedInteger(config.uiPollMs ?? 1000, 'uiPollMs', 250, 60_000),
+    uiPollMs: boundedInteger(config.uiPollMs ?? 1000, 'uiPollMs', 500, 60_000),
     allowRemoteUi: config.allowRemoteUi ?? false,
-  }
-  if (resolved.defaultBudgetCredits > resolved.maxBudgetCredits) {
-    throw new Error('defaultBudgetCredits must not exceed maxBudgetCredits')
-  }
-  if (resolved.defaultTokenBudget > resolved.maxTokenBudget) {
-    throw new Error('defaultTokenBudget must not exceed maxTokenBudget')
-  }
-  if (resolved.defaultMoneyBudgetMicros > resolved.maxMoneyBudgetMicros) {
-    throw new Error('defaultMoneyBudgetMicros must not exceed maxMoneyBudgetMicros')
   }
   if (resolved.maxOpenWorkItems > resolved.maxWorkItems) {
     throw new Error('maxOpenWorkItems must not exceed maxWorkItems')
@@ -156,7 +138,15 @@ export function normalizeModelPrices(
     && price.outputMicrosPerMillion !== undefined)
 }
 
-export function collapseLegacyTokenPrice(price: TokenPrice, revision: number, updatedAt: number): ModelPrice3 | undefined {
+export function collapseLegacyTokenPrice(price: {
+  provider: string
+  model: string
+  inputMicrosPerMillion: number
+  cacheReadMicrosPerMillion: number
+  cacheWriteMicrosPerMillion: number
+  outputMicrosPerMillion: number
+  reasoningMicrosPerMillion?: number
+}, revision: number, updatedAt: number): ModelPrice3 | undefined {
   if (price.cacheWriteMicrosPerMillion !== price.inputMicrosPerMillion) return undefined
   if (price.reasoningMicrosPerMillion !== undefined && price.reasoningMicrosPerMillion !== price.outputMicrosPerMillion) return undefined
   return {
@@ -171,61 +161,16 @@ export function collapseLegacyTokenPrice(price: TokenPrice, revision: number, up
   }
 }
 
-export function normalizeTokenPrices(prices: TokenPriceInput[]): TokenPrice[] {
-  if (!Array.isArray(prices)) throw new Error('token prices must be an array')
-  const seen = new Set<string>()
-  return prices.map((price, index) => {
-    if (!isRecord(price)) throw new Error(`tokenPrices[${index}] must be an object`)
-    const provider = nonEmpty(price.provider, `tokenPrices[${index}].provider`, 128)
-    const model = nonEmpty(price.model, `tokenPrices[${index}].model`, 256)
-    const key = `${provider}/${model}`
-    if (seen.has(key)) throw new Error(`duplicate token price route ${key}`)
-    for (const required of ['inputPerMillion', 'cacheReadPerMillion', 'cacheWritePerMillion', 'outputPerMillion'] as const) {
-      if (price[required] === undefined) throw new Error(`tokenPrices[${index}].${required} is required`)
-    }
-    seen.add(key)
-    const micros = (field: keyof TokenPriceInput): number => {
-      const raw = price[field]
-      if (raw === undefined) return 0
-      if (typeof raw !== 'number' || !Number.isFinite(raw) || raw < 0 || raw > 1_000_000) throw new Error(`tokenPrices[${index}].${field} must be a finite number between 0 and 1000000`)
-      const value = Math.round(raw * 1_000_000)
-      if (!Number.isSafeInteger(value)) throw new Error(`tokenPrices[${index}].${field} is too large`)
-      return value
-    }
-    const reasoning = price.reasoningPerMillion === undefined ? undefined : micros('reasoningPerMillion')
-    return {
-      provider,
-      model,
-      inputMicrosPerMillion: micros('inputPerMillion'),
-      cacheReadMicrosPerMillion: micros('cacheReadPerMillion'),
-      cacheWriteMicrosPerMillion: micros('cacheWritePerMillion'),
-      outputMicrosPerMillion: micros('outputPerMillion'),
-      ...(reasoning === undefined ? {} : { reasoningMicrosPerMillion: reasoning }),
-    }
-  })
-}
-
-function normalizeRouteCosts(costs: Record<string, number>): Record<string, number> {
-  if (!isRecord(costs)) throw new Error('routeCosts must be an object')
-  const result: Record<string, number> = {}
-  for (const [route, cost] of Object.entries(costs)) {
-    const trimmed = route.trim()
-    if (!/^[^/\s]+\/.+$/.test(trimmed)) throw new Error(`invalid routeCosts key ${JSON.stringify(route)}; expected provider/model`)
-    result[trimmed] = boundedInteger(cost, `routeCosts[${JSON.stringify(route)}]`, 1, 1_000_000)
-  }
-  return result
-}
-
 export function assertCompanyState(value: unknown, expectedWorkspaceHash?: string): asserts value is CompanyState {
   if (!isRecord(value)) throw new Error('company state must be an object')
   exactKeys(value, [
     'schemaVersion', 'revision', 'id', 'name', 'slogan', 'mission', 'governanceRevision', 'workspaceHash', 'founderSessionId',
-    'stagedFromUserMessageId', 'phase', 'planReviewState', 'createdAt', 'updatedAt', 'approvedAt',
-    'pausedAt', 'archivedAt', 'limits', 'counters', 'budget', 'tokenBudget', 'moneyBudget', 'modelCatalog',
+    'stagedFromUserMessageId', 'phase', 'createdAt', 'updatedAt', 'approvedAt',
+    'pausedAt', 'archivedAt', 'limits', 'counters', 'moneyBudget', 'modelCatalog',
     'temporaryAuthorizations', 'formation', 'health', 'orgUnits', 'positions', 'staffingRequests', 'hrEmployeeId',
     'employees', 'products', 'workItems', 'tickets', 'supportEmployeeId', 'approvals', 'governanceNotifications', 'provisioning',
   ], 'company state')
-  if (value.schemaVersion !== 1) throw new Error(`unsupported company schemaVersion ${String(value.schemaVersion)}`)
+  if (value.schemaVersion !== COMPANY_STATE_SCHEMA_VERSION) throw new Error(`unsupported company schemaVersion ${String(value.schemaVersion)}`)
   safeInteger(value.revision, 'revision', 1)
   stringMatches(value.id, 'company id', COMPANY_ID)
   plainString(value.name, 'company name', 1, 200)
@@ -238,15 +183,12 @@ export function assertCompanyState(value: unknown, expectedWorkspaceHash?: strin
   }
   plainString(value.founderSessionId, 'founderSessionId', 1, 512)
   plainString(value.stagedFromUserMessageId, 'stagedFromUserMessageId', 1, 512)
-  enumValue(value.phase, 'phase', ['staged', 'provisioning', 'provisioning_failed', 'operating', 'paused', 'halted', 'closing', 'archived'])
-  if (value.planReviewState !== undefined) enumValue(value.planReviewState, 'planReviewState', ['awaiting_review', 'awaiting_feedback'])
+  enumValue(value.phase, 'phase', COMPANY_PHASES)
   timestamp(value.createdAt, 'createdAt')
   timestamp(value.updatedAt, 'updatedAt')
   for (const key of ['approvedAt', 'pausedAt', 'archivedAt'] as const) if (value[key] !== undefined) timestamp(value[key], key)
   assertLimits(value.limits)
   assertCounters(value.counters)
-  assertBudget(value.budget)
-  assertTokenBudget(value.tokenBudget)
   assertMoneyBudget(value.moneyBudget)
   assertModelCatalog(value.modelCatalog)
   assertTemporaryAuthorizations(value.temporaryAuthorizations)
@@ -257,11 +199,11 @@ export function assertCompanyState(value: unknown, expectedWorkspaceHash?: strin
   assertOrganization(value.orgUnits, value.positions)
   assertStaffingRequests(value.staffingRequests)
   const limits = value.limits as CompanyState['limits']
-  const budget = value.budget as CompanyState['budget']
   if (!Array.isArray(value.employees) || !Array.isArray(value.products) || !Array.isArray(value.workItems) || !Array.isArray(value.tickets ?? []) || !Array.isArray(value.approvals) || !Array.isArray(value.governanceNotifications)) {
     throw new Error('employees, products, workItems, tickets, approvals, and governanceNotifications must be arrays')
   }
-  if (value.employees.length > limits.maxEmployees) throw new Error('saved company exceeds maxEmployees snapshot')
+  if ((value.employees as CompanyState['employees']).filter((employee) => employee.status !== 'retired').length > limits.maxEmployees) throw new Error('saved company exceeds active maxEmployees snapshot')
+  if (value.employees.length > 10_000) throw new Error('saved company employee history exceeds hard safety cap')
   if (value.products.length > limits.maxProducts) throw new Error('saved company exceeds maxProducts snapshot')
   if (value.workItems.length > limits.maxWorkItems) throw new Error('saved company exceeds maxWorkItems snapshot')
   const employeeIds = uniqueIds(value.employees, EMPLOYEE_ID, 'employee')
@@ -270,31 +212,36 @@ export function assertCompanyState(value: unknown, expectedWorkspaceHash?: strin
   if (formation.firstProductId !== undefined && !productIds.has(formation.firstProductId)) throw new Error('formation.firstProductId references an unknown product')
   const workIds = uniqueIds(value.workItems, WORK_ID, 'work')
   const approvalIds = uniqueIds(value.approvals, APPROVAL_ID, 'approval')
-  const tokenBudget = value.tokenBudget as CompanyState['tokenBudget']
-  for (const reservation of tokenBudget.reservations) {
-    if (!employeeIds.has(reservation.employeeId)) throw new Error(`token reservation ${reservation.id} references unknown employee`)
-    if (reservation.workId !== undefined && !workIds.has(reservation.workId)) throw new Error(`token reservation ${reservation.id} references unknown work`)
-  }
-  for (const usage of tokenBudget.usage) {
-    if (!employeeIds.has(usage.employeeId)) throw new Error(`token usage ${usage.id} references unknown employee`)
-    if (usage.workId !== undefined && !workIds.has(usage.workId)) throw new Error(`token usage ${usage.id} references unknown work`)
-  }
   const moneyBudget = value.moneyBudget as CompanyState['moneyBudget']
   for (const reservation of moneyBudget.reservations) {
     if (!employeeIds.has(reservation.employeeId)) throw new Error(`money reservation ${reservation.id} references unknown employee`)
-    if (reservation.workId !== undefined && !workIds.has(reservation.workId)) throw new Error(`money reservation ${reservation.id} references unknown work`)
+    if (reservation.workId !== undefined) {
+      const work = (value.workItems as CompanyState['workItems']).find((candidate) => candidate.id === reservation.workId)
+      if (work === undefined) throw new Error(`money reservation ${reservation.id} references unknown work`)
+      if (work.assigneeId !== reservation.employeeId) throw new Error(`money reservation ${reservation.id} employee/work owner mismatch`)
+      if (reservation.productId !== work.productId) throw new Error(`money reservation ${reservation.id} product/work mismatch`)
+    }
     if (reservation.productId !== undefined && !productIds.has(reservation.productId)) throw new Error(`money reservation ${reservation.id} references unknown product`)
+    if (reservation.staffingRequestId !== undefined) {
+      const request = (value.staffingRequests as CompanyState['staffingRequests']).find((candidate) => candidate.id === reservation.staffingRequestId)
+      if (request === undefined || request.hrEmployeeId !== reservation.employeeId || (request.reservationId !== undefined && request.reservationId !== reservation.id)) throw new Error(`money reservation ${reservation.id} staffing request mismatch`)
+    }
+  }
+  for (const work of value.workItems as CompanyState['workItems']) {
+    if (work.reservationId === undefined) continue
+    const reservation = moneyBudget.reservations.find((candidate) => candidate.id === work.reservationId)
+    if (reservation?.workId !== work.id || reservation.employeeId !== work.assigneeId) throw new Error(`work ${work.id} prepared reservation does not match its owner`)
   }
   for (const usage of moneyBudget.usage) {
-    if (!employeeIds.has(usage.employeeId)) throw new Error(`money usage ${usage.id} references unknown employee`)
+    if (usage.employeeId !== 'founder' && !employeeIds.has(usage.employeeId)) throw new Error(`money usage ${usage.id} references unknown employee`)
     if (usage.workId !== undefined && !workIds.has(usage.workId)) throw new Error(`money usage ${usage.id} references unknown work`)
     if (usage.productId !== undefined && !productIds.has(usage.productId)) throw new Error(`money usage ${usage.id} references unknown product`)
   }
   for (const authorization of value.temporaryAuthorizations as CompanyState['temporaryAuthorizations']) {
     if (!employeeIds.has(authorization.employeeId)) throw new Error(`temporary authorization ${authorization.id} references unknown employee`)
-    if (authorization.approvalId !== undefined) {
-      const approval = (value.approvals as CompanyState['approvals']).find((candidate) => candidate.id === authorization.approvalId)
-      if (approval?.kind !== 'temporary_authorization' || approval.status !== 'approved') throw new Error(`temporary authorization ${authorization.id} lacks approved tool-side provenance`)
+    const approval = (value.approvals as CompanyState['approvals']).find((candidate) => candidate.id === authorization.approvalId)
+    if (approval?.kind !== 'temporary_authorization' || approval.status !== 'approved' || approval.consumedAt === undefined) {
+      throw new Error(`temporary authorization ${authorization.id} lacks consumed approval provenance`)
     }
     for (const use of authorization.uses) {
       if (!workIds.has(use.workId)) throw new Error(`temporary authorization ${authorization.id} use references unknown work`)
@@ -305,7 +252,17 @@ export function assertCompanyState(value: unknown, expectedWorkspaceHash?: strin
   for (const request of value.staffingRequests as CompanyState['staffingRequests']) {
     if (!employeeIds.has(request.hrEmployeeId)) throw new Error(`staffing request ${request.id} references unknown HR employee`)
     if (request.employeeId !== undefined && !employeeIds.has(request.employeeId)) throw new Error(`staffing request ${request.id} references unknown employee`)
-    if (request.approvalId !== undefined && !approvalIds.has(request.approvalId)) throw new Error(`staffing request ${request.id} references unknown approval`)
+    if (request.reservationId !== undefined) {
+      const reservation = moneyBudget.reservations.find((candidate) => candidate.id === request.reservationId)
+      if (reservation?.staffingRequestId !== request.id || reservation.employeeId !== request.hrEmployeeId) throw new Error(`staffing request ${request.id} prepared reservation mismatch`)
+    }
+    if (request.approvalId !== undefined) {
+      const approval = (value.approvals as CompanyState['approvals']).find((candidate) => candidate.id === request.approvalId)
+      if (approval?.kind !== 'organization_change') throw new Error(`staffing request ${request.id} references a non-organization approval`)
+      if (request.status === 'approved' && approval.status !== 'approved') throw new Error(`staffing request ${request.id} is approved but its approval is ${approval.status}`)
+      if (request.status === 'rejected' && !['rejected', 'cancelled', 'expired'].includes(approval.status)) throw new Error(`staffing request ${request.id} is rejected but its approval is ${approval.status}`)
+      if (request.status === 'applied' && (approval.status !== 'approved' || approval.consumedAt === undefined)) throw new Error(`staffing request ${request.id} is applied without a consumed approval`)
+    }
   }
   for (const unit of value.orgUnits as CompanyState['orgUnits']) if (unit.managerEmployeeId !== undefined && !employeeIds.has(unit.managerEmployeeId)) throw new Error(`org unit ${unit.id} references unknown manager employee`)
   const orgUnitIds = new Set((value.orgUnits as Array<{ id: string }>).map((unit) => unit.id))
@@ -314,10 +271,9 @@ export function assertCompanyState(value: unknown, expectedWorkspaceHash?: strin
   const sessionIds = new Set<string>()
   for (const [index, raw] of value.employees.entries()) {
     if (!isRecord(raw)) throw new Error(`employees[${index}] must be an object`)
-    exactKeys(raw, ['id', 'name', 'role', 'department', 'orgUnitId', 'positionId', 'isHr', 'budgetMicros', 'operationalBlock', 'status', 'sessionId', 'joinedAt', 'retiredAt', 'failure', 'llm', 'executionPrompt'], `employees[${index}]`)
+    exactKeys(raw, ['id', 'name', 'role', 'orgUnitId', 'positionId', 'isHr', 'budgetMicros', 'operationalBlock', 'status', 'sessionId', 'joinedAt', 'retiredAt', 'failure', 'llm', 'executionPrompt'], `employees[${index}]`)
     plainString(raw.name, `employees[${index}].name`, 1, 200)
     plainString(raw.role, `employees[${index}].role`, 1, 1000)
-    if (raw.department !== undefined) plainString(raw.department, `employees[${index}].department`, 1, 200)
     if (raw.orgUnitId !== undefined) {
       plainString(raw.orgUnitId, `employees[${index}].orgUnitId`, 1, 128)
       if (!orgUnitIds.has(raw.orgUnitId)) throw new Error(`employees[${index}] references unknown org unit`)
@@ -328,7 +284,7 @@ export function assertCompanyState(value: unknown, expectedWorkspaceHash?: strin
       if (raw.orgUnitId !== undefined && positionUnits.get(raw.positionId) !== raw.orgUnitId) throw new Error(`employees[${index}] position belongs to another org unit`)
     }
     if (raw.isHr !== undefined && typeof raw.isHr !== 'boolean') throw new Error(`employees[${index}].isHr must be boolean`)
-    if (raw.budgetMicros !== undefined) safeInteger(raw.budgetMicros, `employees[${index}].budgetMicros`, 0)
+    safeInteger(raw.budgetMicros, `employees[${index}].budgetMicros`, 0)
     if (raw.operationalBlock !== undefined) assertOperationalBlock(raw.operationalBlock, `employees[${index}].operationalBlock`)
     enumValue(raw.status, `employees[${index}].status`, ['planned', 'provisioning', 'idle', 'working', 'paused', 'failed', 'retired'])
     if (!isRecord(raw.llm)) throw new Error(`employees[${index}].llm must be an object`)
@@ -358,15 +314,13 @@ export function assertCompanyState(value: unknown, expectedWorkspaceHash?: strin
   }
   for (const [index, raw] of value.products.entries()) {
     if (!isRecord(raw)) throw new Error(`products[${index}] must be an object`)
-    exactKeys(raw, ['id', 'name', 'summary', 'status', 'productRoot', 'successCriteria', 'budgetCredits', 'tokenBudget', 'budgetMicros', 'createdAt', 'updatedAt', 'releaseApprovalId'], `products[${index}]`)
+    exactKeys(raw, ['id', 'name', 'summary', 'status', 'productRoot', 'successCriteria', 'budgetMicros', 'createdAt', 'updatedAt', 'releaseApprovalId'], `products[${index}]`)
     plainString(raw.name, `products[${index}].name`, 1, 200)
     plainString(raw.summary, `products[${index}].summary`, 1, 16_384)
     plainString(raw.productRoot, `products[${index}].productRoot`, 1, 4096)
     enumValue(raw.status, `products[${index}].status`, ['proposed', 'approved', 'active', 'paused', 'validating', 'released', 'retired', 'cancelled'])
     stringArray(raw.successCriteria, `products[${index}].successCriteria`, 1, 256, 16_384)
-    safeInteger(raw.budgetCredits, `products[${index}].budgetCredits`, 0)
-    safeInteger(raw.tokenBudget, `products[${index}].tokenBudget`, 0)
-    if (raw.budgetMicros !== undefined) safeInteger(raw.budgetMicros, `products[${index}].budgetMicros`, 0)
+    safeInteger(raw.budgetMicros, `products[${index}].budgetMicros`, 0)
     timestamp(raw.createdAt, `products[${index}].createdAt`)
     timestamp(raw.updatedAt, `products[${index}].updatedAt`)
     if (raw.releaseApprovalId !== undefined) stringMatches(raw.releaseApprovalId, `products[${index}].releaseApprovalId`, APPROVAL_ID)
@@ -393,9 +347,23 @@ export function assertCompanyState(value: unknown, expectedWorkspaceHash?: strin
     if (raw.resolvedAt !== undefined) safeInteger(raw.resolvedAt, `tickets[${index}].resolvedAt`, 1)
     if (raw.reply !== undefined) plainString(raw.reply, `tickets[${index}].reply`, 1, 16_384)
     if (raw.closedAt !== undefined) safeInteger(raw.closedAt, `tickets[${index}].closedAt`, 1)
+    if (raw.workItemId !== undefined) {
+      const linked = (value.workItems as CompanyState['workItems']).find((work) => work.id === raw.workItemId)
+      if (linked?.ticketId !== raw.id) throw new Error(`ticket ${String(raw.id)} and work ${String(raw.workItemId)} are not linked bidirectionally`)
+      if (raw.status === 'resolved' && linked.status !== 'completed') throw new Error(`resolved ticket ${String(raw.id)} requires completed repair work`)
+      if (raw.status === 'closed' && !['completed', 'failed', 'cancelled'].includes(linked.status)) throw new Error(`closed ticket ${String(raw.id)} requires terminal repair work`)
+      if ((raw.status === 'filed' || raw.status === 'triaged') && linked.status !== 'pending') throw new Error(`${String(raw.status)} ticket ${String(raw.id)} requires pending repair work`)
+      if (raw.status === 'dispatched' && !['pending', 'claimed', 'in_progress'].includes(linked.status)) throw new Error(`dispatched ticket ${String(raw.id)} requires runnable repair work`)
+    }
+  }
+  for (const work of value.workItems as CompanyState['workItems']) {
+    if (work.ticketId === undefined) continue
+    const ticket = (value.tickets as CompanyState['tickets']).find((candidate) => candidate.id === work.ticketId)
+    if (ticket?.workItemId !== work.id || work.kind !== 'repair') throw new Error(`ticket-linked work ${work.id} has an invalid backlink`)
   }
   if (value.supportEmployeeId !== undefined) {
-    if (typeof value.supportEmployeeId !== 'string' || !employeeIds.has(value.supportEmployeeId)) throw new Error('supportEmployeeId references an unknown employee')
+    const support = (value.employees as CompanyState['employees']).find((employee) => employee.id === value.supportEmployeeId)
+    if (support === undefined || ['retired', 'failed', 'planned', 'provisioning'].includes(support.status)) throw new Error('supportEmployeeId must reference a runnable employee')
   }
   assertAcyclic(value.workItems)
   for (const [index, raw] of value.approvals.entries()) {
@@ -438,6 +406,7 @@ export function assertCompanyState(value: unknown, expectedWorkspaceHash?: strin
     plainString(raw.content, `governanceNotifications[${index}].content`, 1, limits.maxMessageChars)
     timestamp(raw.createdAt, `governanceNotifications[${index}].createdAt`)
   }
+  if ((value.phase === 'provisioning') !== (value.provisioning !== undefined)) throw new Error('company provisioning phase and generation must agree')
   if (value.provisioning !== undefined) {
     if (!isRecord(value.provisioning)) throw new Error('provisioning must be an object')
     exactKeys(value.provisioning, ['id', 'startedAt', 'approvalId', 'employeeIds', 'reservationIds'], 'provisioning')
@@ -449,17 +418,8 @@ export function assertCompanyState(value: unknown, expectedWorkspaceHash?: strin
     stringArray(value.provisioning.reservationIds, 'provisioning.reservationIds', 1, limits.maxEmployees, 128)
     for (const id of value.provisioning.reservationIds as string[]) stringMatches(id, 'provisioning.reservationIds[]', UUID)
   }
-  if (budget.totalCredits - budget.spentCredits - budget.reservedCredits < 0) {
-    throw new Error('company budget available credits are negative')
-  }
   const typedProducts = value.products as unknown as CompanyState['products']
   const typedWork = value.workItems as unknown as CompanyState['workItems']
-  const productAllocation = typedProducts.filter((product) => product.status !== 'cancelled' && product.status !== 'retired')
-    .reduce((sum, product) => sum + product.budgetCredits, 0)
-  if (productAllocation > budget.totalCredits) throw new Error('product budget allocations exceed company total credits')
-  const tokenAllocation = typedProducts.filter((product) => product.status !== 'cancelled' && product.status !== 'retired')
-    .reduce((sum, product) => sum + product.tokenBudget, 0)
-  if (tokenAllocation > (value.tokenBudget as CompanyState['tokenBudget']).totalTokens) throw new Error('product token allocations exceed company total tokens')
   const typedMoney = value.moneyBudget as CompanyState['moneyBudget']
   if (typedMoney.migrationRequired !== true) {
     const productMoneyAllocation = typedProducts.filter((product) => product.status !== 'cancelled' && product.status !== 'retired')
@@ -491,102 +451,7 @@ function assertLimits(value: unknown): void {
 function assertCounters(value: unknown): void {
   if (!isRecord(value)) throw new Error('counters must be an object')
   exactKeys(value, ['employee', 'product', 'work', 'approval', 'event', 'orgUnit', 'position', 'staffing', 'authorization', 'ticket'], 'counters')
-  for (const key of ['employee', 'product', 'work', 'approval', 'event', 'orgUnit', 'position', 'staffing', 'authorization']) safeInteger(value[key], `counters.${key}`, 0)
-}
-
-function assertBudget(value: unknown): void {
-  if (!isRecord(value)) throw new Error('budget must be an object')
-  exactKeys(value, ['unit', 'totalCredits', 'reservedCredits', 'spentCredits', 'warningAtCredits', 'entries'], 'budget')
-  if (value.unit !== 'activation-credit') throw new Error('budget.unit must be activation-credit')
-  safeInteger(value.totalCredits, 'budget.totalCredits', 0)
-  safeInteger(value.reservedCredits, 'budget.reservedCredits', 0)
-  safeInteger(value.spentCredits, 'budget.spentCredits', 0)
-  if (value.warningAtCredits !== undefined) safeInteger(value.warningAtCredits, 'budget.warningAtCredits', 0)
-  if (!Array.isArray(value.entries)) throw new Error('budget.entries must be an array')
-  const entryIds = new Set<string>()
-  for (const [index, entry] of value.entries.entries()) {
-    if (!isRecord(entry)) throw new Error(`budget.entries[${index}] must be an object`)
-    exactKeys(entry, ['id', 'kind', 'credits', 'reason', 'employeeId', 'workId', 'messageId', 'approvalId', 'reservationId', 'at'], `budget.entries[${index}]`)
-    stringMatches(entry.id, `budget.entries[${index}].id`, UUID)
-    if (entryIds.has(entry.id)) throw new Error(`duplicate budget entry id ${entry.id}`)
-    entryIds.add(entry.id)
-    enumValue(entry.kind, `budget.entries[${index}].kind`, ['reserve', 'commit', 'release', 'increase', 'decrease'])
-    enumValue(entry.reason, `budget.entries[${index}].reason`, ['employee-onboarding', 'work-dispatch', 'message-delivery', 'human-adjustment', 'recovery'])
-    safeInteger(entry.credits, `budget.entries[${index}].credits`, 1)
-    if (entry.employeeId !== undefined) stringMatches(entry.employeeId, `budget.entries[${index}].employeeId`, EMPLOYEE_ID)
-    if (entry.workId !== undefined) stringMatches(entry.workId, `budget.entries[${index}].workId`, WORK_ID)
-    if (entry.messageId !== undefined) stringMatches(entry.messageId, `budget.entries[${index}].messageId`, UUID)
-    if (entry.approvalId !== undefined) stringMatches(entry.approvalId, `budget.entries[${index}].approvalId`, APPROVAL_ID)
-    if (entry.reservationId !== undefined) stringMatches(entry.reservationId, `budget.entries[${index}].reservationId`, UUID)
-    timestamp(entry.at, `budget.entries[${index}].at`)
-  }
-}
-
-function assertTokenBudget(value: unknown): void {
-  if (!isRecord(value)) throw new Error('tokenBudget must be an object')
-  exactKeys(value, ['unit', 'currency', 'totalTokens', 'reservedTokens', 'usedTokens', 'warningAtTokens', 'totalCostMicros', 'prices', 'usage', 'reservations', 'legacyActivationCredits'], 'tokenBudget')
-  if (value.unit !== 'token') throw new Error('tokenBudget.unit must be token')
-  normalizeCurrency(String(value.currency))
-  for (const key of ['totalTokens', 'reservedTokens', 'usedTokens', 'totalCostMicros'] as const) safeInteger(value[key], `tokenBudget.${key}`, 0)
-  if (value.warningAtTokens !== undefined) safeInteger(value.warningAtTokens, 'tokenBudget.warningAtTokens', 0)
-  if (value.legacyActivationCredits !== undefined) safeInteger(value.legacyActivationCredits, 'tokenBudget.legacyActivationCredits', 0)
-  if (!Array.isArray(value.prices) || !Array.isArray(value.usage) || !Array.isArray(value.reservations)) throw new Error('tokenBudget prices, usage, and reservations must be arrays')
-  const priceRoutes = new Set<string>()
-  for (const [index, price] of value.prices.entries()) {
-    if (!isRecord(price)) throw new Error(`tokenBudget.prices[${index}] must be an object`)
-    exactKeys(price, ['provider', 'model', 'inputMicrosPerMillion', 'cacheReadMicrosPerMillion', 'cacheWriteMicrosPerMillion', 'outputMicrosPerMillion', 'reasoningMicrosPerMillion'], `tokenBudget.prices[${index}]`)
-    plainString(price.provider, `tokenBudget.prices[${index}].provider`, 1, 128)
-    plainString(price.model, `tokenBudget.prices[${index}].model`, 1, 256)
-    const priceRoute = `${String(price.provider)}/${String(price.model)}`
-    if (priceRoutes.has(priceRoute)) throw new Error(`duplicate token price route ${priceRoute}`)
-    priceRoutes.add(priceRoute)
-    for (const key of ['inputMicrosPerMillion', 'cacheReadMicrosPerMillion', 'cacheWriteMicrosPerMillion', 'outputMicrosPerMillion'] as const) safeInteger(price[key], `tokenBudget.prices[${index}].${key}`, 0)
-    if (price.reasoningMicrosPerMillion !== undefined) safeInteger(price.reasoningMicrosPerMillion, `tokenBudget.prices[${index}].reasoningMicrosPerMillion`, 0)
-  }
-  const usageIds = new Set<string>()
-  let usedTokens = 0
-  let totalCostMicros = 0
-  for (const [index, entry] of value.usage.entries()) {
-    if (!isRecord(entry)) throw new Error(`tokenBudget.usage[${index}] must be an object`)
-    exactKeys(entry, ['id', 'sessionId', 'eventSeq', 'turn', 'step', 'employeeId', 'workId', 'provider', 'model', 'inputTokens', 'outputTokens', 'cacheReadTokens', 'cacheWriteTokens', 'reasoningTokens', 'totalTokens', 'costMicros', 'priced', 'at'], `tokenBudget.usage[${index}]`)
-    plainString(entry.id, `tokenBudget.usage[${index}].id`, 1, 1024)
-    if (usageIds.has(entry.id as string)) throw new Error(`duplicate token usage ${entry.id}`)
-    usageIds.add(entry.id as string)
-    for (const key of ['sessionId', 'employeeId', 'provider', 'model'] as const) plainString(entry[key], `tokenBudget.usage[${index}].${key}`, 1, 512)
-    if (entry.workId !== undefined) plainString(entry.workId, `tokenBudget.usage[${index}].workId`, 1, 128)
-    for (const key of ['eventSeq', 'turn', 'step', 'inputTokens', 'outputTokens', 'cacheReadTokens', 'cacheWriteTokens', 'reasoningTokens', 'totalTokens', 'costMicros'] as const) safeInteger(entry[key], `tokenBudget.usage[${index}].${key}`, 0)
-    if ((entry.reasoningTokens as number) > (entry.outputTokens as number)) throw new Error(`tokenBudget.usage[${index}].reasoningTokens exceeds outputTokens`)
-    const entryTotal = (entry.inputTokens as number) + (entry.outputTokens as number) + (entry.cacheReadTokens as number) + (entry.cacheWriteTokens as number)
-    if (!Number.isSafeInteger(entryTotal) || entryTotal !== entry.totalTokens) throw new Error(`tokenBudget.usage[${index}].totalTokens mismatch`)
-    if (typeof entry.priced !== 'boolean') throw new Error(`tokenBudget.usage[${index}].priced must be boolean`)
-    if (entry.priced === false && entry.costMicros !== 0) throw new Error(`tokenBudget.usage[${index}] unpriced cost must be zero`)
-    timestamp(entry.at, `tokenBudget.usage[${index}].at`)
-    usedTokens += entry.totalTokens as number
-    totalCostMicros += entry.costMicros as number
-    if (!Number.isSafeInteger(usedTokens) || !Number.isSafeInteger(totalCostMicros)) throw new Error('tokenBudget usage aggregate overflow')
-  }
-  if (usedTokens !== value.usedTokens) throw new Error('tokenBudget used aggregate mismatch')
-  if (totalCostMicros !== value.totalCostMicros) throw new Error('tokenBudget cost aggregate mismatch')
-  let reserved = 0
-  const reservationIds = new Set<string>()
-  const reservedEmployees = new Set<string>()
-  for (const [index, reservation] of value.reservations.entries()) {
-    if (!isRecord(reservation)) throw new Error(`tokenBudget.reservations[${index}] must be an object`)
-    exactKeys(reservation, ['id', 'employeeId', 'workId', 'messageId', 'limitTokens', 'remainingTokens', 'createdAt'], `tokenBudget.reservations[${index}]`)
-    stringMatches(reservation.id, `tokenBudget.reservations[${index}].id`, UUID)
-    if (reservationIds.has(reservation.id as string)) throw new Error(`duplicate token reservation ${reservation.id}`)
-    reservationIds.add(reservation.id as string)
-    plainString(reservation.employeeId, `tokenBudget.reservations[${index}].employeeId`, 1, 128)
-    if (reservedEmployees.has(reservation.employeeId as string)) throw new Error(`employee ${reservation.employeeId} has multiple active token reservations`)
-    reservedEmployees.add(reservation.employeeId as string)
-    if (reservation.workId !== undefined) plainString(reservation.workId, `tokenBudget.reservations[${index}].workId`, 1, 128)
-    if (reservation.messageId !== undefined) plainString(reservation.messageId, `tokenBudget.reservations[${index}].messageId`, 1, 128)
-    safeInteger(reservation.limitTokens, `tokenBudget.reservations[${index}].limitTokens`, 1)
-    safeInteger(reservation.remainingTokens, `tokenBudget.reservations[${index}].remainingTokens`, 0, reservation.limitTokens as number)
-    timestamp(reservation.createdAt, `tokenBudget.reservations[${index}].createdAt`)
-    reserved += reservation.remainingTokens as number
-  }
-  if (reserved !== value.reservedTokens) throw new Error('tokenBudget reserved aggregate mismatch')
+  for (const key of ['employee', 'product', 'work', 'approval', 'event', 'orgUnit', 'position', 'staffing', 'authorization', 'ticket']) safeInteger(value[key], `counters.${key}`, 0)
 }
 
 function assertMoneyBudget(value: unknown): void {
@@ -663,14 +528,14 @@ function assertMoneyBudget(value: unknown): void {
   const reservedEmployees = new Set<string>()
   for (const [index, raw] of value.reservations.entries()) {
     if (!isRecord(raw)) throw new Error(`moneyBudget.reservations[${index}] must be an object`)
-    exactKeys(raw, ['id', 'employeeId', 'workId', 'productId', 'messageId', 'limitTokens', 'remainingTokens', 'reservedMicros', 'remainingMicros', 'callHeadroomMicros', 'rates', 'routes', 'routeRates', 'authorizationId', 'unknownCost', 'createdAt'], `moneyBudget.reservations[${index}]`)
+    exactKeys(raw, ['id', 'employeeId', 'workId', 'productId', 'messageId', 'staffingRequestId', 'limitTokens', 'remainingTokens', 'reservedMicros', 'remainingMicros', 'callHeadroomMicros', 'rates', 'routes', 'routeRates', 'authorizationId', 'unknownCost', 'createdAt'], `moneyBudget.reservations[${index}]`)
     stringMatches(raw.id, `moneyBudget.reservations[${index}].id`, UUID)
     if (reservationIds.has(raw.id as string)) throw new Error(`duplicate money reservation ${raw.id}`)
     reservationIds.add(raw.id as string)
     plainString(raw.employeeId, `moneyBudget.reservations[${index}].employeeId`, 1, 128)
     if (reservedEmployees.has(raw.employeeId as string)) throw new Error(`employee ${raw.employeeId} has multiple active money reservations`)
     reservedEmployees.add(raw.employeeId as string)
-    for (const key of ['workId', 'productId', 'messageId', 'authorizationId'] as const) if (raw[key] !== undefined) plainString(raw[key], `moneyBudget.reservations[${index}].${key}`, 1, 512)
+    for (const key of ['workId', 'productId', 'messageId', 'staffingRequestId', 'authorizationId'] as const) if (raw[key] !== undefined) plainString(raw[key], `moneyBudget.reservations[${index}].${key}`, 1, 512)
     safeInteger(raw.limitTokens, `moneyBudget.reservations[${index}].limitTokens`, 1)
     safeInteger(raw.remainingTokens, `moneyBudget.reservations[${index}].remainingTokens`, 0, raw.limitTokens as number)
     safeInteger(raw.reservedMicros, `moneyBudget.reservations[${index}].reservedMicros`, 0)
@@ -772,7 +637,7 @@ function assertTemporaryAuthorizations(value: unknown): void {
     ids.add(raw.id as string)
     stringMatches(raw.employeeId, `temporaryAuthorizations[${index}].employeeId`, EMPLOYEE_ID)
     plainString(raw.reason, `temporaryAuthorizations[${index}].reason`, 1, 4096)
-    if (raw.approvalId !== undefined) stringMatches(raw.approvalId, `temporaryAuthorizations[${index}].approvalId`, APPROVAL_ID)
+    stringMatches(raw.approvalId, `temporaryAuthorizations[${index}].approvalId`, APPROVAL_ID)
     if (raw.authorizedBy !== 'founder') throw new Error(`temporaryAuthorizations[${index}].authorizedBy must be founder`)
     for (const key of ['startsAt', 'expiresAt', 'createdAt'] as const) timestamp(raw[key], `temporaryAuthorizations[${index}].${key}`)
     if ((raw.expiresAt as number) <= (raw.startsAt as number)) throw new Error(`temporaryAuthorizations[${index}] expiry must be after start`)
@@ -815,7 +680,7 @@ function assertHealth(value: unknown): void {
   if (!isRecord(value)) throw new Error('health must be an object')
   exactKeys(value, ['status', 'reason', 'detail', 'detectedAt', 'resumable'], 'health')
   enumValue(value.status, 'health.status', ['healthy', 'degraded', 'manual_pause', 'halted'])
-  if (value.reason !== undefined) enumValue(value.reason, 'health.reason', ['network', 'quota', 'rate_limit', 'money_budget', 'unpriced_model', 'token_budget', 'turn_limit', 'provider', 'unknown', 'manual', 'financial_migration', 'needs_budget_review'])
+  if (value.reason !== undefined) enumValue(value.reason, 'health.reason', ['network', 'quota', 'rate_limit', 'money_budget', 'unpriced_model', 'session_unrecoverable', 'provider', 'unknown', 'manual', 'financial_migration', 'needs_budget_review'])
   if (value.detail !== undefined) plainString(value.detail, 'health.detail', 1, 4096)
   if (value.detectedAt !== undefined) timestamp(value.detectedAt, 'health.detectedAt')
   if (typeof value.resumable !== 'boolean') throw new Error('health.resumable must be boolean')
@@ -883,13 +748,23 @@ function assertStaffingRequests(value: unknown): void {
   if (!Array.isArray(value)) throw new Error('staffingRequests must be an array')
   for (const [index, request] of value.entries()) {
     if (!isRecord(request)) throw new Error(`staffingRequests[${index}] must be an object`)
-    exactKeys(request, ['id', 'action', 'status', 'requestedBy', 'candidateName', 'employeeId', 'workProfile', 'constraints', 'hrEmployeeId', 'attemptId', 'recommendation', 'approvalId', 'createdAt', 'updatedAt'], `staffingRequests[${index}]`)
+    exactKeys(request, ['id', 'action', 'status', 'requestedBy', 'candidateName', 'employeeId', 'workProfile', 'constraints', 'hrEmployeeId', 'attemptId', 'reviewDeliveryAttempts', 'recommendation', 'approvalId', 'lastDeliveredAt', 'reservationId', 'leaseAt', 'createdAt', 'updatedAt'], `staffingRequests[${index}]`)
     plainString(request.id, `staffingRequests[${index}].id`, 1, 128)
     enumValue(request.action, `staffingRequests[${index}].action`, ['hire', 'adjust', 'retire'])
     enumValue(request.status, `staffingRequests[${index}].status`, ['pending', 'in_review', 'recommended', 'approved', 'rejected', 'applied'])
     for (const key of ['requestedBy', 'workProfile', 'hrEmployeeId'] as const) plainString(request[key], `staffingRequests[${index}].${key}`, 1, 16_384)
-    for (const key of ['candidateName', 'employeeId', 'constraints', 'attemptId', 'approvalId'] as const) if (request[key] !== undefined) plainString(request[key], `staffingRequests[${index}].${key}`, 1, 4096)
+    for (const key of ['candidateName', 'employeeId', 'constraints', 'attemptId', 'approvalId', 'reservationId'] as const) if (request[key] !== undefined) plainString(request[key], `staffingRequests[${index}].${key}`, 1, 4096)
     if (request.recommendation !== undefined) assertStaffingRecommendation(request.recommendation, `staffingRequests[${index}].recommendation`)
+    if (request.action === 'hire' && request.candidateName === undefined) throw new Error(`staffingRequests[${index}] hire requires candidateName`)
+    if (request.action !== 'hire' && request.employeeId === undefined) throw new Error(`staffingRequests[${index}] ${String(request.action)} requires employeeId`)
+    if ((request.status === 'in_review') !== (request.attemptId !== undefined)) throw new Error(`staffingRequests[${index}] in_review status and attemptId must agree`)
+    if (request.reviewDeliveryAttempts !== undefined) safeInteger(request.reviewDeliveryAttempts, `staffingRequests[${index}].reviewDeliveryAttempts`, 0, 3)
+    if (['recommended', 'approved', 'rejected', 'applied'].includes(String(request.status)) && (request.recommendation === undefined || request.approvalId === undefined)) {
+      throw new Error(`staffingRequests[${index}] ${String(request.status)} requires recommendation and approvalId`)
+    }
+    if (request.lastDeliveredAt !== undefined) timestamp(request.lastDeliveredAt, `staffingRequests[${index}].lastDeliveredAt`)
+    if (request.leaseAt !== undefined) timestamp(request.leaseAt, `staffingRequests[${index}].leaseAt`)
+    if ((request.reservationId === undefined) !== (request.leaseAt === undefined)) throw new Error(`staffingRequests[${index}] reservationId and leaseAt must agree`)
     timestamp(request.createdAt, `staffingRequests[${index}].createdAt`)
     timestamp(request.updatedAt, `staffingRequests[${index}].updatedAt`)
   }
@@ -897,20 +772,21 @@ function assertStaffingRequests(value: unknown): void {
 
 function assertStaffingRecommendation(value: unknown, path: string): void {
   if (!isRecord(value)) throw new Error(`${path} must be an object`)
-  exactKeys(value, ['difficulty', 'provider', 'model', 'reasoningEffort', 'budgetMicros', 'rationale', 'orgPath', 'positionTitle', 'responsibilities', 'assessedAt'], path)
+  exactKeys(value, ['difficulty', 'provider', 'model', 'reasoningEffort', 'budgetMicros', 'rationale', 'orgPath', 'positionTitle', 'responsibilities', 'designateAsHr', 'assessedAt'], path)
   enumValue(value.difficulty, `${path}.difficulty`, ['low', 'medium', 'high', 'critical'])
   for (const key of ['provider', 'model', 'rationale', 'positionTitle'] as const) plainString(value[key], `${path}.${key}`, 1, 16_384)
   if (value.reasoningEffort !== undefined) plainString(value.reasoningEffort, `${path}.reasoningEffort`, 1, 128)
   if (value.budgetMicros !== undefined) safeInteger(value.budgetMicros, `${path}.budgetMicros`, 0)
   stringArray(value.orgPath, `${path}.orgPath`, 1, 16, 200)
   stringArray(value.responsibilities, `${path}.responsibilities`, 1, 128, 4096)
+  if (value.designateAsHr !== undefined && typeof value.designateAsHr !== 'boolean') throw new Error(`${path}.designateAsHr must be boolean`)
   timestamp(value.assessedAt, `${path}.assessedAt`)
 }
 
 function assertOperationalBlock(value: unknown, path: string): void {
   if (!isRecord(value)) throw new Error(`${path} must be an object`)
   exactKeys(value, ['kind', 'code', 'message', 'at'], path)
-  enumValue(value.kind, `${path}.kind`, ['network', 'quota', 'rate_limit', 'money_budget', 'unpriced_model', 'token_budget', 'turn_limit', 'provider', 'unknown'])
+  enumValue(value.kind, `${path}.kind`, ['network', 'quota', 'rate_limit', 'money_budget', 'unpriced_model', 'session_unrecoverable', 'provider', 'unknown'])
   plainString(value.code, `${path}.code`, 1, 128)
   plainString(value.message, `${path}.message`, 1, 4096)
   timestamp(value.at, `${path}.at`)
@@ -921,7 +797,7 @@ function assertWork(raw: unknown, index: number, employees: Set<string>, product
   exactKeys(raw, [
     'id', 'productId', 'kind', 'subject', 'objective', 'status', 'assigneeId', 'eligibleEmployeeIds',
     'dependencies', 'approvalDependencies', 'inScope', 'outOfScope', 'acceptance', 'verify', 'deliverables',
-    'reviewedWorkId', 'ticketId', 'eligibleOrgUnitIds', 'attempt', 'attemptId', 'handoffId', 'reassigning', 'reservationId', 'leaseAt',
+    'reviewedWorkId', 'ticketId', 'eligibleOrgUnitIds', 'attempt', 'attemptId', 'handoffId', 'reassigning', 'reservationId', 'leaseAt', 'deliveryAttempts',
     'output', 'verdict', 'findings', 'evidence', 'attemptHistory', 'createdAt', 'updatedAt',
   ], `workItems[${index}]`)
   if (!products.has(String(raw.productId))) throw new Error(`workItems[${index}] references unknown product`)
@@ -965,11 +841,19 @@ function assertWork(raw: unknown, index: number, employees: Set<string>, product
   if (raw.reassigning !== undefined && typeof raw.reassigning !== 'boolean') throw new Error(`workItems[${index}].reassigning must be boolean`)
   if (raw.reservationId !== undefined) stringMatches(raw.reservationId, `workItems[${index}].reservationId`, UUID)
   if (raw.leaseAt !== undefined) timestamp(raw.leaseAt, `workItems[${index}].leaseAt`)
-  if ((raw.status === 'claimed' || raw.status === 'in_progress') && (raw.attemptId === undefined || raw.assigneeId === undefined)) {
+  if (raw.deliveryAttempts !== undefined) safeInteger(raw.deliveryAttempts, `workItems[${index}].deliveryAttempts`, 0, 3)
+  const open = raw.status === 'claimed' || raw.status === 'in_progress'
+  const terminal = raw.status === 'completed' || raw.status === 'failed' || raw.status === 'cancelled'
+  if (open && (raw.attemptId === undefined || raw.assigneeId === undefined)) {
     throw new Error(`open work item ${raw.id} requires assigneeId and attemptId`)
   }
+  if (!open && raw.attemptId !== undefined) throw new Error(`non-open work item ${raw.id} must not retain attemptId`)
+  if ((raw.reservationId === undefined) !== (raw.leaseAt === undefined)) throw new Error(`work item ${raw.id} reservationId and leaseAt must agree`)
+  if (!open && raw.reservationId !== undefined) throw new Error(`non-open work item ${raw.id} must not retain a prepared reservation`)
+  if (raw.reassigning === true && (raw.status !== 'pending' || raw.handoffId === undefined)) throw new Error(`reassigning work item ${raw.id} requires a pending handoff`)
+  if (raw.reassigning !== true && raw.handoffId !== undefined) throw new Error(`work item ${raw.id} retains a handoffId outside reassignment`)
   if (raw.output !== undefined) plainString(raw.output, `workItems[${index}].output`, 1, 1_048_576)
-  if (raw.status === 'completed' && raw.output === undefined) throw new Error(`completed work item ${raw.id} requires output`)
+  if (terminal && raw.output === undefined) throw new Error(`terminal work item ${raw.id} requires output`)
   if (raw.verdict !== undefined) enumValue(raw.verdict, `workItems[${index}].verdict`, ['pass', 'needs_revision', 'reject'])
   if (raw.findings !== undefined) {
     if (!Array.isArray(raw.findings)) throw new Error(`workItems[${index}].findings must be an array`)
@@ -1023,7 +907,7 @@ export function assertAcyclic(workItems: readonly Pick<WorkItem, 'id' | 'depende
 export function validateApprovalPayload(kind: ApprovalKind, payload: unknown): asserts payload is JsonValue {
   assertJsonValue(payload, `${kind} approval payload`)
   if (!isRecord(payload)) throw new Error(`${kind} approval payload must be an object`)
-  rejectDangerousKeys(payload, `${kind} approval payload`, kind === 'budget_change' ? new Set(['newTotalTokens', 'expectedTotalTokens']) : undefined)
+  rejectDangerousKeys(payload, `${kind} approval payload`)
   switch (kind) {
     case 'bootstrap':
       exactKeys(payload, ['companyId', 'stagedRevision'], 'bootstrap approval payload')
@@ -1031,35 +915,20 @@ export function validateApprovalPayload(kind: ApprovalKind, payload: unknown): a
       safeInteger(payload.stagedRevision, 'bootstrap.stagedRevision', 1)
       break
     case 'budget_change':
-      if (payload.newTotalMicros !== undefined || payload.expectedTotalMicros !== undefined) {
-        exactKeys(payload, ['newTotalMicros', 'expectedTotalMicros', 'productAllocations', 'employeeAllocations', 'legacyTreatment'], 'budget_change approval payload')
-        safeInteger(payload.newTotalMicros, 'budget_change.newTotalMicros', 0)
-        safeInteger(payload.expectedTotalMicros, 'budget_change.expectedTotalMicros', 0)
-        for (const field of ['productAllocations', 'employeeAllocations'] as const) {
-          if (payload[field] === undefined) continue
-          if (!Array.isArray(payload[field])) throw new Error(`budget_change.${field} must be an array`)
-          for (const [index, allocation] of payload[field].entries()) {
-            if (!isRecord(allocation)) throw new Error(`budget_change.${field}[${index}] must be an object`)
-            exactKeys(allocation, ['id', 'budgetMicros'], `budget_change.${field}[${index}]`)
-            plainString(allocation.id, `budget_change.${field}[${index}].id`, 1, 128)
-            safeInteger(allocation.budgetMicros, `budget_change.${field}[${index}].budgetMicros`, 0)
-          }
+      exactKeys(payload, ['newTotalMicros', 'expectedTotalMicros', 'productAllocations', 'employeeAllocations', 'legacyTreatment'], 'budget_change approval payload')
+      safeInteger(payload.newTotalMicros, 'budget_change.newTotalMicros', 0)
+      safeInteger(payload.expectedTotalMicros, 'budget_change.expectedTotalMicros', 0)
+      for (const field of ['productAllocations', 'employeeAllocations'] as const) {
+        if (payload[field] === undefined) continue
+        if (!Array.isArray(payload[field])) throw new Error(`budget_change.${field} must be an array`)
+        for (const [index, allocation] of payload[field].entries()) {
+          if (!isRecord(allocation)) throw new Error(`budget_change.${field}[${index}] must be an object`)
+          exactKeys(allocation, ['id', 'budgetMicros'], `budget_change.${field}[${index}]`)
+          plainString(allocation.id, `budget_change.${field}[${index}].id`, 1, 128)
+          safeInteger(allocation.budgetMicros, `budget_change.${field}[${index}].budgetMicros`, 0)
         }
-        if (payload.legacyTreatment !== undefined) enumValue(payload.legacyTreatment, 'budget_change.legacyTreatment', ['accepted'])
-      } else if (payload.newTotalTokens !== undefined || payload.expectedTotalTokens !== undefined) {
-        exactKeys(payload, ['newTotalTokens', 'expectedTotalTokens', 'currency', 'prices'], 'budget_change approval payload')
-        safeInteger(payload.newTotalTokens, 'budget_change.newTotalTokens', 1)
-        safeInteger(payload.expectedTotalTokens, 'budget_change.expectedTotalTokens', 1)
-        if (payload.currency !== undefined) normalizeCurrency(String(payload.currency))
-        if (payload.prices !== undefined) {
-          if (!Array.isArray(payload.prices)) throw new Error('budget_change.prices must be an array')
-          normalizeTokenPrices(payload.prices as unknown as TokenPriceInput[])
-        }
-      } else {
-        exactKeys(payload, ['newTotalCredits', 'expectedTotalCredits'], 'budget_change approval payload')
-        safeInteger(payload.newTotalCredits, 'budget_change.newTotalCredits', 0)
-        safeInteger(payload.expectedTotalCredits, 'budget_change.expectedTotalCredits', 0)
       }
+      if (payload.legacyTreatment !== undefined) enumValue(payload.legacyTreatment, 'budget_change.legacyTreatment', ['accepted'])
       break
     case 'pricing_change':
       exactKeys(payload, ['currency', 'expectedCurrency', 'expectedPricingRevision', 'expectedDigest', 'prices'], 'pricing_change approval payload')
@@ -1096,22 +965,21 @@ export function validateApprovalPayload(kind: ApprovalKind, payload: unknown): a
       }
       break
     case 'organization_change':
-      exactKeys(payload, ['action', 'employeeId', 'name', 'role', 'department', 'staffingRequestId', 'budgetMicros'], 'organization_change approval payload')
+      exactKeys(payload, ['action', 'employeeId', 'name', 'role', 'staffingRequestId', 'budgetMicros', 'designateAsHr'], 'organization_change approval payload')
       enumValue(payload.action, 'organization_change.action', ['add', 'remove', 'hire', 'adjust', 'retire'])
       if (payload.staffingRequestId !== undefined) plainString(payload.staffingRequestId, 'organization_change.staffingRequestId', 1, 128)
       if (payload.employeeId !== undefined) plainString(payload.employeeId, 'organization_change.employeeId', 1, 128)
       if (payload.name !== undefined) plainString(payload.name, 'organization_change.name', 1, 200)
       if (payload.role !== undefined) plainString(payload.role, 'organization_change.role', 1, 1000)
-      if (payload.department !== undefined) plainString(payload.department, 'organization_change.department', 1, 200)
       if (payload.budgetMicros !== undefined) safeInteger(payload.budgetMicros, 'organization_change.budgetMicros', 0)
+      if (payload.designateAsHr !== undefined && typeof payload.designateAsHr !== 'boolean') throw new Error('organization_change.designateAsHr must be boolean')
       break
     case 'product_scope':
-      exactKeys(payload, ['action', 'productId', 'name', 'productRoot', 'budgetCredits', 'budgetMicros'], 'product_scope approval payload')
+      exactKeys(payload, ['action', 'productId', 'name', 'productRoot', 'budgetMicros'], 'product_scope approval payload')
       enumValue(payload.action, 'product_scope.action', ['create', 'update', 'activate', 'cancel'])
       if (payload.productId !== undefined) plainString(payload.productId, 'product_scope.productId', 1, 128)
       if (payload.name !== undefined) plainString(payload.name, 'product_scope.name', 1, 200)
       if (payload.productRoot !== undefined) plainString(payload.productRoot, 'product_scope.productRoot', 1, 4096)
-      if (payload.budgetCredits !== undefined) safeInteger(payload.budgetCredits, 'product_scope.budgetCredits', 0)
       if (payload.budgetMicros !== undefined) safeInteger(payload.budgetMicros, 'product_scope.budgetMicros', 0)
       break
     case 'model_route':
@@ -1140,17 +1008,17 @@ export function validateApprovalPayload(kind: ApprovalKind, payload: unknown): a
 
 export function assertCompanyMessage(value: unknown): asserts value is CompanyMessage {
   if (!isRecord(value)) throw new Error('mailbox record must be an object')
-  exactKeys(value, ['id', 'from', 'to', 'content', 'createdAt', 'deliveryState', 'reservationId', 'leaseAt', 'acceptedAt', 'readAt'], 'mailbox record')
+  exactKeys(value, ['id', 'from', 'to', 'content', 'createdAt', 'deliveryState', 'attempts', 'reservationId', 'leaseAt', 'acceptedAt'], 'mailbox record')
   stringMatches(value.id, 'message.id', UUID)
   plainString(value.from, 'message.from', 1, 128)
   plainString(value.to, 'message.to', 1, 128)
   plainString(value.content, 'message.content', 1, 131_072)
   timestamp(value.createdAt, 'message.createdAt')
-  enumValue(value.deliveryState, 'message.deliveryState', ['queued', 'reserved', 'accepted', 'read', 'held_budget', 'dead'])
+  enumValue(value.deliveryState, 'message.deliveryState', ['queued', 'reserved', 'accepted', 'held_budget', 'dead'])
+  if (value.attempts !== undefined) safeInteger(value.attempts, 'message.attempts', 0, 3)
   if (value.reservationId !== undefined) stringMatches(value.reservationId, 'message.reservationId', UUID)
   if (value.leaseAt !== undefined) timestamp(value.leaseAt, 'message.leaseAt')
   if (value.acceptedAt !== undefined) timestamp(value.acceptedAt, 'message.acceptedAt')
-  if (value.readAt !== undefined) timestamp(value.readAt, 'message.readAt')
 }
 
 function rejectDangerousKeys(value: JsonValue, path: string, allowed?: ReadonlySet<string>): void {
@@ -1169,7 +1037,8 @@ function rejectDangerousKeys(value: JsonValue, path: string, allowed?: ReadonlyS
 
 export function assertJsonValue(value: unknown, path = 'value'): asserts value is JsonValue {
   const seen = new Set<object>()
-  const visit = (candidate: unknown, current: string): void => {
+  const visit = (candidate: unknown, current: string, depth: number): void => {
+    if (depth > 64) throw new Error(`${current} exceeds the maximum JSON nesting depth`)
     if (candidate === null || typeof candidate === 'string' || typeof candidate === 'boolean') return
     if (typeof candidate === 'number') {
       if (!Number.isFinite(candidate) || Object.is(candidate, -0)) throw new Error(`${current} is not a lossless JSON number`)
@@ -1180,15 +1049,15 @@ export function assertJsonValue(value: unknown, path = 'value'): asserts value i
     seen.add(candidate)
     if (Array.isArray(candidate)) {
       if (Object.keys(candidate).length !== candidate.length) throw new Error(`${current} is a sparse array`)
-      candidate.forEach((item, index) => visit(item, `${current}[${index}]`))
+      candidate.forEach((item, index) => visit(item, `${current}[${index}]`, depth + 1))
     } else {
       const prototype = Object.getPrototypeOf(candidate)
       if (prototype !== Object.prototype && prototype !== null) throw new Error(`${current} must be a plain object`)
-      for (const [key, child] of Object.entries(candidate)) visit(child, `${current}.${key}`)
+      for (const [key, child] of Object.entries(candidate)) visit(child, `${current}.${key}`, depth + 1)
     }
     seen.delete(candidate)
   }
-  visit(value, path)
+  visit(value, path, 0)
 }
 
 function uniqueIds(items: unknown[], pattern: RegExp, label: string): Set<string> {

@@ -1,12 +1,12 @@
 import { createHash } from 'node:crypto'
-import { existsSync, lstatSync, realpathSync } from 'node:fs'
+import { lstatSync, realpathSync } from 'node:fs'
 import { lstat, mkdir, realpath } from 'node:fs/promises'
-import { homedir } from 'node:os'
-import { isAbsolute, join, normalize, posix, relative, resolve, sep } from 'node:path'
+import { isAbsolute, join, posix, relative, resolve, sep } from 'node:path'
 import { dshHomeDisplay, expandHomePath, resolveDshHome } from '@deepseek-ai/dsh-home-paths'
-import type { ResolvedCompanyConfig, WorkspaceIdentity, WorkspacePaths } from './types.js'
+import type { WorkspaceIdentity, WorkspacePaths } from './types.js'
 
-export const STATE_SCHEMA_DIR = 'v1'
+/** Stable filesystem layout; aggregate schema versions migrate in place. */
+export const STATE_LAYOUT_DIR = 'v1'
 
 export function resolveStateRoot(configured?: string): { path: string; display: string } {
   if (configured !== undefined) {
@@ -44,7 +44,7 @@ export function canonicalWorkspaceSync(cwd: string | undefined): WorkspaceIdenti
 }
 
 export function workspacePaths(stateRoot: string, workspace: WorkspaceIdentity): WorkspacePaths {
-  const root = join(stateRoot, STATE_SCHEMA_DIR, 'workspaces', workspace.key)
+  const root = join(stateRoot, STATE_LAYOUT_DIR, 'workspaces', workspace.key)
   const activeDir = join(root, 'active')
   return {
     workspace,
@@ -53,6 +53,7 @@ export function workspacePaths(stateRoot: string, workspace: WorkspaceIdentity):
     activeDir,
     stateFile: join(activeDir, 'company.json'),
     auditFile: join(activeDir, 'events.jsonl'),
+    transactionFile: join(activeDir, 'transaction.json'),
     mailboxDir: join(activeDir, 'mailboxes'),
     archiveDir: join(root, 'archive'),
     retiredSessionsFile: join(root, 'retired-sessions.json'),
@@ -133,41 +134,6 @@ export function normalizeMultilineString(value: string, label: string, maxChars:
     throw new Error(`${label} must not contain control characters other than line breaks and tabs`)
   }
   return normalized
-}
-
-export function isStateRootInsideWorkspace(stateRoot: string, workspace: string): boolean {
-  const rel = relative(workspace, stateRoot)
-  return rel === '' || (!rel.startsWith(`..${sep}`) && rel !== '..' && !isAbsolute(rel))
-}
-
-export function isBroadWorkspace(workspace: string): boolean {
-  const normalizedWorkspace = normalize(workspace)
-  return normalizedWorkspace === normalize(homedir()) || normalizedWorkspace === resolve(sep)
-}
-
-export function effectiveLimits(saved: ResolvedCompanyConfig, state: { limits: Record<string, number> }): Record<string, number> {
-  const configured: Record<string, number> = {
-    maxEmployees: saved.maxEmployees,
-    maxProducts: saved.maxProducts,
-    maxWorkItems: saved.maxWorkItems,
-    maxOpenWorkItems: saved.maxOpenWorkItems,
-    maxAttemptsPerWork: saved.maxAttemptsPerWork,
-    maxPendingApprovals: saved.maxPendingApprovals,
-    maxMailboxMessages: saved.maxMailboxMessages,
-    maxAuditBytes: saved.maxAuditBytes,
-    maxMessageChars: saved.maxMessageChars,
-    maxOutputChars: saved.maxOutputChars,
-    memberMaxDepth: saved.memberMaxDepth,
-  }
-  const result: Record<string, number> = {}
-  for (const [key, value] of Object.entries(configured)) {
-    result[key] = Math.min(value, state.limits[key] ?? value)
-  }
-  return result
-}
-
-export function fileExists(path: string): boolean {
-  return existsSync(path)
 }
 
 export function isErrno(error: unknown, code: string): error is NodeJS.ErrnoException {

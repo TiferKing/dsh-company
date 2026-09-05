@@ -69,7 +69,7 @@ test('all seven company views render the safe Host projection', () => {
   assert.match(output, /Host computes money/)
   assert.match(output, /Product Division/)
   assert.match(output, /Engineering/)
-  assert.match(output, /175 \/ 1,000,000 tokens/)
+  assert.match(output, /Token analytics: 175 tokens/)
   assert.match(output, /Publish a release candidate/)
   assert.doesNotMatch(output, /must-be-dropped/)
   assert.doesNotMatch(output, /attempt_id/)

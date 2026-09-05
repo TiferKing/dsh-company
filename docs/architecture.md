@@ -1,107 +1,295 @@
-# dsh-company architecture
+# dsh-company 架构：核心逻辑与工作模式
 
-Status: implementation contract
-Target: DeepSeek Harness `@deepseek-ai/dsh@0.1.1-rc.2` (rc.2)
-Scope: one bounded AI software company per canonical workspace
+本文描述当前源码的运行模型。目标宿主是 DeepSeek Harness（DSH）`0.1.1-rc.2`；磁盘聚合版本为 `schemaVersion: 2`，Web 快照版本为 `schema_version: 5`。这两个版本和 npm 包版本分别演进。
 
-## 0. Trust model summary
+## 1. 这家公司如何工作
 
-- **Session identity is the only authority.** Every mutation names an exact live participant (founder session, or the designated HR/support employee for scoped operations). Enumerable ids are never authority by themselves; the runtime re-verifies liveness, role, and company binding inside each revision-fenced transaction.
-- **Web parity with the host settings page.** Loopback same-origin pages act as the session participant they name (full view + mutations, persisted). Remote clients — only reachable when `allowRemoteUi` is enabled — are strictly read-only and receive a downgraded projection. A local process that can reach the loopback port is in the same trust domain as one that can edit host settings or state files directly.
-- **Reservations are accounting units, never truncation devices.** Since v0.13 there are no per-turn token limits: output is never clamped or blocked mid-turn; overruns are recorded post-hoc and halt the company only when spending exceeds the money budget.
-- **Employees cannot escalate.** Tool filters deny founder-only `company_*` tools and every spawn-capable native tool (`subagent`, `subagent_fork`, `ralph`, `workflow`, `agent_teams_create`). Headcount changes flow exclusively through HR staffing with human approval.
+`dsh-company` 把一个 DSH 工作区组织成持续存在的 AI 软件公司。人类提出使命、提供预算并作关键决策；根会话中的 AI 负责规划和经营；HR 评估人员配置；员工通过持久子会话执行有验收条件的工作。插件把这些活动变成可校验、可恢复的公司状态。
 
-## 1. Boundaries
+这里的 `Founder` 是代码中的角色名，指绑定公司的**根 AI Agent**，可以理解为受人类委任的经营负责人。它和作出审批的人类不是同一个主体。Web 控制台让人类直接查看公司、修改草案和作出决策。
 
-`dsh-company` is a Cordis Host + Web client plugin. It composes DSH instead of implementing another agent runtime:
+核心循环是：
 
-- one exact live root session is Founder;
-- direct durable continuable subagents are employees (reserved session ids, full transcripts in DSH session storage);
-- formation, governance, HR staffing, organization, products, work, tickets, approvals, messages, factual usage, monetary authority and health are durable company state;
-- an event-driven scheduler admits only ready work, HR assessments or mail, and cold-recovers open attempts after restarts with the same capability;
-- safe browser projections never carry attempt capabilities, execution prompts, credentials or endpoints.
-
-It does not perform legal incorporation, provider billing, payroll, purchases, credential management, deployment, publication or irreversible external effects. Company approval and temporary authorization never bypass Harness sandbox or Host/user approval.
-
-## 2. DSH seams
-
-- `ctx.tools.register(defineTool(...))` — closed Host tools (see README table);
-- `ctx.systemPrompt.section(...)` — founder / HR / employee policy, including the restart-resume protocol (never recreate employee personas) and the no-self-spawn rule;
-- `ctx.subagents.startContinuable() / followup() / interrupt()` — durable employees; `followup` cold-resumes via `agents.resume(resumeSessionId)` restoring the full transcript;
-- `ctx.llm.listProviders() / listModels() / resolveModelInfo() / resolveCallConfig()` — capability discovery and route validation; `llm/adapters-updated` + `settings/document-updated` invalidate cached projections;
-- `agent/request` — route capture, temporary-authorization validation, call-headroom renewal; per-turn blocking and max_tokens clamping are deliberately absent;
-- `session/event` — ingest `assistant/message` `TokenUsage` into the money/token ledgers;
-- `agent/request-error`, `agent/error`, `agent/status` — failure classification, reservation cleanup, scheduling;
-- Web server registration — `GET /plugins/dsh-company/state` (participant-aware, snake_case projection) and `POST /plugins/dsh-company/action` (loopback-only mutation channel; remote 403 `web_mutations_require_loopback`), plus the console-decision steer into the founder conversation.
-
-Model discovery is advisory: an exact configured route remains valid when absent from an advertised catalog; discovery creates capability rows, never invented prices.
-
-## 3. Durable aggregate
-
-Filesystem path and state `schemaVersion: 1` stay stable; normalization is idempotent (v0.13 strips legacy turn-token fields). The browser snapshot contract is `schema_version: 4` (v0.4 removed flat `departments`; v0.5 added the Host-parsed `company.charter_outline`; v0.9 added `tickets`).
-
-```ts
-interface CompanyState {
-  phase: 'staged' | 'provisioning' | 'provisioning_failed' |
-    'operating' | 'paused' | 'halted' | 'closing' | 'archived'
-  name: string; slogan: string; mission: string
-  governanceRevision: number
-  formation: { status: 'draft' | 'approved'; charter: string; … }
-  moneyBudget: {
-    currency: string                 // immutable after usage
-    totalMicros / reservedMicros / spentMicros
-    pricingRevision: number
-    prices: ModelPrice3[]            // three-rate rows, revision-fenced
-    usage / reservations             // factual ledger
-  }
-  tokenBudget: TokenBudget           // legacy v0.1 ledger, kept in step
-  modelCatalog: { generation, probedAt, models[] }
-  orgUnits / positions / employees   // hierarchical org; manager attribution
-  staffingRequests                   // HR pipeline with recommendations
-  products / workItems               // scope-bounded products; DAG work
-  tickets                            // filed → triaged → dispatched → resolved → closed
-  approvals / temporaryAuthorizations
-  supportEmployeeId?                 // designated ticket decider
-  health / provisioning / audit
-}
+```mermaid
+flowchart LR
+    H[人类：使命、预算、关键决策] --> F[Founder：产品与工作规划]
+    F --> HR[HR：人员与模型评估]
+    HR --> A[人类审批]
+    A --> E[持久员工会话]
+    F --> W[带依赖与验收条件的工作]
+    W --> S[宿主调度与预算准入]
+    E --> S
+    S --> R[执行、证据与用量]
+    R --> F
+    R --> H
 ```
 
-Every mutation runs in `store.transact`: revision fence → audit row appended first → state written atomically; a failed audit append aborts the mutation. Mailbox writes stage before the state commit and roll back on failure.
+公司的持续性来自磁盘状态和 DSH 会话历史。模型忘记上下文或宿主重启后，不需要重新推测公司成员、批准记录或任务进度。公司的自主性有明确范围：获批资源内的日常执行由调度器推进，人事、预算、发布等关键决策仍有审批门槛。
 
-## 4. Money & accounting
+## 2. 核心对象与职责分工
 
-- Authority is integer micro-currency. Tools/Web accept human units (≤6 decimals, exact decimal→micro conversion) converted once at the Host boundary.
-- Admission (`reserveMoneyTurn`) reserves worst-case prompt+output money for a turn. Entitlement sizing (v0.13) is context-window driven — min across primary/fallback route context windows — and by affordability at the tightest of company/product/employee budgets. Unknown-cost routes require a temporary authorization bypass and book a 1M-token placeholder.
-- `agent/request` validates that the requested route was captured by the reservation and that the covering authorization is still active; it renews call headroom when remaining micros fall short. It never injects or clamps `max_tokens`.
-- `session/event` settles factual usage: per-entry cost from an immutable rate snapshot at the reservation's pricing revision; one aggregate BigInt half-up rounding; reasoning tokens never double-charged. Overspend is persisted first, then the company halts (`money_budget`) with employee operational blocks; manual resume after correction.
-- Price edits apply only to future calls (`pricing_change` approval, digest-fenced); recorded usage keeps its original revision. Currency is immutable after any usage.
+| 对象 | 表达什么 | 谁推进它 |
+|---|---|---|
+| 公司 `CompanyState` | 使命、章程、运行阶段、资源和治理记录 | Founder 命令、人类决策、宿主事件 |
+| 员工 `Employee` | 编制身份及其 DSH continuable 会话、模型路线、金额上限 | HR 推荐，审批后由 Founder 应用 |
+| 产品 `Product` | 交付目标、工作目录、成功标准、预算分配和生命周期 | Founder；发布需满足质量与审批条件 |
+| 工作 `WorkItem` | 产品上的一个 DAG 节点，含范围、依赖、负责人、验收和执行尝试 | Founder 建计划，调度器派发，负责人报告 |
+| 决策 `ApprovalRequest` | 针对明确对象和前置条件的结构化批准请求 | 参与者提议，人类通过 UI 或后续对话决策 |
 
-## 5. Organization & staffing
+组织单元和岗位补充员工的职责归属。组织树可以有 company、division、department、team 多层，但**所有公司员工都是 Founder 的直属 DSH 子会话**。组织树不是另一棵 Agent 进程树；部门经理不会因此获得创建员工或审批的权限。
 
-- Org units are hierarchical (company/division/department/team) with manager attribution; the flat v1 `departments` projection is gone.
-- Every hire/adjust/retire starts at `company_request_staffing`; the designated HR lead claims the assessment and recommends difficulty, provider/model (must be an enabled, three-rate-priced route), reasoning effort, employee monetary ceiling, org path, position and responsibilities. A human approves the `organization_change`; the founder applies it. Employee provisioning reserves the continuable session id and installs persona + tool filter.
-- Employee tool filters deny all founder-only `company_*` tools and the spawn-capable native tools; the founder policy forbids recreating employee personas after restarts and routes headcount requests to HR.
+同一个规范化工作区最多有一家活动公司。工作区路径经真实路径解析和规范化后生成稳定标识，因此同一目录的路径别名不会被当成不同公司。
 
-## 6. Work lifecycle
+```mermaid
+flowchart TD
+    T[company_* 工具] --> R[CompanyRuntime：公司命令]
+    U[Web 控制台] --> HTTP[HTTP：请求、身份、修订校验]
+    HTTP --> R
+    R --> D[纯领域规则：工作、金额、审批、授权]
+    R --> STORE[CompanyStore：事务与恢复]
+    R --> S[CompanyScheduler：派发与重试]
+    S --> D
+    S --> STORE
+    S --> DSH[DSH：continuable 会话与模型执行]
+    DSH --> ACC[Accounting：调用准入与事实结算]
+    ACC --> STORE
+    STORE --> SNAP[角色过滤后的 Snapshot]
+    SNAP --> HTTP
+```
 
-- Work items carry kind (discovery…operations), product scope, acceptance, verification, deliverables, dependencies (acyclic, validated), optional approval dependencies, and review independence (`review` requires a differing assignee).
-- The scheduler preclaims ready work for idle employees (reserve → begin attempt → deliver prompt); employees confirm with `company_claim_work` and update through `company_update_work` with the exact attempt capability. Terminal updates require kind-specific evidence (changed paths within scope, acceptance results).
-- Reassignment revokes the old capability and completes a fenced handoff. Pause interrupts members, releases reservations and requeues without consuming attempts. Cold recovery re-delivers the same attempt after host restarts; failed/cancelled repairs return their ticket to triaged.
+插件负责业务协调；DSH 负责模型调用、工具执行、会话持久化、沙箱和宿主权限。公司审批不会直接扩大 DSH 的权限。
 
-## 7. Tickets (v0.9)
+| 代码入口 | 主要职责 |
+|---|---|
+| [index.ts](../src/index.ts) | Cordis 装配、事件订阅、启动恢复和卸载顺序 |
+| [runtime.ts](../src/runtime.ts) | 身份校验与公司用例；成立、人事、产品、工作、工单和控制操作 |
+| [scheduler.ts](../src/scheduler.ts) | 每工作区串行调度；消息、HR、工作投递、重试和恢复 |
+| [employees.ts](../src/employees.ts) | 员工会话创建、续接、模型选择、persona 与工具限制 |
+| [work.ts](../src/work.ts) | 工作资格、DAG、attempt、范围和证据规则 |
+| [money.ts](../src/money.ts)、[accounting.ts](../src/accounting.ts) | 唯一金额账本、预留、请求准入、用量结算和异常处置 |
+| [approvals.ts](../src/approvals.ts)、[authorizations.ts](../src/authorizations.ts) | 决策前置条件、一次性应用和有时限的内部授权 |
+| [state.ts](../src/state.ts)、[schemas.ts](../src/schemas.ts)、[migration.ts](../src/migration.ts) | 存储事务、聚合不变量和旧版本迁移 |
+| [models.ts](../src/models.ts) | 从实际 DSH 注册表探测可用路线和模型能力 |
+| [tools.ts](../src/tools.ts)、[prompt.ts](../src/prompt.ts) | 模型可用命令、分区状态查询与公司运行约定 |
+| [http.ts](../src/http.ts)、[snapshot.ts](../src/snapshot.ts)、[client/](../src/client/) | Web 边界、只读投影和控制台交互 |
 
-Human-filed tickets from the Web console create a linked, unassigned `repair` work item (blocked from admission by `ticket_awaiting_dispatch` until dispatch). Triage sets severity; dispatch assigns a runnable employee (never the founder — hard check). Completion auto-resolves the ticket and steers the founder to reply and close (`company_close_ticket`, reply defaulting to the work output). Failure returns the ticket to triaged with severity kept. A designated support engineer (`company_designate_support`) may run the whole loop without the founder.
+## 3. 成立与招聘模式
 
-## 8. Web console
+### 3.1 先形成公司决策，再创建执行会话
 
-- Mounts via official slots (conversation header button + shell overlay). One fiber-owned controller polls `/state` and posts `/action`; duplicate React mounts never multiply requests.
-- Loopback founder view renders the editable formation form, approvals, ticket filing, the recruiting price matrix with model-id-keyed presets (never auto-enabling), and pause/resume/archive. Every successful console action steers the founder conversation with an authoritative record; ticket resolution steers too.
-- Remote views downgrade: employee viewer, empty permissions, private evidence stripped, an explicit read-only banner.
+`company_bootstrap` 记录名称、标语、使命、章程、首个产品、币种、金额预算和模型价格，创建 `staged` 草案以及一个初始 HR 编制。此时不启动员工。
 
-## 9. Failure taxonomy & health
+人类可以编辑草案，然后批准。批准后先持久化 `provisioning` generation、预分配 session ID 和预算预留，再调用 DSH 创建 HR 会话。会话确认持久存在后，公司进入 `operating`，首个产品激活。
 
-Scoped operational blocks (`money_budget`, `unpriced_model`, provider/network classes) pause the affected employee with a reason; company `halted` requires manual resume. Provisioning failure keeps the formation editable for retry. Archive preserves transcripts, revokes capabilities and reconciles reservations; forced archive consumes its approval only on success.
+```mermaid
+stateDiagram-v2
+    [*] --> staged: 起草
+    staged --> provisioning: 人类批准
+    provisioning --> operating: HR 会话创建或恢复成功
+    provisioning --> provisioning_failed: 创建失败
+    provisioning_failed --> provisioning: 编辑后重新批准
+    operating --> paused: 人工暂停
+    operating --> halted: 预算或运行故障
+    paused --> operating: 人工恢复
+    halted --> operating: 修复条件后人工恢复
+    staged --> archived: 丢弃草案
+    operating --> archived: 归档
+    paused --> archived: 归档
+    halted --> archived: 归档
+```
 
-## 10. Testing
+图中展示主要路径；每个命令仍校验当前阶段。归档是终态，目录移到历史区后才可以在该工作区成立新公司。
 
-`pnpm verify` = typecheck (host + client) + node:test suites + build (tsc + tsdown) + package check. Suites pin: money rounding and migration, reservation/settlement and overrun halt, unknown-cost authorization fences, catalog probing, org load oracle, snapshot redaction, web action execution/steer and remote fail-closed, ticket lifecycle, charter parsing, render trees, price presets, tool-filter denials, and cold recovery.
+### 3.2 每次人员变更都是一个可追踪的请求
+
+后续招聘、调整和退休使用统一流程：
+
+```text
+Founder 提出 staffing request
+  → designated HR 收到评估任务并领取 assessment attempt
+  → HR 提交难度、理由及人员方案
+  → organization_change 审批
+  → 人类批准或拒绝
+  → Founder 应用批准的变更
+  → 创建/调整/退休员工，request 记为 applied
+```
+
+招聘和调整方案包含 provider/model、推理强度、员工金额上限、组织路径、岗位与职责。推荐模型必须已在价格矩阵中启用；“宿主可以使用这个模型”和“公司允许花钱使用这个模型”是两个条件。退休只需评估难度和理由，员工当前配置由宿主读取。
+
+预算调整可以保留原会话；模型或 persona 变更需要换会话、撤销旧尝试并交接未完工作。创建失败保留可重试请求与已消费的批准记录，重试继续原人事决策，不重复招聘一个新身份。
+
+HR 也是可替换员工。`designate_as_hr` 只有在继任会话成功后才转移 `hrEmployeeId`；同一事务撤销旧 HR 身份、转移待处理请求并释放旧评估租约。重启恢复走同一交接规则。
+
+## 4. 产品研发与员工执行模式
+
+### 4.1 Founder 管计划，调度器管派发
+
+Founder 把产品拆成有向无环图。`dependencies` 表示必须完成的前置工作；`approvalDependencies` 表示执行所需决策。范围、验收标准、验证方式、交付物和评审目标属于计划的一部分，不能用一段“完成了”的输出替代。
+
+例如，一个产品可以采用：
+
+```text
+产品发现 → 设计 → 实现 → 验证 → 独立评审 → 发布工作
+                       ↖ 失败反馈与修复迭代 ↙
+```
+
+调度器对每个工作区串行处理；不同员工的 DSH 会话可以并行执行。投递前检查公司与产品阶段、DAG、审批、员工状态、组织范围、负责人、评审独立性、尝试上限、模型能力和预算。
+
+HR 不参与普通工作。员工最多持有一个打开的普通 work attempt。`eligible_org_unit_ids` 可以约束部门子树；没有限定范围的工作可能被任意符合条件的非 HR 员工领取，规划时应说明所需专业归属。
+
+### 4.2 一次工作尝试就是一次执行权
+
+```text
+pending
+  → 宿主生成 attempt_id，状态 claimed，预留金额与投递租约
+  → DSH 接受 followup
+  → 员工 company_claim_work 确认同一尝试
+  → in_progress 与分步证据更新
+  → completed / failed / cancelled
+```
+
+`attempt_id` 是 UUID 能力凭证，和负责人一起校验。旧会话或旧 attempt 的更新不能覆盖新尝试。员工不能自行领取未经调度预先准入的工作；Founder 可以显式接管工作。
+
+重新分配先撤销旧能力，写入 handoff 状态，再中断原执行、完成交接。崩溃后可以收尾 handoff。暂停把打开的工作退回待执行、撤销能力且不消耗一次业务尝试；恢复后使用新的执行能力。
+
+工作尝试次数和**同一次尝试的投递次数**不同：前者受 `maxAttemptsPerWork` 限制，后者最多三次。会话空闲但没有提交终态时，可用同一 attempt 续接；连续无结果会结束该尝试并通知 Founder。耗尽尝试的工作不会阻塞其他可执行工作。
+
+员工可以分步提交证据，再提交终态；后续省略的证据字段不会清空已报告内容。涉及文件变更的工作完成时要求 changed paths 和 acceptance results，路径按工作区相对路径与 Node glob 检查。
+
+### 4.3 发布有两个时点
+
+先检查前置开发工作、完成的验证以及独立通过的评审，才能批准发布。批准时不要求发布工作本身已经完成，否则会形成“发布要等批准，批准要等发布”的死锁。
+
+批准后执行 release 工作；最终把产品改为 `released` 时，再检查包括 release 在内的发布前工作已完成。独立评审要求同一产品内、已完成的被审查工作，以及双方明确且不同的负责人。
+
+产品典型生命周期是 `proposed → approved → active → validating → released → retired`，另有暂停、取消和返回研发的路径。产品处于 `released` 不等于公司停止；后续 operations 和用户问题仍可进入受控流程。
+
+### 4.4 用户反馈形成工单闭环
+
+Web 提交工单时，宿主同时创建关联的 pending repair 工作。Founder 或指定支持员工分级、选择合格员工并派单；修复完成自动把工单标为 `resolved`，随后由决策者给出面向人的回复并关闭。
+
+修复失败时保留 attempt 历史，工单回到待派发状态，必须再次作出派单决定。归档公司会明确关闭未结工单并取消未完修复，不会把取消伪装成问题已解决。Web 当前提供提交和查看，分级、派发与回复关闭由公司工具完成。
+
+## 5. 预算、价格与模型执行模式
+
+### 5.1 一个事实账本，三层约束
+
+金额使用整数微货币：`1` 货币单位等于 `1,000,000` micros。公司的 `moneyBudget.usage` 是模型消费的事实明细，Token 统计由同一明细派生。
+
+| 范围 | 语义 |
+|---|---|
+| 公司总额 | 员工执行和 Founder 管理调用共同占用的资金上限 |
+| 产品预算 | 产品之间的资金分配；有效分配总额不超过公司总额 |
+| 员工预算 | 同一笔消费上的人员上限；多个员工上限可以重叠，不代表额外资金 |
+
+未消耗预留从可用额中扣除，已结算费用进入 spent。预留是准入承诺，不是已消费金额，也不是中途截断输出的 Token 限制。
+
+每条模型价格包含未命中缓存输入、命中缓存输入、输出三档单价。每条用量先用 BigInt 汇总三档分子，再统一四舍五入一次；reasoning 字段作诊断，避免把已包含在输出中的 Token 再收费。
+
+### 5.2 先预留，再按实际调用结算
+
+1. 派发时，宿主依据价格、上下文窗口及三层可用额度预留一个员工回合的资金。配置 fallback 时同时覆盖候选路线的保守成本。
+2. `agent/request` 在 DSH 解析实际调用路线后，再开新事务检查身份、阶段、预留 ID、路线、授权有效期及当前调用余量。
+3. 为已准入请求捕获不可变的价格和预留归属，包括工作、产品与临时授权。
+4. `session/event` 的事实用量按捕获内容结算。旧请求晚到时仍归原工作，不得消耗后来创建的新预留。
+5. `session/flush` 等待尚未完成的记账；`session/created` 重放历史用量，以 `sessionId:eventSeq` 去重。
+
+超支已经发生时先记录事实，再暂停相关员工或 halt 公司；不能通过拒绝记账掩盖超支。员工回放缺少可靠历史路线或预留时保留 Token 与 unknown cost，暂停并要求复核，不按当前配置猜造历史费用。Founder 的历史未知费用仍保留对话通道。
+
+Founder 对话保留人机控制通道，不因公司预算不足被截断；它的管理用量仍记入账本。这意味着公司总额是员工准入约束，**不是供应商最终账单的绝对硬封顶**。
+
+### 5.3 模型能力与价格各有来源
+
+模型目录来自 DSH registry，记录可用性、上下文窗口和推理选项；价格矩阵来自公司明确的配置或获批编辑。UI 的价格预设只辅助填写，不自动批准或启用路线。
+
+模型适配器或设置变化会将目录标为 stale。调度前必须重新探测；传入 AbortSignal 的探测被取消后不得提交成成功结果。无可用路线或无完整价格的普通员工执行会阻塞；收费路线的普通金额准入还要求可信上下文窗口。三档价格全为零的已知免费路线可以使用会计占位，不据此产生费用。
+
+## 6. 决策、状态查询与沟通模式
+
+审批包含类型化 payload、请求来源、决定及必要的前置条件。预算、价格、章程等改变在批准事务中直接应用；人事、产品转换等先形成批准记录，再由具体命令匹配 payload 并一次性消费。消费与状态变更在同一事务中完成。
+
+`expiresAt` 对普通审批表示**等待决策的期限**；临时授权另有执行有效期。旧价格摘要、治理 revision 或预算前置条件不匹配时，请求取消，不把过时决策套到新状态。
+
+工具路径要求审批晚于请求时的真实用户消息，排除模型在提出请求的同一轮自批。该检查验证消息来源与顺序，并不理解所有自然语言是否真的表达批准；Founder 仍必须忠实使用人类决定。Web 路径由明确的决策按钮提交，并校验正在编辑的 revision。
+
+临时授权针对一个员工，具备理由、起止时间、批准记录和撤销记录。它仅可豁免普通内部工作的公司/产品/员工金额准入及 `product_scope`、`model_route` 依赖；不豁免人员治理、发布、运维、外部效果、DAG、attempt、负责人、范围或证据，也不改变 DSH 工具权限。
+
+`company_status` 默认返回有效 JSON 经营概览：公司状态、预算、审批和邮箱预览、各类状态计数及查询说明。模型用 `section` 加可选筛选、`offset`/`limit` 查询详情，避免大公司把预算与待决事项挤到输出截断之外。分页基于安全投影，重型历史明细仍遵守投影保留窗口。
+
+工具默认结果已从完整快照改为概览；外部程序若曾直接按 CompanySnapshot 解析工具结果，需要改用分区查询。HTTP 的 schema-v5 快照契约保持不变。
+
+员工通过持久 mailbox 报告进度、阻塞和增员提案。消息是数据与建议，不能充当系统指令、人类批准或 attempt 凭证；接收方依据公司状态自主判断，必要时发起正式工作或治理流程。DSH 接受投递只表示接收成功，不表示业务事项已经完成。
+
+## 7. 恢复、并发与持久化
+
+### 7.1 本地事务保护公司事实
+
+默认布局如下，`v1` 是磁盘目录布局版本：
+
+```text
+~/.dsh/dsh-company/v1/workspaces/<workspace-hash>/
+├── identity.json
+├── active/
+│   ├── company.json
+│   ├── transaction.json       # 提交期间的恢复日志
+│   ├── events.jsonl
+│   └── mailboxes/*.jsonl
+├── archive/<company-id>/
+└── retired-sessions.json
+```
+
+一次事务依次取得工作区串行队列和稳定的 identity 文件锁，读取并迁移状态，校验 expected revision，执行内存变更，再验证整个聚合。随后写入包含目标 state、audit、mailbox 的 WAL，原子写各文件，最后提交 `company.json` 并清理 WAL。
+
+普通写失败尝试回滚；进程中断时，下次异步读取或事务完成日志中的提交。同步 prompt 读取可以读取 WAL 的目标聚合。归档也在同一锁域复核公司身份、工作状态及强制归档批准，避免等待员工停止期间出现的新工作被未授权取消。
+
+`company.json` 是当前业务状态，DSH 会话存储保存完整对话。`events.jsonl` 是有大小上限的滚动审计窗口，会淘汰最旧行，不是无限留存的合规日志。usage 明细保留在公司聚合中，随归档一起保留。
+
+### 7.2 外部会话通过“准备—执行—确认”恢复
+
+文件事务不能把 DSH 创建会话也纳入原子提交。因此成立和人员创建先保存意图与固定 session ID，再调用 DSH，最后保存确认。重启先查询 `listChildren`：已有符合公司标签的 continuable 子会话就采用，没有才创建。
+
+同一 Founder 的并发恢复合并执行。恢复确认或失败补偿必须重新检查公司身份、员工 session ID 和请求状态，不能让过时结果覆盖已换人的新会话。
+
+调度采用**事件驱动加针对性延迟重试**。临时传输失败安排后续重试，尚未领取的 HR 评估按冷却时间再投递；每工作区合并为一个定时唤醒，卸载时清理。预算不足的邮件留在 `held_budget`，不会仅因缺钱耗尽真实投递重试次数。
+
+恢复打开的工作时复用同一 attempt。过期投递租约不代表正在执行的员工已经失效：运行中的会话不能仅因租约时间被撤销；已接受的尝试恢复也不应清空进度。真正不可恢复的会话标记 failed，通知 Founder 通过人事流程修复。
+
+### 7.3 三种并发控制解决不同问题
+
+| 机制 | 保护对象 |
+|---|---|
+| 工作区锁、WAL、revision | 文件事务与旧草稿写入 |
+| generation、session ID、attempt ID、reservation ID | 跨异步操作的执行归属与过时回调 |
+| 每工作区调度队列与合并定时器 | 重复派发和重试风暴 |
+
+这些机制不提供文件修改隔离。员工默认共享同一个代码工作区，`inScope` 是验收与治理约束，不是独立 worktree 或操作系统写锁。计划应通过依赖或互斥范围避免并发修改同一文件。
+
+## 8. Web 控制台工作模式
+
+Web 通过 `GET /plugins/dsh-company/state?sessionId=…` 获取经过角色过滤的快照，通过 `POST /plugins/dsh-company/action` 提交带 expected_revision 的动作。状态接口返回投影，不是原始 `CompanyState`。快照采用 snake_case，移除 attempt 能力、执行 prompt 及当前查看者不可见的私有证据，对诊断和结构化敏感字段脱敏；业务自由文本并不是经过通用凭据扫描的内容。客户端用闭合解析器校验，再由一个 `CompanyUiController` 管理请求和动作状态。
+
+控制台提供概览、组织、产品、工作、工单、招聘、审计、审批八个视图。成立、治理、预算和价格编辑表单保存开始编辑时的 revision；后台轮询不能悄悄把旧草稿变成基于最新状态的写入。工单及一般确认动作使用提交时的当前 revision。
+
+打开 Drawer 时快轮询，关闭或归档后降频。ETag 对实际安全投影取摘要，运行中状态或邮箱变化也会触发刷新；客户端只有持有对应快照时才能发送条件请求。动作完成后的刷新取消旧 GET，防止旧响应覆盖刚提交的结果。
+
+本地回环同源页面可以代表明确命名的在线会话操作；写请求必须带同源 Origin，并在 Runtime 二次核验真实 Agent。远程 UI 仅在配置允许时可读，始终禁止写入。判断依据是连接地址及 Forwarded/X-Forwarded-For 中的完整转发链；存在远程或无法确认的地址就按远程请求处理。反向代理必须保留转发链；删除这些头的回环代理会隐藏真实客户端来源。
+
+这个模型以本机和宿主为信任域，不是公网多租户认证系统。若需要远程经营控制台，应先设计独立认证与授权，不能把 session ID 当作远程登录凭证。
+
+## 9. 当前保证与设计边界
+
+宿主强制执行的是结构化规则：身份、阶段、金额准入、状态转换、依赖、能力凭证和证据形状。章程与 persona 中的自然语言用于指导模型，不会自动编译成覆盖全部行为的政策引擎。
+
+证据要求代表“必须提交可检查的记录”，不代表插件已经独立运行测试或证明结果真实。发布门会检查完成状态与独立评审关系；实际测试质量和报告可信度仍需要验证工作及人类审阅。
+
+`external_effect` 目前是结构化批准加描述性目标，没有把任意终端命令、云资源或部署目标逐条绑定到工作契约。实际外部执行必须继续依赖 DSH 的工具审批与沙箱；公司批准记录本身不是外部操作的安全证明。
+
+宿主必须运行且 Founder 会话可定位，公司才能推进。没有独立后台守护进程、分布式队列或跨主机一致性协议。员工不会自主扩张为无限层级的子公司或嵌套 Agent。
+
+聚合全量读取和写入适合受限规模的公司；usage 长期积累、历史记录裁剪与滚动审计决定了它还不是大规模财务数据库。扩大规模前，应先考虑明细分段、分页查询和外部审计留存。
+
+## 10. 开发与验证
+
+`pnpm verify` 是完整门禁：Host/Client 类型检查、全部 node:test、生产构建、包内容与加载契约检查。重点回归包括成立/人员恢复、过时会话与用量、任务重试、HR 继任、归档一致性、审批前置条件，以及 Host 快照到客户端的真实往返。
+
+修改规则时先确定它属于哪一层：业务不变量放纯领域函数和聚合校验，跨会话步骤放 Runtime，调度时序放 Scheduler，模型建议放 prompt。新磁盘字段需要兼容迁移；新 Web 投影字段需要同步客户端解析与契约测试。不要用前端按钮禁用或提示词替代宿主校验。

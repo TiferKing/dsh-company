@@ -150,7 +150,7 @@ export function CompanyActions(props: {
               {busy ? t('action.working') : t('action.approveStart')}
             </button>
           ) : null}
-          <button type="button" className="dsh-company-action" disabled={busy} onClick={() => controller.close()}>
+          <button type="button" className="dsh-company-action" onClick={() => controller.close()}>
             {t('action.returnChat')}
           </button>
         </div>
@@ -370,14 +370,17 @@ export function CompanyDrawer({
     && snapshot?.viewer.permissions.some((permission) => permission === '*' || FOUNDER_AUTHORIZATION_PERMISSIONS.includes(permission as (typeof FOUNDER_AUTHORIZATION_PERMISSIONS)[number]))
 
   const onOverlayMouseDown = (event: ReactMouseEvent<HTMLDivElement>): void => {
-    if (event.currentTarget === event.target && confirmation === undefined && !busy) controller.close()
+    if (event.currentTarget === event.target && confirmation === undefined) controller.close()
   }
 
   const onKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>): void => {
     if (event.key === 'Escape') {
       event.preventDefault()
       if (confirmation !== undefined && !busy) setConfirmation(undefined)
-      else if (!busy) controller.close()
+      else {
+        setConfirmation(undefined)
+        controller.close()
+      }
       return
     }
     if (event.key !== 'Tab') return
@@ -432,13 +435,21 @@ export function CompanyDrawer({
   }
 
   const requestGrantAuthorization = (employeeName: string, payload: Record<string, unknown>): void => {
+    const requestedDuration = typeof payload.expires_at === 'number' ? Math.max(1, payload.expires_at - Date.now()) : 0
     setConfirmation({
       title: t('authorization.grant'),
       body: `${t('authorization.confirmGrant', { name: employeeName })}\n\n${t('authorization.fixedScopes')}: ${t('authorization.scopeBudget')}; ${t('authorization.scopeInternalApprovals')}.\n\n${t('authorization.boundaryTitle')}: ${t('authorization.boundary')}`,
       warning: t('authorization.unknownCostBoundary'),
       confirmLabel: t('authorization.grant'),
       variant: 'primary',
-      run: () => controller.performAction('grant_temporary_authorization', payload),
+      run: async () => {
+        const succeeded = await controller.performAction('grant_temporary_authorization', {
+          ...payload,
+          expires_at: Date.now() + requestedDuration,
+        })
+        if (succeeded) setActiveTab('approvals')
+        return succeeded
+      },
     })
   }
 
@@ -448,10 +459,14 @@ export function CompanyDrawer({
       body: `${t('authorization.confirmRevoke')}\n${employeeName} · ${authorizationId}`,
       confirmLabel: t('authorization.revoke'),
       variant: 'danger',
-      run: () => controller.performAction('revoke_temporary_authorization', {
-        authorization_id: authorizationId,
-        reason,
-      }),
+      run: async () => {
+        const succeeded = await controller.performAction('revoke_temporary_authorization', {
+          authorization_id: authorizationId,
+          reason,
+        })
+        if (succeeded) setActiveTab('approvals')
+        return succeeded
+      },
     })
   }
 
@@ -459,8 +474,8 @@ export function CompanyDrawer({
     if (confirmation === undefined || confirming) return
     setConfirming(true)
     try {
-      await confirmation.run()
-      setConfirmation(undefined)
+      const succeeded = await confirmation.run()
+      if (succeeded) setConfirmation(undefined)
     } finally {
       setConfirming(false)
     }
@@ -477,8 +492,8 @@ export function CompanyDrawer({
           canRequestGovernance={!state.archived && snapshot.viewer.role === 'founder' && snapshot.company.formation_status === 'approved'}
           canReprobe={!state.archived && snapshot.viewer.role === 'founder'}
           busy={busy}
-          onEditFormation={(payload) => controller.performAction('edit_formation', payload)}
-          onRequestGovernance={(payload) => controller.performAction('request_governance_change', payload)}
+          onEditFormation={(payload, expectedRevision) => controller.performAction('edit_formation', payload, expectedRevision)}
+          onRequestGovernance={(payload, expectedRevision) => controller.performAction('request_governance_change', payload, expectedRevision)}
           onReprobe={() => controller.performAction('reprobe_models', {})}
           onOpenApprovals={() => setActiveTab('approvals')}
         />
@@ -504,7 +519,7 @@ export function CompanyDrawer({
             t={t}
             locale={localeState.active}
             busy={busy}
-            canFile={!state.archived && snapshot.viewer.role === 'founder'}
+            canFile={!state.archived && snapshot.viewer.role === 'founder' && snapshot.company.phase === 'operating'}
             onFileTicket={(payload) => controller.performAction('file_ticket', payload)}
           />
         )
@@ -515,7 +530,7 @@ export function CompanyDrawer({
           locale={localeState.active}
           busy={busy}
           canManage={!state.archived && snapshot.viewer.role === 'founder'}
-          onRequestModelPrices={(payload) => controller.performAction('request_budget_change', payload)}
+          onRequestModelPrices={(payload, expectedRevision) => controller.performAction('request_budget_change', payload, expectedRevision)}
           onReprobe={() => controller.performAction('reprobe_models', {})}
           onOpenApprovals={() => setActiveTab('approvals')}
         />
@@ -526,7 +541,7 @@ export function CompanyDrawer({
           locale={localeState.active}
           busy={busy}
           canManageBudget={!state.archived && snapshot.viewer.role === 'founder'}
-          onRequestBudgetChange={(payload) => controller.performAction('request_budget_change', payload)}
+          onRequestBudgetChange={(payload, expectedRevision) => controller.performAction('request_budget_change', payload, expectedRevision)}
           onOpenApprovals={() => setActiveTab('approvals')}
         />
       case 'approvals':
@@ -596,7 +611,6 @@ export function CompanyDrawer({
               className="dsh-company-icon-button"
               aria-label={t('drawer.close')}
               title={t('drawer.close')}
-              disabled={busy}
               ref={closeRef}
               onClick={() => controller.close()}
             >

@@ -7,6 +7,7 @@ import type {
   MoneyRateSnapshot,
   MoneyReservation,
   MoneyUsageEntry,
+  TemporaryAuthorizationUse,
 } from './types.js'
 
 const MILLION = 1_000_000n
@@ -86,7 +87,8 @@ export function matchModelPrice(
 export function resolveModelContextWindow(state: CompanyState, provider: string, model: string): number {
   if (state.modelCatalog.stale) throw new CompanyUnpricedModelError(provider, model, 'model catalog is stale; prompt-inclusive monetary admission requires a fresh context window')
   const discovered = state.modelCatalog.models.find((candidate) => candidate.provider === provider && candidate.model === model)
-  if (discovered?.contextWindow === undefined || discovered.contextWindow < 1) {
+  if (discovered?.available !== true) throw new CompanyUnpricedModelError(provider, model, 'route is unavailable in the current DSH model registry')
+  if (discovered.contextWindow === undefined || discovered.contextWindow < 1) {
     throw new CompanyUnpricedModelError(provider, model, 'route has no discovered context window; prompt-inclusive monetary admission is blocked')
   }
   return discovered.contextWindow
@@ -110,7 +112,7 @@ export function resolveRateSnapshot(state: CompanyState, provider: string, model
 }
 
 /**
- * Price one usage event using the v0.3 three-rate contract. The complete BigInt
+ * Price one usage event using the canonical three-rate contract. The complete BigInt
  * numerator is rounded exactly once, half-up; reasoning is already a subset of
  * output and never contributes a fourth term.
  */
@@ -179,20 +181,8 @@ function maximumCategoryTokensForMoney(availableMicros: number, microsPerMillion
   assertSafeInteger(microsPerMillion, 'category rate', 0)
   assertSafeInteger(ceiling, 'category token ceiling', 0)
   if (microsPerMillion === 0) return ceiling
-  return Math.min(ceiling, safeBigIntNumber(BigInt(availableMicros) * MILLION / BigInt(microsPerMillion), 'category money-bounded tokens'))
-}
-
-export function maximumTokensForMoney(remainingMicros: number, remainingTokens: number, rates: MoneyRateSnapshot): number {
-  assertSafeInteger(remainingMicros, 'remaining money', 0)
-  assertSafeInteger(remainingTokens, 'remaining turn tokens', 0)
-  const maximum = Math.max(
-    rates.inputCacheMissMicrosPerMillion,
-    rates.inputCacheHitMicrosPerMillion,
-    rates.outputMicrosPerMillion,
-  )
-  if (maximum === 0) return remainingTokens
-  const bounded = (BigInt(remainingMicros) * MILLION) / BigInt(maximum)
-  return Math.min(remainingTokens, safeBigIntNumber(bounded, 'money-bounded token maximum'))
+  const affordable = BigInt(availableMicros) * MILLION / BigInt(microsPerMillion)
+  return affordable >= BigInt(ceiling) ? ceiling : safeBigIntNumber(affordable, 'category money-bounded tokens')
 }
 
 export function employeeMoneyTotals(state: CompanyState, employeeId: string): MoneyTotals {
@@ -219,6 +209,25 @@ export function productMoneyTotals(state: CompanyState, productId: string): Mone
   return { spentMicros, reservedMicros, availableMicros: Math.max(0, total - spentMicros - reservedMicros) }
 }
 
+export interface TokenUsageTotals {
+  inputTokens: number
+  outputTokens: number
+  cacheReadTokens: number
+  cacheWriteTokens: number
+  reasoningTokens: number
+  totalTokens: number
+}
+
+/** Token analytics are derived from the single authoritative money-usage ledger. */
+export function employeeTokenTotals(state: CompanyState, employeeId: string): TokenUsageTotals {
+  return sumTokenUsage(state.moneyBudget.usage.filter((entry) => entry.employeeId === employeeId))
+}
+
+/** Token analytics are derived from usage entries already attributed to a product. */
+export function productTokenTotals(state: CompanyState, productId: string): TokenUsageTotals {
+  return sumTokenUsage(state.moneyBudget.usage.filter((entry) => entry.productId === productId))
+}
+
 export function reserveMoneyTurn(
   state: CompanyState,
   input: {
@@ -228,6 +237,7 @@ export function reserveMoneyTurn(
     fallback?: { provider: string; model: string }
     workId?: string
     messageId?: string
+    staffingRequestId?: string
     bypass?: MoneyAdmissionBypass
   },
   now = Date.now(),
@@ -260,7 +270,7 @@ export function reserveMoneyTurn(
     entitlement = Math.min(entitlement, ...routes.map((route) => resolveModelContextWindow(state, route.provider, route.model)))
   } catch {
     // Unpriced/bypass paths tolerate a stale or context-less catalog; the
-    // legacy token ledger then books a 1M placeholder instead.
+    // unknown-cost authorization keeps a conservative 1M-token accounting placeholder.
     entitlement = 1_000_000
   }
   let rates: MoneyRateSnapshot | undefined
@@ -305,6 +315,7 @@ export function reserveMoneyTurn(
     ...(input.workId === undefined ? {} : { workId: input.workId }),
     ...(productId === undefined ? {} : { productId }),
     ...(input.messageId === undefined ? {} : { messageId: input.messageId }),
+    ...(input.staffingRequestId === undefined ? {} : { staffingRequestId: input.staffingRequestId }),
     limitTokens: entitlement,
     remainingTokens: entitlement,
     reservedMicros,
@@ -318,16 +329,6 @@ export function reserveMoneyTurn(
     createdAt: now,
   })
   state.moneyBudget.reservedMicros = safeAdd(state.moneyBudget.reservedMicros, reservedMicros, 'company reservations')
-  state.tokenBudget.reservations.push({
-    id,
-    employeeId: input.employeeId,
-    ...(input.workId === undefined ? {} : { workId: input.workId }),
-    ...(input.messageId === undefined ? {} : { messageId: input.messageId }),
-    limitTokens: entitlement,
-    remainingTokens: entitlement,
-    createdAt: now,
-  })
-  state.tokenBudget.reservedTokens = safeAdd(state.tokenBudget.reservedTokens, entitlement, 'legacy token reservations')
   assertMoneyBudgetInvariant(state)
   return id
 }
@@ -376,10 +377,21 @@ export function releaseMoneyReservation(state: CompanyState, reservationId: stri
   if (index < 0) return { micros: 0, tokens: 0 }
   const reservation = state.moneyBudget.reservations[index]!
   state.moneyBudget.reservedMicros -= reservation.remainingMicros
-  state.tokenBudget.reservedTokens = Math.max(0, state.tokenBudget.reservedTokens - reservation.remainingTokens)
-  const legacyIndex = state.tokenBudget.reservations.findIndex((candidate) => candidate.id === reservation.id)
-  if (legacyIndex >= 0) state.tokenBudget.reservations.splice(legacyIndex, 1)
   state.moneyBudget.reservations.splice(index, 1)
+  if (reservation.workId !== undefined) {
+    const work = state.workItems.find((candidate) => candidate.id === reservation.workId && candidate.reservationId === reservation.id)
+    if (work !== undefined) {
+      work.reservationId = undefined
+      work.leaseAt = undefined
+    }
+  }
+  if (reservation.staffingRequestId !== undefined) {
+    const request = state.staffingRequests.find((candidate) => candidate.id === reservation.staffingRequestId && candidate.reservationId === reservation.id)
+    if (request !== undefined) {
+      request.reservationId = undefined
+      request.leaseAt = undefined
+    }
+  }
   assertMoneyBudgetInvariant(state)
   return { micros: reservation.remainingMicros, tokens: reservation.remainingTokens }
 }
@@ -409,16 +421,25 @@ export function recordMoneyUsage(
     model: string
     usage: TokenUsage
     at: number
-    rates?: MoneyRateSnapshot
+    /** null preserves an unattributable historical route as unknown cost. */
+    rates?: MoneyRateSnapshot | null
+    /** Call-time attribution; null explicitly means no reservation was captured. */
+    reservation?: MoneyReservation | null
+    /** Exact admission captured before a live request; useful for same-millisecond retries. */
+    authorizationUseId?: string
+    /** Founder conversation is never blocked; an unpriced call is recorded as unknown cost. */
+    allowUnpriced?: boolean
   },
 ): MoneyUsageEntry | undefined {
   const id = `${input.sessionId}:${input.eventSeq}`
   if (state.moneyBudget.usage.some((entry) => entry.id === id)) return undefined
-  const reservation = activeMoneyReservation(state, input.employeeId)
-  const rates = input.rates
+  const reservation = input.reservation === undefined ? activeMoneyReservation(state, input.employeeId) : input.reservation ?? undefined
+  if (reservation !== undefined && reservation.employeeId !== input.employeeId) throw new Error('money usage reservation employee scope mismatch')
+  const activeReservation = reservation === undefined ? undefined : state.moneyBudget.reservations.find((candidate) => candidate.id === reservation.id && candidate.employeeId === input.employeeId)
+  const rates = input.rates === null ? undefined : input.rates
     ?? reservation?.routeRates?.find((candidate) => candidate.provider === input.provider && candidate.model === input.model)
     ?? (reservation?.unknownCost === true ? undefined : reservation?.rates)
-  if (rates === undefined && reservation?.authorizationId === undefined) throw new CompanyUnpricedModelError(input.provider, input.model)
+  if (rates === undefined && reservation?.authorizationId === undefined && input.allowUnpriced !== true) throw new CompanyUnpricedModelError(input.provider, input.model)
   const normalized = normalizeUnpricedUsage(input.usage)
   const priced = rates !== undefined
   const calculated = rates === undefined ? { ...normalized, costMicros: 0 } : priceUsageThreeRate(input.usage, rates)
@@ -450,10 +471,15 @@ export function recordMoneyUsage(
   state.moneyBudget.usage.push(entry)
   if (entry.authorizationId !== undefined && entry.workId !== undefined) {
     const authorization = state.temporaryAuthorizations.find((candidate) => candidate.id === entry.authorizationId)
-    let use = authorization?.uses[authorization.uses.length - 1]
-    while (use !== undefined && use.workId !== entry.workId) {
-      const priorIndex = authorization!.uses.indexOf(use) - 1
-      use = priorIndex < 0 ? undefined : authorization!.uses[priorIndex]
+    // A delayed event may belong to an earlier attempt of this same work.
+    // Later admissions cannot acquire its authorized cost retroactively.
+    let use: TemporaryAuthorizationUse | undefined
+    for (let index = (authorization?.uses.length ?? 0) - 1; index >= 0; index -= 1) {
+      const candidate = authorization!.uses[index]!
+      if (candidate.workId !== entry.workId) continue
+      if (input.authorizationUseId === undefined ? candidate.at > (reservation?.createdAt ?? input.at) : candidate.id !== input.authorizationUseId) continue
+      use = candidate
+      break
     }
     if (use !== undefined) {
       use.usageId ??= entry.id
@@ -462,39 +488,11 @@ export function recordMoneyUsage(
     }
   }
   state.moneyBudget.spentMicros = safeAdd(state.moneyBudget.spentMicros, entry.costMicros, 'company spend')
-  state.tokenBudget.usedTokens = safeAdd(state.tokenBudget.usedTokens, entry.totalTokens, 'legacy token usage')
-  state.tokenBudget.totalCostMicros = safeAdd(state.tokenBudget.totalCostMicros, entry.costMicros, 'legacy token cost')
-  state.tokenBudget.usage.push({
-    id: entry.id,
-    sessionId: entry.sessionId,
-    eventSeq: entry.eventSeq,
-    turn: entry.turn,
-    step: entry.step,
-    employeeId: entry.employeeId,
-    ...(entry.workId === undefined ? {} : { workId: entry.workId }),
-    provider: entry.provider,
-    model: entry.model,
-    inputTokens: entry.inputTokens,
-    outputTokens: entry.outputTokens,
-    cacheReadTokens: entry.cacheReadTokens,
-    cacheWriteTokens: entry.cacheWriteTokens,
-    reasoningTokens: entry.reasoningTokens,
-    totalTokens: entry.totalTokens,
-    costMicros: entry.costMicros,
-    priced: entry.priced,
-    at: entry.at,
-  })
-  if (reservation !== undefined) {
-    const consumedTokens = Math.min(reservation.remainingTokens, entry.totalTokens)
-    reservation.remainingTokens -= consumedTokens
-    const legacy = state.tokenBudget.reservations.find((candidate) => candidate.id === reservation.id)
-    if (legacy !== undefined) {
-      legacy.remainingTokens = Math.max(0, legacy.remainingTokens - consumedTokens)
-      if (legacy.remainingTokens === 0) state.tokenBudget.reservations.splice(state.tokenBudget.reservations.indexOf(legacy), 1)
-    }
-    state.tokenBudget.reservedTokens = Math.max(0, state.tokenBudget.reservedTokens - consumedTokens)
-    const committedMicros = Math.min(reservation.remainingMicros, entry.costMicros)
-    reservation.remainingMicros -= committedMicros
+  if (activeReservation !== undefined) {
+    const consumedTokens = Math.min(activeReservation.remainingTokens, entry.totalTokens)
+    activeReservation.remainingTokens -= consumedTokens
+    const committedMicros = Math.min(activeReservation.remainingMicros, entry.costMicros)
+    activeReservation.remainingMicros -= committedMicros
     state.moneyBudget.reservedMicros = Math.max(0, state.moneyBudget.reservedMicros - committedMicros)
   }
   assertMoneyBudgetInvariant(state)
@@ -568,6 +566,17 @@ function normalizeUnpricedUsage(usage: TokenUsage) {
     inputCacheHitTokens,
     totalTokens: safeAdd(safeAdd(inputCacheMissTokens, inputCacheHitTokens, 'total tokens'), outputTokens, 'total tokens'),
   }
+}
+
+function sumTokenUsage(entries: readonly MoneyUsageEntry[]): TokenUsageTotals {
+  return entries.reduce<TokenUsageTotals>((total, entry) => ({
+    inputTokens: safeAdd(total.inputTokens, entry.inputTokens, 'input token analytics'),
+    outputTokens: safeAdd(total.outputTokens, entry.outputTokens, 'output token analytics'),
+    cacheReadTokens: safeAdd(total.cacheReadTokens, entry.cacheReadTokens, 'cache-read token analytics'),
+    cacheWriteTokens: safeAdd(total.cacheWriteTokens, entry.cacheWriteTokens, 'cache-write token analytics'),
+    reasoningTokens: safeAdd(total.reasoningTokens, entry.reasoningTokens, 'reasoning token analytics'),
+    totalTokens: safeAdd(total.totalTokens, entry.totalTokens, 'total token analytics'),
+  }), { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0, totalTokens: 0 })
 }
 
 function tokenField(value: number | undefined, name: string): number {

@@ -7,13 +7,11 @@ import { companyState } from './fixtures.js'
 test('Web parser accepts the actual Host buildSnapshot projection', () => {
   const state = companyState()
   state.employees[0]!.role = 'CTO'
-  state.employees[0]!.department = 'Engineering'
   state.employees.push(
     {
       id: 'e2',
       name: 'Developer',
       role: 'Software Engineer',
-      department: 'Engineering',
       status: 'idle',
       sessionId: 'developer-session',
       joinedAt: Date.now(),
@@ -71,7 +69,7 @@ test('Web parser accepts the actual Host buildSnapshot projection', () => {
   )
   const parsed = parseCompanySnapshot(wire)
 
-  assert.equal(parsed.schema_version, 4)
+  assert.equal(parsed.schema_version, 5)
   assert.equal(parsed.company.founder_session_id, 'founder-session')
   assert.equal(parsed.employees[0]?.session_id, 'employee-session')
   assert.equal(parsed.employees[0]?.department, 'Engineering')

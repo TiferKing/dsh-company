@@ -6,11 +6,9 @@ import type {
   ResolvedCompanyConfig,
 } from './types.js'
 import { normalizeMultilineString } from './paths.js'
-import { adjustBudgetTotal } from './budget.js'
-import { adjustTokenBudget, replaceTokenPrices } from './tokens.js'
 import { adjustMoneyBudgetTotal, pricingMatrixDigest, replaceModelPrices, resolveRateSnapshot } from './money.js'
-import { validateApprovalPayload, isRecord, normalizeCurrency, normalizeModelPrices, normalizeTokenPrices } from './schemas.js'
-import type { ModelPriceInput, TokenPriceInput } from './types.js'
+import { validateApprovalPayload, isRecord, normalizeCurrency, normalizeModelPrices } from './schemas.js'
+import type { ModelPriceInput } from './types.js'
 
 export interface ApprovalResolutionInput {
   approvalId: string
@@ -33,6 +31,7 @@ export function createApproval(
     requestedFromUserMessageId?: string
   },
 ): ApprovalRequest {
+  expirePendingApprovals(state)
   const pending = state.approvals.filter((approval) => approval.status === 'pending').length
   if (pending >= state.limits.maxPendingApprovals) throw new Error(`pending approval cap ${state.limits.maxPendingApprovals} reached`)
   const summary = input.summary.normalize('NFC').trim()
@@ -60,6 +59,25 @@ export function createApproval(
   return approval
 }
 
+export function expirePendingApprovals(state: CompanyState, now = Date.now()): number {
+  let expired = 0
+  for (const approval of state.approvals) {
+    if (approval.status !== 'pending' || approval.expiresAt === undefined || approval.expiresAt > now) continue
+    approval.status = 'expired'
+    approval.resolvedAt = now
+    if (approval.kind === 'organization_change' && isRecord(approval.payload) && typeof approval.payload.staffingRequestId === 'string') {
+      const staffingRequestId = approval.payload.staffingRequestId
+      const request = state.staffingRequests.find((candidate) => candidate.id === staffingRequestId && candidate.approvalId === approval.id)
+      if (request !== undefined && request.status === 'recommended') {
+        request.status = 'rejected'
+        request.updatedAt = now
+      }
+    }
+    expired += 1
+  }
+  return expired
+}
+
 export function resolveApproval(
   state: CompanyState,
   config: ResolvedCompanyConfig,
@@ -68,8 +86,7 @@ export function resolveApproval(
   const approval = requireApproval(state, input.approvalId)
   if (approval.status !== 'pending') throw new Error(`approval ${approval.id} is already ${approval.status}; terminal approvals are immutable`)
   if (approval.expiresAt !== undefined && approval.expiresAt <= Date.now()) {
-    approval.status = 'expired'
-    approval.resolvedAt = Date.now()
+    expirePendingApprovals(state)
     return { approval, applied: false, stale: false }
   }
   const statement = input.humanStatement?.trim()
@@ -145,11 +162,7 @@ function approvalPreconditionError(state: CompanyState, approval: ApprovalReques
       if (approval.payload.companyId !== state.id) return 'company id changed'
       return undefined
     case 'budget_change':
-      return approval.payload.expectedTotalMicros !== undefined
-        ? approval.payload.expectedTotalMicros === state.moneyBudget.totalMicros ? undefined : 'money budget total changed'
-        : approval.payload.expectedTotalTokens !== undefined
-          ? approval.payload.expectedTotalTokens === state.tokenBudget.totalTokens ? undefined : 'token budget total changed'
-          : approval.payload.expectedTotalCredits === state.budget.totalCredits ? undefined : 'legacy budget total changed'
+      return approval.payload.expectedTotalMicros === state.moneyBudget.totalMicros ? undefined : 'money budget total changed'
     case 'pricing_change':
       if (approval.payload.expectedCurrency !== state.moneyBudget.currency) return 'money budget currency changed'
       if (approval.payload.expectedPricingRevision !== state.moneyBudget.pricingRevision) return 'pricing revision changed'
@@ -164,7 +177,10 @@ function approvalPreconditionError(state: CompanyState, approval: ApprovalReques
       }
       return undefined
     case 'organization_change': {
-      if (approval.payload.action === 'remove') {
+      const staffingRequestId = approval.payload.staffingRequestId
+      const request = typeof staffingRequestId === 'string' ? state.staffingRequests.find((candidate) => candidate.id === staffingRequestId) : undefined
+      if (request === undefined || request.approvalId !== approval.id || request.status !== 'recommended') return 'staffing recommendation is no longer current'
+      if (approval.payload.action === 'adjust' || approval.payload.action === 'retire' || approval.payload.action === 'remove') {
         const employeeId = approval.payload.employeeId
         if (typeof employeeId !== 'string' || !state.employees.some((employee) => employee.id === employeeId && employee.status !== 'retired')) return 'target employee is no longer active'
       }
@@ -196,33 +212,21 @@ function approvalPreconditionError(state: CompanyState, approval: ApprovalReques
 function applyApprovedPayload(state: CompanyState, config: ResolvedCompanyConfig, approval: ApprovalRequest): boolean {
   if (!isRecord(approval.payload)) throw new Error('approval payload must be an object')
   switch (approval.kind) {
-    case 'budget_change':
-      if (approval.payload.newTotalMicros !== undefined) {
-        const total = approval.payload.newTotalMicros as number
-        if (total > config.maxMoneyBudgetMicros) throw new Error(`money budget exceeds configured maximum ${config.maxMoneyBudgetMicros}`)
-        if (state.moneyBudget.migrationRequired === true && approval.payload.legacyTreatment !== 'accepted') {
-          throw new Error('financial migration remediation must explicitly accept the preserved v0.2 ledger treatment')
-        }
-        applyMoneyAllocations(state, approval.payload.productAllocations, approval.payload.employeeAllocations)
-        adjustMoneyBudgetTotal(state, total)
-        if (approval.payload.legacyTreatment === 'accepted' && state.moneyBudget.legacyV02 !== undefined) {
-          state.moneyBudget.legacyV02.treatment = 'accepted'
-        }
-        tryCompleteFinancialMigration(state)
-      } else if (approval.payload.newTotalTokens !== undefined) {
-        const total = approval.payload.newTotalTokens as number
-        if (total > config.maxTokenBudget) throw new Error(`token budget exceeds configured maximum ${config.maxTokenBudget}`)
-        adjustTokenBudget(state, total)
-        if (approval.payload.currency !== undefined || approval.payload.prices !== undefined) {
-          const currency = approval.payload.currency === undefined ? state.tokenBudget.currency : normalizeCurrency(approval.payload.currency as string)
-          const prices = approval.payload.prices === undefined ? state.tokenBudget.prices : normalizeTokenPrices(approval.payload.prices as unknown as TokenPriceInput[])
-          replaceTokenPrices(state, currency, prices)
-        }
-      } else {
-        adjustBudgetTotal(state, approval.payload.newTotalCredits as number, config.maxBudgetCredits, approval.id)
+    case 'budget_change': {
+      const total = approval.payload.newTotalMicros as number
+      if (total > config.maxMoneyBudgetMicros) throw new Error(`money budget exceeds configured maximum ${config.maxMoneyBudgetMicros}`)
+      if (state.moneyBudget.migrationRequired === true && approval.payload.legacyTreatment !== 'accepted') {
+        throw new Error('financial migration remediation must explicitly accept the preserved v0.2 ledger treatment')
       }
+      applyMoneyAllocations(state, approval.payload.productAllocations, approval.payload.employeeAllocations)
+      adjustMoneyBudgetTotal(state, total)
+      if (approval.payload.legacyTreatment === 'accepted' && state.moneyBudget.legacyV02 !== undefined) {
+        state.moneyBudget.legacyV02.treatment = 'accepted'
+      }
+      tryCompleteFinancialMigration(state)
       approval.consumedAt = Date.now()
       return true
+    }
     case 'pricing_change': {
       const currency = normalizeCurrency(approval.payload.currency as string)
       if (currency !== state.moneyBudget.currency && (
@@ -325,14 +329,16 @@ function applyMoneyAllocations(state: CompanyState, productRaw: JsonValue | unde
 
 function releaseGateError(state: CompanyState, productId: string): string | undefined {
   const work = state.workItems.filter((item) => item.productId === productId && item.status !== 'cancelled')
-  if (work.some((item) => item.status !== 'completed')) return 'product has unfinished required work'
-  const verifications = work.filter((item) => item.kind === 'verification' && item.status === 'completed')
+  const prerequisites = work.filter((item) => item.kind !== 'release' && item.kind !== 'operations')
+  if (prerequisites.some((item) => item.status !== 'completed')) return 'product has unfinished pre-release work'
+  const verifications = prerequisites.filter((item) => item.kind === 'verification' && item.status === 'completed')
   if (verifications.length === 0) return 'no completed verification work'
-  const reviews = work.filter((item) => item.kind === 'review' && item.status === 'completed' && item.verdict === 'pass')
+  const reviews = prerequisites.filter((item) => item.kind === 'review' && item.status === 'completed' && item.verdict === 'pass')
   if (reviews.length === 0) return 'no completed passing review work'
   for (const review of reviews) {
     const reviewed = review.reviewedWorkId === undefined ? undefined : state.workItems.find((item) => item.id === review.reviewedWorkId)
-    if (reviewed !== undefined && reviewed.assigneeId !== review.assigneeId) return undefined
+    if (reviewed !== undefined && reviewed.productId === productId && reviewed.status === 'completed'
+      && reviewed.assigneeId !== undefined && review.assigneeId !== undefined && reviewed.assigneeId !== review.assigneeId) return undefined
   }
   return 'no independent passing review'
 }

@@ -5,7 +5,7 @@ import { snapshotFixture } from './fixtures/company-snapshot.js'
 
 test('parses the Host projection and normalizes presentation fields', () => {
   const snapshot = parseCompanySnapshot(snapshotFixture())
-  assert.equal(snapshot.schema_version, 4)
+  assert.equal(snapshot.schema_version, 5)
   assert.equal(snapshot.employees[0]?.activity?.state, 'running')
   assert.deepEqual(snapshot.employees[0]?.llm, {
     provider: 'deepseek',
@@ -18,11 +18,13 @@ test('parses the Host projection and normalizes presentation fields', () => {
   assert.equal(snapshot.budget.provider_model_aggregates[0]?.cost_micros, 42)
   assert.equal(snapshot.budget.usage_detail.returned, 1)
   assert.equal(snapshot.temporary_authorizations[0]?.id, 'auth-1')
+  assert.deepEqual(snapshot.work[0]?.acceptance, ['Unit tests'])
+  assert.deepEqual(snapshot.work[0]?.verify, ['pnpm test'])
+  assert.deepEqual(snapshot.work[0]?.deliverables, ['src/widget.ts'])
   assert.deepEqual(snapshot.work[0]?.evidence, {
-    changed_paths: [],
-    acceptance_results: ['Unit tests'],
+    changed_paths: ['src/widget.ts'],
+    acceptance_results: ['Unit tests: pass'],
     commands_run: ['pnpm test'],
-    deliverables: ['src/widget.ts'],
   })
   assert.match(snapshot.approvals[0]?.payload_summary ?? '', /\[redacted\]/)
   assert.equal('attempt_id' in (snapshot.work[0] ?? {}), false)
@@ -64,11 +66,11 @@ test('parses employee-level temporary authorizations with work-specific use audi
   assert.equal(authorization?.uses[0]?.work_id, 'work-1')
 })
 
-test('rejects workload bands or averages that disagree with Host evidence', () => {
-  const wrongBand = snapshotFixture()
-  const units = wrongBand.org_units as Array<Record<string, unknown>>
+test('accepts Host-owned workload bands but rejects inconsistent numeric evidence', () => {
+  const changedPolicy = snapshotFixture()
+  const units = changedPolicy.org_units as Array<Record<string, unknown>>
   ;(units[0]!.load as Record<string, unknown>).band = 'pressure'
-  assert.throws(() => parseCompanySnapshot(wrongBand), /Host-derived normal/)
+  assert.equal(parseCompanySnapshot(changedPolicy).org_units[0]?.load.band, 'pressure')
 
   const wrongAverage = snapshotFixture()
   const wrongUnits = wrongAverage.org_units as Array<Record<string, unknown>>

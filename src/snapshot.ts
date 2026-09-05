@@ -1,10 +1,10 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-agent'
 import { SessionId } from '@deepseek-ai/dsh-session'
-import { availableMoney, employeeMoneyTotals, matchModelPrice, productMoneyTotals } from './money.js'
+import { availableMoney, employeeMoneyTotals, employeeTokenTotals, matchModelPrice, productMoneyTotals, productTokenTotals } from './money.js'
 import { parseCharterClauses } from './charter.js'
-import { employeeTokenTotals, productTokenTotals } from './tokens.js'
 import { temporaryAuthorizationStatus } from './authorizations.js'
+import { COMPANY_SNAPSHOT_SCHEMA_VERSION } from './types.js'
 import type {
   CompanyActor,
   CompanyMessage,
@@ -30,8 +30,13 @@ const FOUNDER_PERMISSIONS = [
 ]
 const EMPLOYEE_PERMISSIONS = ['work.claim-self', 'work.update-self', 'message.send', 'approval.request', 'company.status-filtered']
 const DETAIL_LIMIT = 200
+const HISTORY_LIMIT = 100
+const WORK_DETAIL_LIMIT = 32
+const INBOX_LIMIT = 100
+const MODEL_CATALOG_LIMIT = 1_000
+const RETIRED_EMPLOYEE_LIMIT = 200
 
-/** Build the canonical v0.3 snake_case Host/Web projection. */
+/** Build the canonical schema-v5 snake_case Host/Web projection. */
 export function buildSnapshot(
   ctx: Context,
   state: CompanyState,
@@ -41,11 +46,26 @@ export function buildSnapshot(
 ): CompanySnapshot {
   const now = Date.now()
   const founderView = actor.kind === 'founder'
+  const visibleAuthorizations = state.temporaryAuthorizations.filter((authorization) => founderView || authorization.employeeId === actor.id)
+  const currentAuthorizations = visibleAuthorizations.filter((authorization) => ['active', 'scheduled'].includes(temporaryAuthorizationStatus(authorization, now)))
+  const historicalAuthorizations = visibleAuthorizations.filter((authorization) => !['active', 'scheduled'].includes(temporaryAuthorizationStatus(authorization, now))).slice(-HISTORY_LIMIT)
+  const authorizationRows = [...currentAuthorizations, ...historicalAuthorizations]
   const liveRunning = new Set(state.employees.flatMap((employee) => {
     if (employee.sessionId === undefined) return []
     return ctx.agents.get(SessionId(employee.sessionId))?.status === 'running' ? [employee.id] : []
   }))
-  const employees: SafeEmployeeView[] = state.employees.map((employee) => {
+  // Keep the employee records needed to interpret the visible authorization
+  // audit. Independent history slicing can otherwise create dangling IDs and
+  // make an otherwise valid company snapshot fail client validation.
+  const authorizationEmployeeIds = new Set(authorizationRows.map((authorization) => authorization.employeeId))
+  const retiredEmployees = state.employees.filter((employee) => employee.status === 'retired')
+  const retainedRetired = new Set(retiredEmployees.filter((employee) => authorizationEmployeeIds.has(employee.id)).map((employee) => employee.id))
+  for (const employee of [...retiredEmployees].reverse()) {
+    if (retainedRetired.size >= RETIRED_EMPLOYEE_LIMIT) break
+    retainedRetired.add(employee.id)
+  }
+  const projectedEmployees = state.employees.filter((employee) => employee.status !== 'retired' || retainedRetired.has(employee.id))
+  const employees: SafeEmployeeView[] = projectedEmployees.map((employee) => {
     const live = employee.sessionId === undefined ? undefined : ctx.agents.get(SessionId(employee.sessionId))
     const activity: SafeEmployeeView['activity'] = employee.status === 'retired'
       ? 'retired'
@@ -55,6 +75,7 @@ export function buildSnapshot(
           ? 'idle'
           : 'ready'
     const showPrivate = founderView || employee.id === actor.id
+    const orgUnitName = employee.orgUnitId === undefined ? undefined : state.orgUnits.find((unit) => unit.id === employee.orgUnitId)?.name
     const tokenUsage = employeeTokenTotals(state, employee.id)
     const money = employeeMoneyTotals(state, employee.id)
     const employeeMoneyUsage = state.moneyBudget.usage.filter((entry) => entry.employeeId === employee.id)
@@ -64,7 +85,7 @@ export function buildSnapshot(
       id: employee.id,
       name: employee.name,
       role: employee.role,
-      ...(employee.department === undefined ? {} : { department: employee.department }),
+      ...(orgUnitName === undefined ? {} : { department: orgUnitName }),
       ...(employee.orgUnitId === undefined ? {} : { org_unit_id: employee.orgUnitId }),
       ...(employee.positionId === undefined ? {} : { position_id: employee.positionId }),
       ...(employee.isHr === undefined ? {} : { is_hr: employee.isHr }),
@@ -102,26 +123,47 @@ export function buildSnapshot(
     }
   })
 
-  const orgUnits = state.orgUnits.map((unit) => ({
+  const requiredOrgIds = new Set<string>([
+    ...state.orgUnits.filter((unit) => unit.parentId === undefined).map((unit) => unit.id),
+    ...state.employees.filter((employee) => employee.status !== 'retired').flatMap((employee) => employee.orgUnitId === undefined ? [] : [employee.orgUnitId]),
+    ...state.workItems.filter((work) => !['completed', 'failed', 'cancelled'].includes(work.status)).flatMap((work) => work.eligibleOrgUnitIds ?? []),
+    ...state.orgUnits.slice(-HISTORY_LIMIT).map((unit) => unit.id),
+  ])
+  for (const unitId of [...requiredOrgIds]) {
+    let unit = state.orgUnits.find((candidate) => candidate.id === unitId)
+    const seen = new Set<string>()
+    while (unit?.parentId !== undefined && !seen.has(unit.id)) {
+      seen.add(unit.id)
+      requiredOrgIds.add(unit.parentId)
+      unit = state.orgUnits.find((candidate) => candidate.id === unit!.parentId)
+    }
+  }
+  const projectedOrgUnits = state.orgUnits.filter((unit) => requiredOrgIds.has(unit.id))
+  const activePositionIds = new Set(state.employees.filter((employee) => employee.status !== 'retired').flatMap((employee) => employee.positionId === undefined ? [] : [employee.positionId]))
+  const recentPositionIds = new Set(state.positions.slice(-HISTORY_LIMIT).map((position) => position.id))
+  const projectedPositions = state.positions.filter((position) => requiredOrgIds.has(position.orgUnitId) && (activePositionIds.has(position.id) || recentPositionIds.has(position.id)))
+  const orgUnits = projectedOrgUnits.map((unit) => ({
     id: unit.id,
     name: unit.name,
     kind: unit.kind,
     ...(unit.parentId === undefined ? {} : { parent_id: unit.parentId }),
-    ...(unit.description === undefined ? {} : { description: unit.description }),
+    ...(unit.description === undefined ? {} : { description: bounded(unit.description, 1_024) }),
     ...(unit.managerEmployeeId === undefined ? {} : { manager_employee_id: unit.managerEmployeeId }),
-    child_ids: state.orgUnits.filter((candidate) => candidate.parentId === unit.id).map((candidate) => candidate.id),
-    position_ids: state.positions.filter((position) => position.orgUnitId === unit.id).map((position) => position.id),
+    child_ids: projectedOrgUnits.filter((candidate) => candidate.parentId === unit.id).map((candidate) => candidate.id),
+    position_ids: projectedPositions.filter((position) => position.orgUnitId === unit.id).map((position) => position.id),
     load: orgLoad(state, unit.id, liveRunning),
   }))
-  const positions = state.positions.map((position) => ({
+  const positions = projectedPositions.map((position) => ({
     id: position.id,
     title: position.title,
     org_unit_id: position.orgUnitId,
     ...(position.reportsToPositionId === undefined ? {} : { reports_to_position_id: position.reportsToPositionId }),
-    responsibilities: [...position.responsibilities],
+    responsibilities: boundedItems(position.responsibilities, 16, 1_024),
     employee_ids: state.employees.filter((employee) => employee.positionId === position.id && employee.status !== 'retired').map((employee) => employee.id),
   }))
-  const staffingRequests = (founderView ? state.staffingRequests : []).map((request) => ({
+  const activeStaffing = state.staffingRequests.filter((request) => !['rejected', 'applied'].includes(request.status))
+  const recentStaffing = state.staffingRequests.filter((request) => ['rejected', 'applied'].includes(request.status)).slice(-HISTORY_LIMIT)
+  const staffingRequests = (founderView ? [...activeStaffing, ...recentStaffing] : []).map((request) => ({
     id: request.id,
     action: request.action,
     status: request.status,
@@ -129,7 +171,19 @@ export function buildSnapshot(
     ...(request.employeeId === undefined ? {} : { employee_id: request.employeeId }),
     work_profile: request.workProfile,
     hr_employee_id: request.hrEmployeeId,
-    ...(request.recommendation === undefined ? {} : { recommendation: structuredClone(request.recommendation) }),
+    ...(request.recommendation === undefined ? {} : { recommendation: {
+      difficulty: request.recommendation.difficulty,
+      provider: request.recommendation.provider,
+      model: request.recommendation.model,
+      ...(request.recommendation.reasoningEffort === undefined ? {} : { reasoningEffort: request.recommendation.reasoningEffort }),
+      ...(request.recommendation.budgetMicros === undefined ? {} : { budgetMicros: request.recommendation.budgetMicros }),
+      rationale: bounded(request.recommendation.rationale, 2_048),
+      orgPath: request.recommendation.orgPath.slice(0, 16),
+      positionTitle: bounded(request.recommendation.positionTitle, 512),
+      responsibilities: boundedItems(request.recommendation.responsibilities, 16, 1_024),
+      ...(request.recommendation.designateAsHr === undefined ? {} : { designateAsHr: request.recommendation.designateAsHr }),
+      assessedAt: request.recommendation.assessedAt,
+    } }),
     ...(request.approvalId === undefined ? {} : { approval_id: request.approvalId }),
     created_at: request.createdAt,
     updated_at: request.updatedAt,
@@ -141,15 +195,12 @@ export function buildSnapshot(
     return {
       id: product.id,
       name: product.name,
-      summary: bounded(product.summary, 16_384),
+      summary: bounded(product.summary, 8_192),
       status: product.status,
       product_root: product.productRoot,
-      success_criteria: [...product.successCriteria],
-      budget_credits: product.budgetCredits,
-      token_budget: product.tokenBudget,
+      success_criteria: boundedItems(product.successCriteria, 32, 1_024),
       token_used: tokenUsage.totalTokens,
-      cost_micros: money.spentMicros,
-      budget_micros: product.budgetMicros ?? 0,
+      budget_micros: product.budgetMicros,
       spent_micros: money.spentMicros,
       reserved_micros: money.reservedMicros,
       available_micros: money.availableMicros,
@@ -161,18 +212,20 @@ export function buildSnapshot(
     }
   })
 
+  const recentWorkIds = new Set(state.workItems.slice(-WORK_DETAIL_LIMIT).map((item) => item.id))
   const work: SafeWorkView[] = state.workItems.map((item) => {
     const blockerEmployeeId = item.assigneeId !== undefined && item.assigneeId !== 'founder'
       ? item.assigneeId
       : actor.kind === 'employee' ? actor.id : undefined
     const blockedReasons = item.status === 'pending' ? workBlockedReasons(state, item, blockerEmployeeId, now) : []
     const canSeePrivate = founderView || item.assigneeId === actor.id
+    const showDetail = canSeePrivate && (recentWorkIds.has(item.id) || item.status === 'claimed' || item.status === 'in_progress')
     return {
       id: item.id,
       product_id: item.productId,
       kind: item.kind,
       subject: item.subject,
-      objective: item.objective,
+      ...(showDetail ? { objective: bounded(item.objective, 8_192) } : {}),
       status: item.status,
       blocked: blockedReasons.length > 0,
       blocked_reasons: blockedReasons,
@@ -181,33 +234,36 @@ export function buildSnapshot(
       dependencies: [...item.dependencies],
       approval_dependencies: [...(item.approvalDependencies ?? [])],
       attempt: item.attempt,
-      ...(item.output === undefined ? {} : { output: bounded(item.output, founderView ? state.limits.maxOutputChars : 16_384) }),
-      ...(item.verdict === undefined ? {} : { verdict: item.verdict }),
-      ...(item.findings === undefined ? {} : {
-        findings: item.findings.map((finding) => ({
+      ...(!showDetail || item.output === undefined ? {} : { output: bounded(item.output, founderView ? Math.min(state.limits.maxOutputChars, 32_768) : 16_384) }),
+      ...(!showDetail || item.verdict === undefined ? {} : { verdict: item.verdict }),
+      ...(!showDetail || item.findings === undefined ? {} : {
+        findings: item.findings.slice(-8).map((finding) => ({
           id: finding.id,
           severity: finding.severity,
           ...(finding.file === undefined ? {} : { file: finding.file }),
           ...(finding.line === undefined ? {} : { line: finding.line }),
-          problem: finding.problem,
-          required_fix: finding.requiredFix,
+          problem: bounded(finding.problem, 1_024),
+          required_fix: bounded(finding.requiredFix, 1_024),
         })),
       }),
-      ...(canSeePrivate ? {
-        acceptance: [...item.acceptance],
-        verify: [...item.verify],
-        deliverables: [...item.deliverables],
-        changed_paths: [...(item.evidence?.changedPaths ?? [])],
-        acceptance_results: [...(item.evidence?.acceptanceResults ?? [])],
-        commands_run: [...(item.evidence?.commandsRun ?? [])],
+      ...(showDetail ? {
+        acceptance: boundedItems(item.acceptance, 8, 1_024),
+        verify: boundedItems(item.verify, 8, 1_024),
+        deliverables: boundedItems(item.deliverables, 8, 1_024),
+        changed_paths: boundedItems(item.evidence?.changedPaths ?? [], 32, 1_024),
+        acceptance_results: boundedItems(item.evidence?.acceptanceResults ?? [], 8, 1_024),
+        commands_run: boundedItems(item.evidence?.commandsRun ?? [], 8, 1_024),
       } : {}),
       created_at: item.createdAt,
       updated_at: item.updatedAt,
     }
   })
 
-  const approvals: SafeApprovalView[] = state.approvals
+  const visibleApprovals = state.approvals
     .filter((approval) => founderView || approval.requestedBy === actor.id || (approval.status === 'approved' && (approval.kind === 'release' || approval.kind === 'external_effect')))
+  const pendingApprovals = visibleApprovals.filter((approval) => approval.status === 'pending')
+  const historicalApprovals = visibleApprovals.filter((approval) => approval.status !== 'pending').slice(-HISTORY_LIMIT)
+  const approvals: SafeApprovalView[] = [...pendingApprovals, ...historicalApprovals]
     .sort((left, right) => statusRank(left.status) - statusRank(right.status) || right.requestedAt - left.requestedAt)
     .map((approval) => ({
       id: approval.id,
@@ -233,14 +289,15 @@ export function buildSnapshot(
 
   const safeInbox: SafeMessageView[] = inbox
     .filter((message) => actor.kind === 'founder' ? message.to === 'founder' : message.to === actor.id)
+    .slice(-INBOX_LIMIT)
     .map((message) => ({
       id: message.id,
       from: message.from,
       to: message.to,
-      content: bounded(message.content, state.limits.maxMessageChars),
+      content: bounded(message.content, Math.min(state.limits.maxMessageChars, 16_384)),
       created_at: message.createdAt,
+      ...(message.attempts === undefined ? {} : { attempts: message.attempts }),
       delivery_state: message.deliveryState,
-      ...(message.readAt === undefined ? {} : { read_at: message.readAt }),
     }))
 
   const visibleUsage = founderView ? state.moneyBudget.usage : state.moneyBudget.usage.filter((entry) => entry.employeeId === actor.id)
@@ -251,18 +308,35 @@ export function buildSnapshot(
   const warnings: string[] = []
   if (available <= (state.moneyBudget.warningAtMicros ?? 0)) warnings.push('Monetary budget is at or below its warning threshold.')
   if (state.modelCatalog.models.some((model) => matchModelPrice(state.moneyBudget.prices, model.provider, model.model) === undefined)) warnings.push('Some model routes are unpriced and normally blocked; an active temporary authorization may admit them only as unknown cost, never as free usage.')
-  if (visibleUsage.some((entry) => !entry.priced)) warnings.push('Legacy unpriced usage remains visible as unverified token/event counts and is not treated as a configured zero-cost route.')
+  if (visibleUsage.some((entry) => !entry.priced)) warnings.push('Unpriced usage remains visible as unknown-cost token/event counts and is never treated as a configured zero-cost route.')
   if (state.moneyBudget.migrationRequired === true) warnings.push('Financial migration review is required before work can resume.')
   if (state.phase === 'provisioning_failed') warnings.push('Employee provisioning failed; fix the route or capacity issue before retrying approval.')
   if (state.phase === 'paused') warnings.push('The company is paused; automatic work admission is disabled.')
   if (state.phase === 'halted') warnings.push(`The company halted automatically: ${state.health.detail ?? state.health.reason ?? 'operational failure'}. Manual resume is available after correction.`)
   else if (state.health.status === 'degraded') warnings.push(`Some employees are operationally blocked: ${state.health.detail ?? state.health.reason ?? 'operational failure'}. Manual resume is available after correction.`)
+  if (state.workItems.length > WORK_DETAIL_LIMIT) warnings.push(`Full contracts and evidence are included only for the newest ${WORK_DETAIL_LIMIT} work items and every currently open attempt.`)
+  if (state.staffingRequests.length > staffingRequests.length) warnings.push(`Staffing history is limited to the newest ${HISTORY_LIMIT} terminal requests.`)
+  if (visibleApprovals.length > approvals.length) warnings.push(`Approval history is limited to the newest ${HISTORY_LIMIT} terminal requests.`)
+  if (visibleAuthorizations.length > authorizationRows.length) warnings.push(`Temporary authorization history is limited to the newest ${HISTORY_LIMIT} terminal records.`)
+  if (state.tickets.filter((ticket) => ticket.status === 'closed').length > HISTORY_LIMIT) warnings.push(`Closed ticket history is limited to the newest ${HISTORY_LIMIT} records.`)
+  if (state.orgUnits.length > projectedOrgUnits.length || state.positions.length > projectedPositions.length) warnings.push(`Organization history keeps active references plus the newest ${HISTORY_LIMIT} units and positions.`)
 
-  const tickets: SafeTicketView[] = state.tickets.map((ticket) => ({
+  const requiredModelKeys = new Set([
+    ...state.employees.flatMap((employee) => [`${employee.llm.provider}\u0000${employee.llm.model}`, ...(employee.llm.fallback === undefined ? [] : [`${employee.llm.fallback.provider}\u0000${employee.llm.fallback.model}`])]),
+    ...state.moneyBudget.prices.filter((price) => price.model !== '*').map((price) => `${price.provider}\u0000${price.model}`),
+  ])
+  const modelCatalogRows = [...state.modelCatalog.models]
+    .sort((left, right) => Number(requiredModelKeys.has(`${right.provider}\u0000${right.model}`)) - Number(requiredModelKeys.has(`${left.provider}\u0000${left.model}`)))
+    .slice(0, MODEL_CATALOG_LIMIT)
+  if (state.modelCatalog.models.length > modelCatalogRows.length) warnings.push(`Model catalog projection is limited to ${MODEL_CATALOG_LIMIT} routes; active and priced routes are prioritized.`)
+
+  const activeTickets = state.tickets.filter((ticket) => ticket.status !== 'closed')
+  const recentClosedTickets = state.tickets.filter((ticket) => ticket.status === 'closed').slice(-HISTORY_LIMIT)
+  const tickets: SafeTicketView[] = [...activeTickets, ...recentClosedTickets].map((ticket) => ({
     id: ticket.id,
     product_id: ticket.productId,
     title: ticket.title,
-    description: bounded(ticket.description, 16_384),
+    description: bounded(ticket.description, 4_096),
     reported_by: ticket.reportedBy,
     reported_at: ticket.reportedAt,
     status: ticket.status,
@@ -270,12 +344,12 @@ export function buildSnapshot(
     ...(ticket.workItemId === undefined ? {} : { work_item_id: ticket.workItemId }),
     ...(ticket.assigneeId === undefined ? {} : { assignee_id: ticket.assigneeId }),
     ...(ticket.resolvedAt === undefined ? {} : { resolved_at: ticket.resolvedAt }),
-    ...(ticket.reply === undefined ? {} : { reply: bounded(ticket.reply, 16_384) }),
+    ...(ticket.reply === undefined ? {} : { reply: bounded(ticket.reply, 8_192) }),
     ...(ticket.closedAt === undefined ? {} : { closed_at: ticket.closedAt }),
   }))
 
   return {
-    schema_version: 4,
+    schema_version: COMPANY_SNAPSHOT_SCHEMA_VERSION,
     revision: state.revision,
     viewer: {
       role: actor.kind,
@@ -292,7 +366,6 @@ export function buildSnapshot(
       governance_revision: state.governanceRevision,
       formation_status: state.formation.status,
       phase: state.phase,
-      ...(state.planReviewState === undefined ? {} : { plan_review_state: state.planReviewState }),
       updated_at: state.updatedAt,
       ...(actor.kind === 'founder' ? { founder_session_id: state.founderSessionId } : {}),
       health: {
@@ -345,15 +418,19 @@ export function buildSnapshot(
       generation: state.modelCatalog.generation,
       ...(state.modelCatalog.probedAt === undefined ? {} : { probed_at: state.modelCatalog.probedAt }),
       ...(state.modelCatalog.invalidatedAt === undefined ? {} : { invalidated_at: state.modelCatalog.invalidatedAt }),
-      models: state.modelCatalog.models.map((model) => ({
+      models: modelCatalogRows.map((model) => ({
         provider: model.provider,
         model: model.model,
         name: model.name,
-        ...(model.description === undefined ? {} : { description: model.description }),
-        ...(model.inputModalities === undefined ? {} : { input_modalities: [...model.inputModalities] }),
+        ...(model.description === undefined ? {} : { description: bounded(model.description, 1_024) }),
+        ...(model.inputModalities === undefined ? {} : { input_modalities: model.inputModalities.slice(0, 16) }),
         ...(model.contextWindow === undefined ? {} : { context_window: model.contextWindow }),
         ...(model.defaultMaxTokens === undefined ? {} : { default_max_tokens: model.defaultMaxTokens }),
-        ...(model.reasoningEfforts === undefined ? {} : { reasoning_efforts: structuredClone(model.reasoningEfforts) }),
+        ...(model.reasoningEfforts === undefined ? {} : { reasoning_efforts: model.reasoningEfforts.slice(0, 8).map((effort) => ({
+          id: bounded(effort.id, 128),
+          name: bounded(effort.name, 256),
+          ...(effort.description === undefined ? {} : { description: bounded(effort.description, 512) }),
+        })) }),
         ...(model.defaultReasoningEffort === undefined ? {} : { default_reasoning_effort: model.defaultReasoningEffort }),
         advertised: model.advertised,
         available: model.available,
@@ -363,18 +440,17 @@ export function buildSnapshot(
         message: redactDiagnostic(error.message, 4096),
       })),
     },
-    temporary_authorizations: state.temporaryAuthorizations
-      .filter((authorization) => founderView || authorization.employeeId === actor.id)
+    temporary_authorizations: authorizationRows
       .map((authorization) => ({
         id: authorization.id,
         employee_id: authorization.employeeId,
         reason: authorization.reason,
-        ...(authorization.approvalId === undefined ? {} : { approval_id: authorization.approvalId }),
+        approval_id: authorization.approvalId,
         authorized_by: authorization.authorizedBy,
         starts_at: authorization.startsAt,
         expires_at: authorization.expiresAt,
         status: temporaryAuthorizationStatus(authorization, now),
-        uses: authorization.uses.map((use) => ({
+        uses: authorization.uses.slice(-DETAIL_LIMIT).map((use) => ({
           id: use.id,
           at: use.at,
           work_id: use.workId,
@@ -518,6 +594,10 @@ function redactDiagnostic(value: string, max: number): string {
 
 function statusRank(status: string): number {
   return status === 'pending' ? 0 : 1
+}
+
+function boundedItems(values: readonly string[], maxItems: number, maxChars: number): string[] {
+  return values.slice(0, maxItems).map((value) => bounded(value, maxChars))
 }
 
 function bounded(value: string, max: number): string {

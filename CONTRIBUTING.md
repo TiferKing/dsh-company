@@ -9,13 +9,13 @@ pnpm install
 pnpm verify   # typecheck + test + build + package:check — the same gate CI runs
 ```
 
-Node `^22.19 || >=24`, pnpm 10.
+Node `>=24.11`, pnpm 11.25 (the packed runtime remains compatible with Node `^22.19 || >=24`).
 
 ## Ground rules
 
 1. **Every change goes through `pnpm verify`.** CI runs exactly this; a red local run means a red PR.
 2. **Money is integer micro-currency.** Never route amounts through binary floating point; use the existing decimal→micro helpers. One aggregate BigInt rounding per entry, never per-category.
-3. **Security invariants are load-bearing.** If your change touches admission, reservations, the HTTP routes, tool filters, or snapshot projection, read `docs/architecture.md` §0 first and extend the tests that pin those fences:
+3. **Security invariants are load-bearing.** If your change touches admission, reservations, the HTTP routes, tool filters, or snapshot projection, read [the architecture](docs/architecture.md), especially sections 5–9, and extend the tests that pin those fences:
    - unpriced routes block admission unless covered by a temporary authorization;
    - remote web clients are read-only and fail closed;
    - snapshots never leak attempt capabilities, execution prompts, or credentials;

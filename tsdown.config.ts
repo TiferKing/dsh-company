@@ -11,7 +11,7 @@ const host = {
   target: 'es2022',
   clean: false,
   dts: false,
-  sourcemap: true,
+  sourcemap: false,
   tsconfig: 'tsconfig.json',
   deps: {
     neverBundle: [/^@deepseek-ai\//, /^react(?:\/|$)/],
@@ -34,7 +34,7 @@ const client = {
   target: 'es2022',
   clean: false,
   dts: false,
-  sourcemap: true,
+  sourcemap: false,
   tsconfig: 'tsconfig.client.json',
   checks: { legacyCjs: false },
   deps: {

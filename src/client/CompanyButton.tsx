@@ -1,4 +1,3 @@
-import { useEffect } from 'react'
 import type { CompanyButtonProps } from './contracts.js'
 import { BuildingIcon } from './icons.js'
 import { phaseLabel, useCompanyState, useLocaleSnapshot } from './ui.js'
@@ -7,10 +6,6 @@ import { phaseLabel, useCompanyState, useLocaleSnapshot } from './ui.js'
 export function CompanyButton({ sessionId, controller, locale, t }: CompanyButtonProps): React.JSX.Element | null {
   const state = useCompanyState(controller)
   useLocaleSnapshot(locale)
-
-  useEffect(() => {
-    controller.setCurrentSession(sessionId)
-  }, [controller, sessionId])
 
   if (state.sessionId !== sessionId || state.snapshot === undefined) return null
   const { snapshot } = state

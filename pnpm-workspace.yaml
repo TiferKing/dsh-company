@@ -3,3 +3,5 @@ packages:
 
 allowBuilds:
   esbuild: true
+
+storeDir: .pnpm-store

@@ -1,4 +1,6 @@
+import { createHash } from 'node:crypto'
 import type { IncomingMessage, ServerResponse } from 'node:http'
+import { isIP } from 'node:net'
 import type { Context } from '@deepseek-ai/cordis'
 import { SessionId } from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-host-webserver'
@@ -15,12 +17,12 @@ export function installCompanyRoutes(ctx: Context, runtime: CompanyRuntime, conf
       yield webCtx.webServer.register({
         kind: 'exact',
         path: STATE_PATH,
-        handler: (req, res) => safeHandler(req, res, () => handleSnapshot(webCtx, runtime, config, req, res)),
+        handler: (req, res) => safeHandler(res, () => handleSnapshot(webCtx, runtime, config, req, res)),
       })
       yield webCtx.webServer.register({
         kind: 'exact',
         path: ACTION_PATH,
-        handler: (req, res) => safeHandler(req, res, () => handleAction(webCtx, runtime, config, req, res)),
+        handler: (req, res) => safeHandler(res, () => handleAction(webCtx, runtime, config, req, res)),
       })
     }, 'dsh-company: snapshot and action routes')
   })
@@ -64,7 +66,15 @@ async function handleSnapshot(ctx: Context, runtime: CompanyRuntime, config: Res
       throw error
     }
   }
-  json(res, 200, snapshot)
+  // Live agent activity, inbox delivery and time-based blockers may change
+  // without a durable company revision. Validate the actual representation.
+  const etag = `"${createHash('sha256').update(JSON.stringify(snapshot)).digest('base64url')}"`
+  if (req.headers['if-none-match'] === etag) {
+    res.writeHead(304, { etag, 'cache-control': 'private, no-cache' })
+    res.end()
+    return
+  }
+  json(res, 200, snapshot, { etag, 'cache-control': 'private, no-cache' })
 }
 
 function downgradeSnapshotToReadonlyWeb(snapshot: CompanySnapshot): void {
@@ -102,7 +112,7 @@ export async function handleAction(
   res: ServerResponse,
 ): Promise<void> {
   if (req.method !== 'POST') return json(res, 405, { error: 'method_not_allowed', message: 'action requires POST' }, { allow: 'POST' })
-  assertUiTransport(req, config)
+  assertUiTransport(req, config, true)
   const request = parseActionRequest(await readJsonBody(req))
   const snapshot = await executeUiAction(ctx, runtime, request, { remote: isRemoteUiRequest(req) })
   json(res, 200, snapshot)
@@ -129,9 +139,25 @@ export async function executeUiAction(
   return runtime.handleUiAction(agent, request)
 }
 
-/** True when the request arrives from a non-loopback socket. */
-export function isRemoteUiRequest(req: { socket: { remoteAddress?: string } }): boolean {
-  return !isLoopback(normalizeAddress(req.socket.remoteAddress))
+/**
+ * True when the socket is remote, or when a loopback reverse proxy explicitly
+ * reports a remote client. Forwarding headers can only make the decision more
+ * restrictive; they can never turn a remote socket into a local one.
+ */
+export function isRemoteUiRequest(req: { socket: { remoteAddress?: string }; headers?: Record<string, string | string[] | undefined> }): boolean {
+  if (!isLoopback(normalizeAddress(req.socket.remoteAddress))) return true
+  const forwardedFor = req.headers?.['x-forwarded-for']
+  const forwardedAddresses = (Array.isArray(forwardedFor) ? forwardedFor : [forwardedFor])
+    .flatMap((value) => value?.split(',') ?? []).map((value) => value.trim())
+  // Proxies commonly append the actual client address to an existing header.
+  // An attacker-controlled first hop must never hide a later remote hop.
+  if (forwardedAddresses.some((address) => !isLoopback(normalizeAddress(address.replace(/^\[|\]$/gu, ''))))) return true
+  const forwarded = req.headers?.forwarded
+  for (const hop of (Array.isArray(forwarded) ? forwarded : [forwarded]).flatMap((value) => value?.split(',') ?? [])) {
+    const match = /(?:^|;)\s*for=(?:"?)(\[[^\]]+\]|[^;"\s]+)/iu.exec(hop)
+    if (match?.[1] !== undefined && !isLoopback(normalizeAddress(match[1].replace(/^\[|\]$/gu, '')))) return true
+  }
+  return false
 }
 
 async function readJsonBody(req: IncomingMessage, maxBytes = 1_048_576): Promise<unknown> {
@@ -178,38 +204,24 @@ function validateActionPayload(action: CompanyUiActionName, payload: Record<stri
       requireNonBlank(payload.confirmation, 'approve_bootstrap confirmation')
       return
     case 'edit_formation': {
-      const allowed = new Set(['name', 'slogan', 'mission', 'charter', 'first_product', 'total_budget', 'total_token_budget', 'currency', 'model_prices', 'prices'])
+      const allowed = new Set(['name', 'slogan', 'mission', 'charter', 'first_product', 'total_budget', 'currency', 'model_prices', 'hr_name', 'hr_provider', 'hr_model', 'hr_reasoning_effort'])
       assertClosed(payload, allowed, `${action} payload`)
       if (Object.keys(payload).length === 0) throw new HttpError(400, 'invalid_request', 'edit_formation payload must change at least one field')
-      for (const key of ['name', 'slogan', 'mission', 'charter', 'currency']) if (payload[key] !== undefined) requireNonBlank(payload[key], `edit_formation ${key}`)
+      for (const key of ['name', 'slogan', 'mission', 'charter', 'currency', 'hr_name', 'hr_provider', 'hr_model', 'hr_reasoning_effort']) if (payload[key] !== undefined) requireNonBlank(payload[key], `edit_formation ${key}`)
+      if ((payload.hr_provider === undefined) !== (payload.hr_model === undefined)) throw new HttpError(400, 'invalid_request', 'hr_provider and hr_model must be supplied together')
       if (payload.total_budget !== undefined) validateHumanMoney(payload.total_budget, 'total_budget')
-      if (payload.total_token_budget !== undefined && (!Number.isSafeInteger(payload.total_token_budget) || (payload.total_token_budget as number) < 1)) throw new HttpError(400, 'invalid_request', 'total_token_budget must be a positive safe integer')
       if (payload.first_product !== undefined) {
         if (!isRecord(payload.first_product)) throw new HttpError(400, 'invalid_request', 'first_product must be an object')
-        assertClosed(payload.first_product, new Set(['name', 'summary', 'product_root', 'success_criteria', 'product_budget', 'token_budget']), 'first_product')
+        assertClosed(payload.first_product, new Set(['name', 'summary', 'product_root', 'success_criteria', 'product_budget']), 'first_product')
         for (const key of ['name', 'summary', 'product_root']) if (payload.first_product[key] !== undefined) requireNonBlank(payload.first_product[key], `first_product ${key}`)
         if (payload.first_product.success_criteria !== undefined && (!Array.isArray(payload.first_product.success_criteria) || payload.first_product.success_criteria.some((item) => typeof item !== 'string' || item.trim() === ''))) throw new HttpError(400, 'invalid_request', 'success_criteria must contain non-blank strings')
         if (payload.first_product.product_budget !== undefined) validateHumanMoney(payload.first_product.product_budget, 'first_product product_budget')
-        if (payload.first_product.token_budget !== undefined && (!Number.isSafeInteger(payload.first_product.token_budget) || (payload.first_product.token_budget as number) < 1)) throw new HttpError(400, 'invalid_request', 'first_product token_budget must be a positive safe integer')
       }
       if (payload.model_prices !== undefined) {
         if (!Array.isArray(payload.model_prices)) throw new HttpError(400, 'invalid_request', 'model_prices must be an array')
         for (const [index, price] of payload.model_prices.entries()) {
           if (!isRecord(price)) throw new HttpError(400, 'invalid_request', `model_prices[${index}] must be an object`)
           validateHumanModelPrice(price, index)
-        }
-      }
-      if (payload.prices !== undefined) {
-        if (!Array.isArray(payload.prices)) throw new HttpError(400, 'invalid_request', 'prices must be an array')
-        for (const [index, price] of payload.prices.entries()) {
-          if (!isRecord(price)) throw new HttpError(400, 'invalid_request', `prices[${index}] must be an object`)
-          assertClosed(price, new Set(['provider', 'model', 'input_per_million', 'cache_read_per_million', 'cache_write_per_million', 'output_per_million', 'reasoning_per_million']), `prices[${index}]`)
-          requireNonBlank(price.provider, `prices[${index}] provider`)
-          requireNonBlank(price.model, `prices[${index}] model`)
-          for (const key of ['input_per_million', 'cache_read_per_million', 'cache_write_per_million', 'output_per_million', 'reasoning_per_million']) {
-            if (key === 'reasoning_per_million' && price[key] === undefined) continue
-            if (typeof price[key] !== 'number' || !Number.isFinite(price[key]) || (price[key] as number) < 0) throw new HttpError(400, 'invalid_request', `prices[${index}] ${key} must be a non-negative number`)
-          }
         }
       }
       return
@@ -258,18 +270,16 @@ function validateActionPayload(action: CompanyUiActionName, payload: Record<stri
       return
     }
     case 'grant_temporary_authorization':
-      assertClosed(payload, new Set(['approval_id', 'employee_id', 'reason', 'starts_at', 'expires_at']), `${action} payload`)
+      assertClosed(payload, new Set(['employee_id', 'reason', 'starts_at', 'expires_at']), `${action} payload`)
       for (const key of ['employee_id', 'reason']) requireNonBlank(payload[key], `${action} ${key}`)
-      if (payload.approval_id !== undefined) requireNonBlank(payload.approval_id, `${action} approval_id`)
       for (const key of ['starts_at', 'expires_at']) {
         if (key === 'starts_at' && payload[key] === undefined) continue
         if (!Number.isSafeInteger(payload[key]) || (payload[key] as number) < 0) throw new HttpError(400, 'invalid_request', `${action} ${key} is invalid`)
       }
       return
     case 'revoke_temporary_authorization':
-      assertClosed(payload, new Set(['approval_id', 'authorization_id', 'reason']), `${action} payload`)
+      assertClosed(payload, new Set(['authorization_id', 'reason']), `${action} payload`)
       for (const key of ['authorization_id', 'reason']) requireNonBlank(payload[key], `${action} ${key}`)
-      if (payload.approval_id !== undefined) requireNonBlank(payload.approval_id, `${action} approval_id`)
       return
     case 'pause':
     case 'resume':
@@ -309,11 +319,11 @@ function assertClosed(value: Record<string, unknown>, allowed: Set<string>, labe
   if (unknown.length > 0) throw new HttpError(400, 'invalid_request', `${label} has unknown field(s): ${unknown.join(', ')}`)
 }
 
-function assertUiTransport(req: IncomingMessage, config: ResolvedCompanyConfig): void {
-  const remote = normalizeAddress(req.socket.remoteAddress)
-  if (!config.allowRemoteUi && !isLoopback(remote)) throw new HttpError(403, 'remote_ui_denied', 'dsh-company UI actions are restricted to loopback clients')
+function assertUiTransport(req: IncomingMessage, config: ResolvedCompanyConfig, requireOrigin = false): void {
+  if (!config.allowRemoteUi && isRemoteUiRequest(req)) throw new HttpError(403, 'remote_ui_denied', 'dsh-company UI access is restricted to loopback clients')
   const origin = req.headers.origin
   const host = req.headers.host
+  if (requireOrigin && origin === undefined) throw new HttpError(403, 'origin_denied', 'Web mutations require an explicit same-origin browser Origin header')
   if (origin !== undefined) {
     if (host === undefined) throw new HttpError(403, 'origin_denied', 'Host header is required when Origin is present')
     let originHost: string
@@ -326,7 +336,7 @@ function assertUiTransport(req: IncomingMessage, config: ResolvedCompanyConfig):
   }
 }
 
-async function safeHandler(req: IncomingMessage, res: ServerResponse, operation: () => Promise<void>): Promise<void> {
+async function safeHandler(res: ServerResponse, operation: () => Promise<void>): Promise<void> {
   try {
     await operation()
   } catch (error) {
@@ -339,23 +349,23 @@ async function safeHandler(req: IncomingMessage, res: ServerResponse, operation:
       return
     }
     if (error instanceof HttpError) {
-      json(res, error.status, { ok: false, code: responseCode(error.status), message: error.message })
+      json(res, error.status, { ok: false, code: error.code, message: publicErrorMessage(error.message) })
       return
     }
     if (error instanceof Error) {
-      json(res, 422, { ok: false, code: 'invalid_transition', message: error.message })
+      json(res, 422, { ok: false, code: 'invalid_transition', message: publicErrorMessage(error.message) })
       return
     }
     json(res, 500, { ok: false, code: 'internal', message: 'unexpected dsh-company handler failure' })
   }
 }
 
-function responseCode(status: number): 'bad_request' | 'unauthorized' | 'not_found' | 'conflict' | 'internal' {
-  if (status === 401 || status === 403) return 'unauthorized'
-  if (status === 404) return 'not_found'
-  if (status === 409) return 'conflict'
-  if (status >= 500) return 'internal'
-  return 'bad_request'
+function publicErrorMessage(value: string): string {
+  return value
+    .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]+/giu, 'Bearer [REDACTED]')
+    .replace(/\b(?:api.?key|access.?token|refresh.?token|password|passwd|secret|credential|authorization)\b\s*[:=]\s*["']?[^\s,"']+/giu, '[REDACTED]')
+    .replace(/https?:\/\/[^\s)\]}>]+/giu, '[REDACTED_URL]')
+    .slice(0, 4096)
 }
 
 function json(res: ServerResponse, status: number, value: unknown, extraHeaders: Record<string, string> = {}): void {
@@ -375,15 +385,16 @@ function normalizeAddress(address: string | undefined): string {
 }
 
 function isLoopback(address: string): boolean {
-  return address === '127.0.0.1' || address === '::1' || address.startsWith('127.')
+  return address === '::1' || (isIP(address) === 4 && address.startsWith('127.'))
 }
 
-function isJsonValue(value: unknown): value is JsonValue {
+function isJsonValue(value: unknown, depth = 0): value is JsonValue {
+  if (depth > 64) return false
   if (value === null || typeof value === 'string' || typeof value === 'boolean') return true
   if (typeof value === 'number') return Number.isFinite(value) && !Object.is(value, -0)
-  if (Array.isArray(value)) return value.every(isJsonValue)
+  if (Array.isArray(value)) return value.every((item) => isJsonValue(item, depth + 1))
   if (!isRecord(value)) return false
-  return Object.values(value).every(isJsonValue)
+  return Object.values(value).every((item) => isJsonValue(item, depth + 1))
 }
 
 class HttpError extends Error {

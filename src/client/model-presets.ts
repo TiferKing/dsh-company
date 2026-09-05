@@ -6,10 +6,10 @@
  * disabled until the founder switches it on; switching on fills these values
  * only when the rate fields are still empty, and everything stays editable.
  *
- * Matching is by MODEL ID ONLY — the provider/route prefix is ignored, so
- * `deepseek-official/deepseek-v4-flash`, `opencode-go/deepseek-v4-flash`, …
- * all resolve the same `deepseek-v4-flash` preset. A dated snapshot suffix
- * also matches its base model (`deepseek-v4-flash-0731` → `deepseek-v4-flash`).
+ * Matching requires both a recognized direct provider and model family.
+ * Aggregators/subscription routes such as `opencode-go` intentionally receive
+ * no suggestion because their billing can differ. A dated snapshot suffix
+ * still matches its base model (`deepseek-v4-flash-0731` → base price).
  *
  * Figures cross-checked 2026-08 against:
  *  - OpenAI:    https://developers.openai.com/api/docs/pricing
@@ -30,7 +30,7 @@ export interface ModelPricePreset {
   output: string
 }
 
-/** Flat model-id-keyed table; the route provider is deliberately ignored. */
+/** Model-id table gated by the recognized direct-provider family below. */
 const PRESETS: Record<string, ModelPricePreset> = {
   // ---- OpenAI (USD, standard) ----
   'gpt-5.2': { currency: 'USD', miss: '1.75', hit: '0.175', output: '14' },
@@ -93,18 +93,26 @@ function lookup(model: string, currency: string): ModelPricePreset | undefined {
   return undefined
 }
 
+function providerOwnsOfficialPrice(provider: string, model: string): boolean {
+  const route = provider.trim().toLowerCase()
+  if (/^(?:gpt-|o[1-9](?:-|$))/u.test(model)) return route === 'openai'
+  if (model.startsWith('deepseek-')) return route === 'deepseek' || route === 'deepseek-official'
+  if (model.startsWith('glm-')) return route === 'bigmodel' || route === 'zhipu' || route === 'zhipuai'
+  return false
+}
+
 /**
- * The preset for one route in one company currency, or undefined. The
- * provider prefix is intentionally ignored: presets key on the model id
- * alone, so any route serving the same model resolves the same price.
+ * Return an official direct-provider suggestion only. Aggregators and
+ * subscription routes may bill the same model id differently, so a matching
+ * model name never transfers another provider's price automatically.
  */
 export function modelPricePreset(
-  _provider: string,
+  provider: string,
   model: string,
   currency: string,
 ): Pick<ModelPricePreset, 'miss' | 'hit' | 'output'> | undefined {
   const normalized = model.trim().toLowerCase()
-  if (normalized === '') return undefined
+  if (normalized === '' || !providerOwnsOfficialPrice(provider, normalized)) return undefined
   const entry = lookup(normalized, currency)
   return entry === undefined ? undefined : { miss: entry.miss, hit: entry.hit, output: entry.output }
 }

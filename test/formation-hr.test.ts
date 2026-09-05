@@ -18,7 +18,7 @@ test('budget-only adjustment keeps the employee session; route change reprovisio
     const config = resolveConfig({ stateRoot: join(base, 'state') })
     const store = new CompanyStore(config)
     const runtime = new CompanyRuntime(ctx, config, store)
-    await runtime.bootstrap(founder, { name: 'C', mission: 'm', charter: '1. a', firstProduct: { name: 'P', summary: 's', productRoot: 'p', successCriteria: ['x'], budgetMicros: 1_000_000, tokenBudget: 500_000 }, totalBudgetMicros: 1_000_000, totalTokenBudget: 1_000_000, currency: 'CNY', draftedBy: 'ai', modelPrices: [{ provider: 'mock', model: 'mock-model', inputCacheMissMicrosPerMillion: 0, inputCacheHitMicrosPerMillion: 0, outputMicrosPerMillion: 0 }] })
+    await runtime.bootstrap(founder, { name: 'C', mission: 'm', charter: '1. a', firstProduct: { name: 'P', summary: 's', productRoot: 'p', successCriteria: ['x'], budgetMicros: 1_000_000 }, totalBudgetMicros: 1_000_000, currency: 'CNY', draftedBy: 'ai', modelPrices: [{ provider: 'mock', model: 'mock-model', inputCacheMissMicrosPerMillion: 0, inputCacheHitMicrosPerMillion: 0, outputMicrosPerMillion: 0 }] })
     await runtime.approveBootstrap(founder, 'Approved and start.', { source: 'ui' })
     const hr = (await store.readActive(workspace))!.employees[0]!
     const hrAgent = { id: hr.sessionId, status: 'idle', session: { header: { cwd: workspace } } } as any
@@ -108,8 +108,8 @@ test('formation is editable, provisions HR first, and gates later hiring through
     const multilineCharter = '1. Human approval governs formation and staffing.\n2. Money is bounded.\n  2.1 Overspending requires an approved budget change.'
     await runtime.bootstrap(founder, {
       name: 'Draft Co', mission: 'Build one bounded tool.', charter: multilineCharter,
-      firstProduct: { name: 'Tool', summary: 'One tool.', productRoot: 'tool', successCriteria: ['Tests pass'], budgetMicros: 1_000_000, tokenBudget: 500_000 },
-      totalBudgetMicros: 1_000_000, totalTokenBudget: 1_000_000, currency: 'CNY',
+      firstProduct: { name: 'Tool', summary: 'One tool.', productRoot: 'tool', successCriteria: ['Tests pass'], budgetMicros: 1_000_000 },
+      totalBudgetMicros: 1_000_000, currency: 'CNY',
       modelPrices: [{ provider: 'mock', model: 'mock-model', inputCacheMissMicrosPerMillion: 0, inputCacheHitMicrosPerMillion: 0, outputMicrosPerMillion: 0 }],
       draftedBy: 'ai',
     })
@@ -119,16 +119,17 @@ test('formation is editable, provisions HR first, and gates later hiring through
     assert.equal(staged?.employees.length, 1)
     assert.equal(staged?.employees[0]?.isHr, true)
     assert.equal(staged?.products[0]?.name, 'Tool')
+    await assert.rejects(() => runtime.editFormation(founder, { currency: 'USD' }), /explicit replacement model price matrix/)
 
     staged = await runtime.editFormation(founder, {
       name: 'Approved Draft Co', charter: 'Edited charter; humans approve staffing.',
-      firstProduct: { name: 'Tool v1', tokenBudget: 600_000 }, totalTokenBudget: 1_200_000,
+      firstProduct: { name: 'Tool v1' },
     })
     assert.equal(staged.name, 'Approved Draft Co')
     assert.equal(staged.formation.draftedBy, 'user')
     assert.equal(staged.products[0]?.name, 'Tool v1')
 
-    await assert.rejects(() => runtime.addEmployee(founder, { name: 'Bypass', role: 'Engineer' }), /requires a completed HR staffing recommendation/)
+    await assert.rejects(() => runtime.addEmployee(founder, { name: 'Bypass', role: 'Engineer' } as any), /requires a completed HR staffing recommendation/)
 
     const operating = await runtime.approveBootstrap(founder, 'Approved from Web UI.', { source: 'ui' })
     assert.equal(operating.phase, 'operating')
@@ -142,12 +143,12 @@ test('formation is editable, provisions HR first, and gates later hiring through
     // HR may only recommend enabled (three-rate priced) routes: an unpriced
     // catalog model is rejected without burning the assessment capability.
     await assert.rejects(() => runtime.submitStaffingAssessment(hrAgent, {
-      requestId: request.id, attemptId: claim.attemptId, difficulty: 'low', provider: 'mock', model: 'unpriced-model',
+      requestId: request.id, attemptId: claim.attemptId, difficulty: 'low', provider: 'mock', model: 'unpriced-model', budgetMicros: 50_000,
       rationale: 'Should be rejected.', orgPath: ['Product'], positionTitle: 'Engineer', responsibilities: ['Build'],
     }), /enabled \(three-rate priced\) on the recruiting page/)
     const recommendation = await runtime.submitStaffingAssessment(hrAgent, {
       requestId: request.id, attemptId: claim.attemptId, difficulty: 'high', provider: 'mock', model: 'mock-model',
-      reasoningEffort: 'default', rationale: 'Implementation needs a strong coding route.',
+      reasoningEffort: 'default', budgetMicros: 50_000, rationale: 'Implementation needs a strong coding route.',
       orgPath: ['Product', 'Tool v1', 'Engineering'], positionTitle: 'Software Engineer', responsibilities: ['Implement and test Tool v1'],
     })
     assert.equal(recommendation.status, 'recommended')
@@ -167,6 +168,33 @@ test('formation is editable, provisions HR first, and gates later hiring through
     const unit = final?.orgUnits.find((candidate) => candidate.id === hired.orgUnitId)
     assert.equal(unit?.name, 'Engineering')
     assert.ok(final?.orgUnits.some((candidate) => candidate.name === 'Tool v1'))
+
+    // The singleton HR role has an explicit succession path, so the original
+    // formation HR lead is not immortal.
+    const successorRequest = await runtime.requestStaffing(founder, { action: 'hire', candidateName: 'HR Successor', workProfile: 'Take over people and model governance.' })
+    const successorClaim = await runtime.claimStaffingAssessment(hrAgent, successorRequest.id)
+    const successorRecommendation = await runtime.submitStaffingAssessment(hrAgent, {
+      requestId: successorRequest.id, attemptId: successorClaim.attemptId, difficulty: 'critical', provider: 'mock', model: 'mock-model',
+      budgetMicros: 100_000, rationale: 'Continuity requires a human-approved successor.', orgPath: ['Human Resources'],
+      positionTitle: 'People Governance Director', responsibilities: ['Own staffing and model governance'], designateAsHr: true,
+    })
+    await runtime.resolveApproval(founder, { approvalId: successorRecommendation.approvalId!, decision: 'approved', humanStatement: 'I approve the HR succession.' }, 'ui')
+    const successor = await runtime.addEmployee(founder, { name: 'HR Successor', role: 'People Governance Director', staffingRequestId: successorRequest.id, approvalId: successorRecommendation.approvalId! })
+    let successionState = (await store.readActive(workspace))!
+    assert.equal(successionState.hrEmployeeId, successor.id)
+    assert.equal(successionState.employees.find((employee) => employee.id === hr.id)?.isHr, false)
+    assert.equal(successionState.employees.find((employee) => employee.id === successor.id)?.isHr, true)
+
+    hrAgent = { id: successor.sessionId, status: 'idle', session: { header: { cwd: workspace } } }
+    const retireRequest = await runtime.requestStaffing(founder, { action: 'retire', employeeId: hr.id, workProfile: 'Retire the superseded HR lead.' })
+    const retireClaim = await runtime.claimStaffingAssessment(hrAgent, retireRequest.id)
+    const retireRecommendation = await runtime.submitStaffingAssessment(hrAgent, {
+      requestId: retireRequest.id, attemptId: retireClaim.attemptId, difficulty: 'low', rationale: 'Succession is complete.',
+    })
+    await runtime.resolveApproval(founder, { approvalId: retireRecommendation.approvalId!, decision: 'approved', humanStatement: 'I approve retirement of the former HR lead.' }, 'ui')
+    await runtime.removeEmployee(founder, hr.id, 'Succession completed.', retireRecommendation.approvalId!, retireRequest.id)
+    successionState = (await store.readActive(workspace))!
+    assert.equal(successionState.employees.find((employee) => employee.id === hr.id)?.status, 'retired')
   } finally {
     await rm(base, { recursive: true, force: true })
   }

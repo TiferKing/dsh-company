@@ -21,31 +21,22 @@ jobs:
       - name: Install pnpm
         uses: pnpm/action-setup@v4
         with:
-          version: 10
+          version: 11.25.0
 
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: 24
+          node-version: 24.11.1
           cache: pnpm
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Typecheck
-        run: pnpm typecheck
+      - name: Full verify gate
+        run: pnpm verify
 
-      - name: Test
-        run: pnpm test
-
-      - name: Build
-        run: pnpm build
-
-      - name: Package check
-        run: pnpm package:check
-
-      - name: Pack tarball
-        run: pnpm pack
+      - name: Pack the already-verified build
+        run: npm pack --ignore-scripts
 
       - name: Upload tarball artifact
         uses: actions/upload-artifact@v4

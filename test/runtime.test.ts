@@ -7,8 +7,8 @@ import { CompanyRuntime } from '../src/runtime.js'
 import { resolveConfig } from '../src/schemas.js'
 import { CompanyStore } from '../src/state.js'
 import { createApproval } from '../src/approvals.js'
-import { createTemporaryAuthorization } from '../src/authorizations.js'
-import { companyState } from './fixtures.js'
+import { reserveMoneyTurn } from '../src/money.js'
+import { approvedTemporaryAuthorization, companyState } from './fixtures.js'
 
 test('reassignment finishes its durable handoff even when idle waiting is cancelled', async () => {
   const base = await mkdtemp(join(tmpdir(), 'dsh-company-runtime-'))
@@ -72,10 +72,8 @@ test('reassignment finishes its durable handoff even when idle waiting is cancel
     const runtime = new CompanyRuntime(ctx, config, store)
     const abort = new AbortController()
     abort.abort(new Error('handoff wait cancelled'))
-    await assert.rejects(
-      () => runtime.reassignWork(founder, 'w1', 'founder', 'Founder takeover', abort.signal),
-      /handoff wait cancelled/,
-    )
+    const reassigned = await runtime.reassignWork(founder, 'w1', 'founder', 'Founder takeover', abort.signal)
+    assert.equal(reassigned.assigneeId, 'founder', 'best-effort idle wait failure must not report a false failed reassignment')
 
     const saved = await store.readActive(workspace)
     const work = saved?.workItems[0]
@@ -134,7 +132,6 @@ test('provisioning retry keeps accepted employees and fences deterministic turn 
       workspaceHash: paths.workspace.sha256,
       phase: 'staged',
       approvedAt: undefined,
-      planReviewState: 'awaiting_review',
     })
     state.employees[0]!.status = 'planned'
     state.employees[0]!.sessionId = undefined
@@ -174,18 +171,66 @@ test('provisioning retry keeps accepted employees and fences deterministic turn 
     assert.equal(failed.phase, 'provisioning_failed')
     assert.equal(failed.employees[0]?.status, 'idle')
     assert.equal(failed.employees[1]?.status, 'failed')
-    assert.equal(failed.tokenBudget.usedTokens, 0)
-    assert.equal(failed.tokenBudget.reservedTokens, 0)
+    assert.equal(failed.moneyBudget.usage.length, 0)
+    assert.equal(failed.moneyBudget.reservations.length, 0)
     const firstSession = failed.employees[0]?.sessionId
+    const edited = await runtime.editFormation(founder, { hrName: 'Recovered HR Lead' })
+    assert.equal(edited.employees[0]?.name, 'Recovered HR Lead', 'provisioning failure reopens the formation, including HR settings')
 
     const operating = await runtime.approveBootstrap(founder, 'Approved retry and start.', { source: 'ui' })
     assert.equal(operating.phase, 'operating')
     assert.equal(operating.employees[0]?.sessionId, firstSession)
     assert.deepEqual(operating.employees.map((employee) => employee.status), ['idle', 'idle'])
-    assert.equal(operating.tokenBudget.usedTokens, 0)
-    assert.equal(operating.tokenBudget.reservedTokens, 128_000, 'a newly accepted turn stays entitled (context-window sized) until the employee becomes idle')
+    assert.equal(operating.moneyBudget.usage.length, 0)
+    assert.equal(operating.moneyBudget.reservations[0]?.remainingTokens, 128_000, 'a newly accepted turn stays entitled (context-window sized) until the employee becomes idle')
     assert.equal(startCalls, 3)
     assert.deepEqual(requestedDepths, [1, 1, 1], 'legacy maxDepth 0 is clamped for direct employees')
+  } finally {
+    await rm(base, { recursive: true, force: true })
+  }
+})
+
+test('startup recovery adopts a durable child and completes an interrupted bootstrap generation', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'dsh-company-provisioning-recovery-'))
+  const workspace = join(base, 'workspace')
+  await mkdir(workspace)
+  try {
+    let founder: any
+    let starts = 0
+    const ctx = {
+      agents: { get(id: unknown) { return String(id) === 'founder-session' ? founder : undefined } },
+      subagents: {
+        registerContinuableSetup: () => () => undefined,
+        listChildren: async () => [{ kind: 'child', id: 'employee-session', mode: 'continuable', label: '', activity: 'inactive', hasChildren: false }],
+        startContinuable: async () => { starts += 1; throw new Error('existing durable child must be adopted') },
+        interrupt: () => undefined,
+      },
+      logger: { warn: () => undefined },
+    } as any
+    founder = { id: 'founder-session', session: { header: { cwd: workspace } } }
+    const config = resolveConfig({ stateRoot: join(base, 'state') })
+    const store = new CompanyStore(config)
+    const paths = await store.pathsForCwd(workspace)
+    const state = companyState({ workspaceHash: paths.workspace.sha256, phase: 'provisioning' })
+    state.products[0]!.status = 'approved'
+    state.employees[0]!.status = 'provisioning'
+    const approval = createApproval(state, 'founder', { kind: 'bootstrap', summary: 'Approve formation', payload: { companyId: state.id, stagedRevision: 1 } })
+    approval.status = 'approved'
+    approval.resolvedAt = Date.now()
+    const reservationId = reserveMoneyTurn(state, { employeeId: 'e1', provider: 'mock', model: 'mock-model' })
+    state.provisioning = { id: '11111111-1111-4111-8111-111111111111', startedAt: Date.now(), approvalId: approval.id, employeeIds: ['e1'], reservationIds: [reservationId] }
+    await store.createStaged(workspace, state)
+    ;(ctx.subagents as any).listChildren = async () => [{
+      kind: 'child', id: 'employee-session', mode: 'continuable', label: `dsh-company:${state.id}:e1`, activity: 'inactive', hasChildren: false,
+    }]
+
+    const runtime = new CompanyRuntime(ctx, config, store)
+    await runtime.recoverWorkspace(founder)
+    const recovered = await store.readActive(workspace)
+    assert.equal(recovered?.phase, 'operating')
+    assert.equal(recovered?.employees[0]?.status, 'idle')
+    assert.equal(recovered?.provisioning, undefined)
+    assert.equal(starts, 0)
   } finally {
     await rm(base, { recursive: true, force: true })
   }
@@ -219,7 +264,7 @@ test('public Web status is readonly and cannot project participant capabilities 
     state.counters.work = 1
     createApproval(state, 'founder', { kind: 'budget_change', summary: 'Private pending approval', payload: { newTotalMicros: 100_000_000, expectedTotalMicros: 100_000_000 } })
     const now = Date.now()
-    createTemporaryAuthorization(state, { employeeId: 'e1', reason: 'Private authorization reason', expiresAt: now + 60_000 }, { maxMs: 120_000 }, now)
+    approvedTemporaryAuthorization(state, { employeeId: 'e1', reason: 'Private authorization reason', expiresAt: now + 60_000 }, { maxMs: 120_000 }, now)
     await store.createStaged(workspace, state)
 
     const runtime = new CompanyRuntime(ctx, config, store)

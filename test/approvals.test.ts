@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { consumeApproval, createApproval, requireApproved, resolveApproval } from '../src/approvals.js'
+import { consumeApproval, createApproval, expirePendingApprovals, requireApproved, resolveApproval } from '../src/approvals.js'
 import { resolveConfig, validateApprovalPayload } from '../src/schemas.js'
 import { companyState } from './fixtures.js'
 
@@ -36,42 +36,51 @@ test('approval payloads are closed and reject secret/command-shaped keys', () =>
   }), /forbidden key/)
 })
 
-test('budget approval applies atomically and terminal request cannot be resolved twice', () => {
+test('money budget approval applies atomically and terminal request cannot be resolved twice', () => {
   const state = companyState()
   const approval = createApproval(state, 'founder', {
     kind: 'budget_change',
-    summary: 'Increase bounded activation credits',
-    payload: { newTotalCredits: 120, expectedTotalCredits: 100 },
+    summary: 'Increase the company monetary ceiling',
+    payload: { newTotalMicros: 120_000_000, expectedTotalMicros: 100_000_000 },
   })
-  const result = resolveApproval(state, resolveConfig({ stateRoot: '/tmp/dsh-company-test-state', maxBudgetCredits: 500 }), {
+  const result = resolveApproval(state, resolveConfig({ stateRoot: '/tmp/dsh-company-test-state' }), {
     approvalId: approval.id,
     decision: 'approved',
     source: 'tool',
     humanStatement: 'Approved this bounded increase.',
   })
   assert.equal(result.applied, true)
-  assert.equal(state.budget.totalCredits, 120)
+  assert.equal(state.moneyBudget.totalMicros, 120_000_000)
   assert.throws(() => resolveApproval(state, resolveConfig({ stateRoot: '/tmp/dsh-company-test-state' }), {
     approvalId: approval.id, decision: 'approved', source: 'tool', humanStatement: 'Again',
   }), /already approved/)
 })
 
-test('token budget approval atomically changes the ceiling, currency, and per-million price matrix', () => {
+test('expired pending approvals are swept before they can exhaust the cap', () => {
+  const state = companyState()
+  state.limits.maxPendingApprovals = 1
+  const expired = createApproval(state, 'founder', {
+    kind: 'external_effect', summary: 'Short-lived request', payload: { description: 'Test expiry.' }, expiresAt: Date.now() + 10_000,
+  })
+  expired.expiresAt = Date.now() - 1
+  assert.equal(expirePendingApprovals(state), 1)
+  assert.equal(expired.status, 'expired')
+  assert.doesNotThrow(() => createApproval(state, 'founder', {
+    kind: 'external_effect', summary: 'Replacement request', payload: { description: 'Uses the released slot.' },
+  }))
+})
+
+test('resolving an expired HR approval also closes its staffing recommendation', () => {
   const state = companyState()
   const approval = createApproval(state, 'founder', {
-    kind: 'budget_change', summary: 'Configure deterministic token accounting',
-    payload: {
-      newTotalTokens: 25_000_000, expectedTotalTokens: 20_000_000, currency: 'cny',
-      prices: [{ provider: 'mock', model: 'mock-model', inputPerMillion: 1.5, cacheReadPerMillion: 0.2, cacheWritePerMillion: 1.5, outputPerMillion: 4 }],
-    },
+    kind: 'organization_change', summary: 'Retire e1', payload: { action: 'retire', employeeId: 'e1', staffingRequestId: 'sr1' }, expiresAt: Date.now() + 60_000,
   })
-  const result = resolveApproval(state, resolveConfig({ stateRoot: '/tmp/dsh-company-test-state', maxTokenBudget: 30_000_000 }), {
-    approvalId: approval.id, decision: 'approved', source: 'tool', humanStatement: 'Approved token and pricing configuration.',
-  })
-  assert.equal(result.applied, true)
-  assert.equal(state.tokenBudget.totalTokens, 25_000_000)
-  assert.equal(state.tokenBudget.currency, 'CNY')
-  assert.equal(state.tokenBudget.prices[0]?.inputMicrosPerMillion, 1_500_000)
+  state.staffingRequests.push({ id: 'sr1', action: 'retire', employeeId: 'e1', status: 'recommended', requestedBy: 'founder', workProfile: 'Review retirement.', hrEmployeeId: 'e1', approvalId: approval.id, createdAt: 1, updatedAt: 1 })
+  approval.expiresAt = Date.now() - 1
+  const result = resolveApproval(state, resolveConfig(), { approvalId: approval.id, decision: 'approved', source: 'ui' })
+  assert.equal(result.applied, false)
+  assert.equal(approval.status, 'expired')
+  assert.equal(state.staffingRequests[0]!.status, 'rejected')
 })
 
 test('approved organization authorization is one-shot', () => {
@@ -85,6 +94,39 @@ test('approved organization authorization is one-shot', () => {
   approval.resolvedAt = Date.now()
   consumeApproval(requireApproved(state, approval.id, 'organization_change'))
   assert.throws(() => requireApproved(state, approval.id, 'organization_change'), /already been consumed/)
+})
+
+test('release approval excludes its own pending release work from prerequisites', () => {
+  const state = companyState()
+  state.employees.push({ ...structuredClone(state.employees[0]!), id: 'e2', name: 'Independent reviewer', sessionId: 'reviewer-session' })
+  state.counters.employee = 2
+  state.workItems.push(
+    { id: 'w1', productId: 'p1', kind: 'implementation', subject: 'Build', objective: 'Build.', status: 'completed', assigneeId: 'e1', dependencies: [], inScope: ['product'], outOfScope: [], acceptance: ['built'], verify: [], deliverables: [], attempt: 1, output: 'built', attemptHistory: [], createdAt: 1, updatedAt: 1 },
+    { id: 'w2', productId: 'p1', kind: 'verification', subject: 'Verify', objective: 'Verify.', status: 'completed', assigneeId: 'e2', dependencies: ['w1'], inScope: [], outOfScope: [], acceptance: ['verified'], verify: [], deliverables: [], attempt: 1, output: 'verified', attemptHistory: [], createdAt: 2, updatedAt: 2 },
+    { id: 'w3', productId: 'p1', kind: 'review', subject: 'Review', objective: 'Review.', status: 'completed', assigneeId: 'e2', dependencies: ['w1'], inScope: [], outOfScope: [], acceptance: ['reviewed'], verify: [], deliverables: [], reviewedWorkId: 'w1', attempt: 1, output: 'pass', verdict: 'pass', attemptHistory: [], createdAt: 3, updatedAt: 3 },
+  )
+  const approval = createApproval(state, 'founder', { kind: 'release', summary: 'Release product', payload: { productId: 'p1' } })
+  state.workItems.push({ id: 'w4', productId: 'p1', kind: 'release', subject: 'Publish release', objective: 'Publish.', status: 'pending', dependencies: ['w2', 'w3'], approvalDependencies: [approval.id], inScope: ['product'], outOfScope: [], acceptance: ['published'], verify: [], deliverables: [], attempt: 0, attemptHistory: [], createdAt: 4, updatedAt: 4 })
+
+  const result = resolveApproval(state, resolveConfig({ stateRoot: '/tmp/dsh-company-test-state' }), {
+    approvalId: approval.id, decision: 'approved', source: 'tool', humanStatement: 'Approve the release gate.',
+  })
+  assert.equal(result.applied, true)
+  assert.equal(approval.status, 'approved')
+  assert.equal(state.products[0]?.status, 'validating')
+})
+
+test('release approval cannot infer independent review from an unidentified author', () => {
+  const state = companyState()
+  state.workItems.push(
+    { id: 'w1', productId: 'p1', kind: 'verification', subject: 'Verify', objective: 'Verify.', status: 'completed', dependencies: [], inScope: [], outOfScope: [], acceptance: ['verified'], verify: [], deliverables: [], attempt: 1, output: 'verified', attemptHistory: [], createdAt: 1, updatedAt: 1 },
+    { id: 'w2', productId: 'p1', kind: 'review', subject: 'Review', objective: 'Review.', status: 'completed', assigneeId: 'e1', reviewedWorkId: 'w1', dependencies: ['w1'], inScope: [], outOfScope: [], acceptance: ['reviewed'], verify: [], deliverables: [], attempt: 1, output: 'pass', verdict: 'pass', attemptHistory: [], createdAt: 2, updatedAt: 2 },
+  )
+  const approval = createApproval(state, 'founder', { kind: 'release', summary: 'Release product', payload: { productId: 'p1' } })
+  const result = resolveApproval(state, resolveConfig(), { approvalId: approval.id, decision: 'approved', source: 'ui' })
+  assert.equal(result.stale, true)
+  assert.equal(approval.status, 'cancelled')
+  assert.match(approval.resolution!.note!, /no independent passing review/)
 })
 
 test('product-scope resolution authorizes only a later exact transition', () => {

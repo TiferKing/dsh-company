@@ -7,8 +7,10 @@ lib/
 dist/
 *.tsbuildinfo
 
-# Package artifacts
+# Package artifacts and local npm cache
 *.tgz
+SHA256SUMS
+.npm-cache/
 
 # Test & coverage
 coverage/
