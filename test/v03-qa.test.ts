@@ -279,7 +279,8 @@ test('financial migration remediation requires explicit legacy acceptance and ne
 })
 
 test('Host department load oracle reconciles nested subtree evidence and exact four-band boundaries', () => {
-  const ctx = { agents: { get: () => undefined } } as any
+  const runningSessions = new Set<string>()
+  const ctx = { agents: { get: (id: unknown) => runningSessions.has(String(id)) ? { status: 'running' } : undefined } } as any
   const rootLoad = (state: CompanyState) => buildSnapshot(ctx, state, { kind: 'founder', id: 'founder', sessionId: 'founder-session' }, []).org_units.find((unit) => unit.id === 'ou1')!.load
 
   const empty = companyState()
@@ -288,7 +289,10 @@ test('Host department load oracle reconciles nested subtree evidence and exact f
 
   const running = companyState()
   running.employees[0]!.status = 'working'
+  assert.deepEqual(rootLoad(running), { band: 'very_idle', people: 1, open_work: 0, effective_sum: 0, average: 0, max_effective: 0 }, 'a saved working flag does not establish current execution')
+  runningSessions.add(running.employees[0]!.sessionId!)
   assert.deepEqual(rootLoad(running), { band: 'normal', people: 1, open_work: 0, effective_sum: 1, average: 1, max_effective: 1 })
+  runningSessions.clear()
 
   const busy = companyState()
   busy.workItems = [workItem({ id: 'w1' }), workItem({ id: 'w2' })]

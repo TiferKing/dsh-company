@@ -452,6 +452,12 @@ export const COMPANY_STYLES = String.raw`
 }
 .dsh-company-section__head .dsh-company-section__title svg { width: 15px; height: 15px; color: var(--dc-accent); }
 
+.dsh-company-former > summary { cursor: pointer; list-style: none; margin-bottom: 0; border-radius: 4px; }
+.dsh-company-former > summary::-webkit-details-marker { display: none; }
+.dsh-company-former > summary:focus-visible { outline: 2px solid var(--dc-accent); outline-offset: 4px; }
+.dsh-company-former[open] > summary { margin-bottom: 10px; }
+.dsh-company-former[open] > summary .dsh-company-chevron { transform: rotate(90deg); }
+
 .dsh-company-section__count {
   flex: 0 0 auto;
   display: inline-flex;

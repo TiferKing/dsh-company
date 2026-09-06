@@ -3,7 +3,11 @@ import {
   type CompanyAction,
   type CompanyActionRequest,
   type CompanySnapshot,
+  type SnapshotQuery,
 } from './types.js'
+import { loadOrganizationSnapshot, loadRunningSnapshot } from './directory-snapshot.js'
+
+type DirectoryView = 'page' | 'organization' | 'overview'
 
 const STATE_ROUTE = '/plugins/dsh-company/state'
 const ACTION_ROUTE = '/plugins/dsh-company/action'
@@ -18,8 +22,12 @@ const MIN_TIMEOUT_MS = 1
 const MAX_TIMEOUT_MS = 120_000
 
 export interface CompanyUiState {
+  /** View represented by the loaded arrays; organization arrays span all pages. */
+  directoryView: DirectoryView
   sessionId: string | undefined
   snapshot: CompanySnapshot | undefined
+  /** True only after both active and archived lookups confirmed absence. */
+  companyAbsent: boolean
   archived: boolean
   open: boolean
   loading: boolean
@@ -158,8 +166,10 @@ export class CompanyUiController {
   readonly getSnapshot = (): CompanyUiState => this.state
 
   private state: CompanyUiState = Object.freeze({
+    directoryView: 'page',
     sessionId: undefined,
     snapshot: undefined,
+    companyAbsent: false,
     archived: false,
     open: false,
     loading: false,
@@ -180,6 +190,9 @@ export class CompanyUiController {
   private visible = true
   private disposed = false
   private generation = 0
+  private directoryQuery: SnapshotQuery = {}
+  private directoryView: DirectoryView = 'page'
+  private activityLimit = 5
   private timer: ReturnType<typeof setTimeout> | undefined
   private request:
     | { generation: number; controller: AbortController; promise: Promise<void> }
@@ -199,6 +212,9 @@ export class CompanyUiController {
   setCurrentSession(sessionId: string | undefined): void {
     if (this.disposed || sessionId === this.state.sessionId) return
     this.generation += 1
+    this.directoryQuery = {}
+    this.directoryView = 'page'
+    this.activityLimit = 5
     this.cancelTimer()
     this.cancelRequest()
     this.snapshotCache.clear()
@@ -207,7 +223,9 @@ export class CompanyUiController {
     this.returnFocus = null
     this.publish({
       sessionId,
+      directoryView: 'page',
       snapshot: undefined,
+      companyAbsent: false,
       archived: false,
       open: false,
       loading: sessionId !== undefined,
@@ -228,6 +246,40 @@ export class CompanyUiController {
       return
     }
     if (this.state.sessionId !== undefined) void this.refresh('visible')
+  }
+
+  setDirectoryQuery(query: SnapshotQuery): void {
+    if (this.disposed || this.state.action !== undefined) return
+    this.directoryQuery = { ...query }
+    this.generation += 1
+    this.cancelTimer()
+    this.cancelRequest()
+    this.snapshotCache.clear()
+    this.publish({ loading: true, networkError: undefined })
+    void this.refresh('directory-page')
+  }
+
+  setDirectoryView(view: DirectoryView): void {
+    if (this.disposed || this.state.action !== undefined || view === this.directoryView) return
+    this.directoryView = view
+    this.activityLimit = 5
+    this.reloadDirectory()
+  }
+
+  loadMoreActivity(limit: number): void {
+    if (this.disposed || this.state.action !== undefined || this.directoryView !== 'overview') return
+    if (!Number.isSafeInteger(limit) || limit < 5) return
+    this.activityLimit = limit
+    this.reloadDirectory()
+  }
+
+  private reloadDirectory(): void {
+    this.generation += 1
+    this.cancelTimer()
+    this.cancelRequest()
+    this.snapshotCache.clear()
+    this.publish({ loading: true, networkError: undefined })
+    void this.refresh('directory-view')
   }
 
   open(sessionId: string, trigger?: HTMLElement): void {
@@ -333,7 +385,7 @@ export class CompanyUiController {
       this.snapshotCache.clear()
       // A Host may return the next snapshot directly. Validate it before use,
       // then still repull: the HTTP state endpoint remains the presentation truth.
-      if (body !== undefined) {
+      if (body !== undefined && this.directoryView === 'page' && Object.keys(this.directoryQuery).length === 0) {
         try {
           const next = parseCompanySnapshot(body)
           if (next.company.id === snapshot.company.id) {
@@ -390,7 +442,9 @@ export class CompanyUiController {
 
   private async pull(sessionId: string, generation: number, controller: AbortController): Promise<void> {
     const hadSnapshot = this.state.snapshot !== undefined
-    this.publish({ loading: !hadSnapshot, networkError: undefined })
+    // Keep the last failure visible while a retry runs: opening the diagnostic
+    // drawer immediately refreshes, and must not erase the reason it appeared.
+    this.publish({ loading: this.state.loading || !hadSnapshot })
     try {
       let snapshot: CompanySnapshot | undefined
       let archived = false
@@ -411,6 +465,8 @@ export class CompanyUiController {
       if (this.disposed || controller.signal.aborted || generation !== this.generation) return
       this.publish({
         snapshot,
+        directoryView: this.directoryView,
+        companyAbsent: snapshot === undefined,
         archived,
         loading: false,
         stale: false,
@@ -422,6 +478,7 @@ export class CompanyUiController {
       if (controller.signal.aborted && timeout === undefined) return
       this.publish({
         loading: false,
+        companyAbsent: false,
         stale: this.state.snapshot !== undefined,
         networkError: messageOf(timeout ?? error),
       })
@@ -436,12 +493,44 @@ export class CompanyUiController {
     archived: boolean,
     controller: AbortController,
   ): Promise<CompanySnapshot> {
+    const view = this.directoryView
+    const limit = this.activityLimit
+    const query: SnapshotQuery = view === 'organization'
+      ? { employeeLimit: 100, orgLimit: 100, positionLimit: 100 }
+      : view === 'overview' ? {} : this.directoryQuery
+    const first = await this.fetchSnapshotPage(sessionId, archived, controller, query)
+    const fetchPage = (next: SnapshotQuery) => this.fetchSnapshotPage(sessionId, archived, controller, next, false)
+    if (view === 'organization') return loadOrganizationSnapshot(first, fetchPage)
+    if (view === 'overview') {
+      // Keep the primary employee page for formation HR fields and recovery
+      // controls. Only the activity card uses the running-employee prefix.
+      if (first.directory === undefined || first.directory.employees.next_offset === null) {
+        return { ...first, activity_employees: first.employees.filter((employee) => employee.status !== 'retired' && employee.activity?.state === 'running').slice(0, limit) }
+      }
+      const running = await loadRunningSnapshot(await fetchPage({ employeeStatus: 'running', employeeLimit: Math.min(limit, 100) }), limit, fetchPage)
+      if (running.directory === undefined || running.company.id !== first.company.id || running.revision !== first.revision || running.schema_version !== first.schema_version
+        || running.viewer.role !== first.viewer.role || running.viewer.participant_id !== first.viewer.participant_id
+        || [...running.viewer.permissions].sort().join('\u0000') !== [...first.viewer.permissions].sort().join('\u0000')) throw new Error('Company directory changed while loading. Refresh to retry.')
+      return { ...first, activity_employees: running.employees, directory: { ...first.directory, summary: running.directory.summary } }
+    }
+    return first
+  }
+
+  private async fetchSnapshotPage(
+    sessionId: string,
+    archived: boolean,
+    controller: AbortController,
+    directoryQuery: SnapshotQuery,
+    cache = true,
+  ): Promise<CompanySnapshot> {
+    controller.signal.throwIfAborted()
     const query = new URLSearchParams({
       sessionId,
       archived: archived ? '1' : '0',
     })
+    for (const [key, value] of Object.entries(directoryQuery)) if (value !== undefined && value !== '') query.set(key, String(value))
     const cacheKey = `${sessionId}\u0000${archived ? 'archive' : 'active'}`
-    const cached = this.snapshotCache.get(cacheKey)
+    const cached = cache ? this.snapshotCache.get(cacheKey) : undefined
     const { response, body } = await withTimeout((async () => {
       const response = await this.fetcher(`${STATE_ROUTE}?${query.toString()}`, {
         cache: 'no-cache',
@@ -457,7 +546,7 @@ export class CompanyUiController {
     }
     // Validators belong to a successfully parsed representation, never to a
     // failed response or to whichever snapshot happens to be on screen.
-    if (!controller.signal.aborted && this.state.sessionId === sessionId) this.snapshotCache.delete(cacheKey)
+    if (cache && !controller.signal.aborted && this.state.sessionId === sessionId) this.snapshotCache.delete(cacheKey)
     const message = errorMessageFromJson(body, `Could not load company (HTTP ${response.status})`)
     const code = errorCodeFromJson(body)
     if (
@@ -473,7 +562,7 @@ export class CompanyUiController {
     }
     const snapshot = parseCompanySnapshot(body)
     const nextEtag = response.headers.get('etag')
-    if (nextEtag !== null && !controller.signal.aborted && this.state.sessionId === sessionId) {
+    if (cache && nextEtag !== null && !controller.signal.aborted && this.state.sessionId === sessionId) {
       this.snapshotCache.set(cacheKey, { etag: nextEtag, snapshot })
     }
     return snapshot

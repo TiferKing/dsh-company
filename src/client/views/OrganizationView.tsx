@@ -166,6 +166,10 @@ function EmployeeRow(props: {
   const bodyId = `${id}-employee-body`
   const assignedWork = snapshot.work.filter((item) => item.assignee_id === employee.id && OPEN_STATUSES.has(item.status))
   const authorizations = snapshot.temporary_authorizations.filter((item) => item.employee_id === employee.id)
+  const activity = employee.status === 'idle' || employee.status === 'working' ? employee.activity?.state : undefined
+  const statusLabel = activity === undefined ? employeeStatusLabel(employee.status, t) : t(`activity.${activity}`)
+  const statusTone = activity === undefined ? employeeTone(employee.status)
+    : activity === 'running' ? 'active' : activity === 'idle' ? 'success' : activity === 'unavailable' ? 'warning' : 'neutral'
   const route = employee.llm
   const lifecycle = [
     employee.joined_at === undefined ? undefined : `${t('organization.joined')}: ${formatAbsolute(employee.joined_at, locale)}`,
@@ -195,7 +199,7 @@ function EmployeeRow(props: {
           </span>
         </div>
         <span className="dsh-company-employee-row__meta">
-          <StatusBadge tone={employeeTone(employee.status)}>{employeeStatusLabel(employee.status, t)}</StatusBadge>
+          <StatusBadge tone={statusTone}>{statusLabel}</StatusBadge>
           <span className="dsh-company-employee-row__route">{route === undefined ? t('common.unknown') : `${route.provider}/${route.model}`}</span>
           <span className="dsh-company-employee-row__budget">{formatMoneyMicros(employee.budget_micros, snapshot.budget.currency, locale)}</span>
           {(employee.token_usage?.unpriced_calls ?? 0) > 0 ? <span className="dsh-company-chip" data-tone="warning">{employee.token_usage?.priced_calls === 0 ? t('audit.unknownCost') : t('audit.knownSubtotal')}</span> : null}
@@ -447,7 +451,15 @@ export function OrganizationView(props: OrganizationViewProps): React.JSX.Elemen
         {roots.length === 0 ? <p className="dsh-company-empty"><InfoIcon />{t('organization.noUnits')}</p> : <ul className="dsh-company-org-tree" role="tree">{roots.map((unit) => <OrgNode key={unit.id} {...common} unit={unit} level={1} />)}</ul>}
       </section>
       {unassigned.length === 0 ? null : <section className="dsh-company-card dsh-company-section"><div className="dsh-company-section__head"><h3 className="dsh-company-section__title">{t('organization.unassigned')}</h3><span className="dsh-company-section__count">{unassigned.length}</span></div><div className="dsh-company-employee-list">{unassigned.map((employee) => <EmployeeRow key={employee.id} employee={employee} snapshot={snapshot} position={undefined} open={openEmployeeIds.has(employee.id)} busy={busy} canManageAuthorization={canManageAuthorization} t={t} locale={locale} onToggle={() => toggleSetMember(setOpenEmployeeIds)(employee.id)} navigateToSession={props.navigateToSession} onNavigationError={setNavigationError} onGrantAuthorization={props.onGrantAuthorization} onRevokeAuthorization={props.onRevokeAuthorization} />)}</div></section>}
-      {retired.length === 0 ? null : <section className="dsh-company-card dsh-company-section"><div className="dsh-company-section__head"><h3 className="dsh-company-section__title">{t('organization.former')}</h3><span className="dsh-company-section__count">{retired.length}</span></div><div className="dsh-company-employee-list">{retired.map((employee) => <EmployeeRow key={employee.id} employee={employee} snapshot={snapshot} position={snapshot.positions.find((position) => position.id === employee.position_id)} open={openEmployeeIds.has(employee.id)} busy={busy} canManageAuthorization={false} t={t} locale={locale} onToggle={() => toggleSetMember(setOpenEmployeeIds)(employee.id)} navigateToSession={props.navigateToSession} onNavigationError={setNavigationError} />)}</div></section>}
+      {retired.length === 0 ? null : (
+        <details className="dsh-company-card dsh-company-section dsh-company-former">
+          <summary className="dsh-company-section__head">
+            <span className="dsh-company-section__title"><ChevronIcon className="dsh-company-chevron" />{t('organization.former')}</span>
+            <span className="dsh-company-section__count">{retired.length}</span>
+          </summary>
+          <div className="dsh-company-employee-list">{retired.map((employee) => <EmployeeRow key={employee.id} employee={employee} snapshot={snapshot} position={snapshot.positions.find((position) => position.id === employee.position_id)} open={openEmployeeIds.has(employee.id)} busy={busy} canManageAuthorization={false} t={t} locale={locale} onToggle={() => toggleSetMember(setOpenEmployeeIds)(employee.id)} navigateToSession={props.navigateToSession} onNavigationError={setNavigationError} />)}</div>
+        </details>
+      )}
       <section className="dsh-company-section"><div className="dsh-company-section__head"><h3 className="dsh-company-section__title">{t('organization.staffing')}</h3><span className="dsh-company-section__count">{snapshot.staffing_requests.length}</span></div>{snapshot.staffing_requests.length === 0 ? <p className="dsh-company-empty"><InfoIcon />{t('organization.noStaffing')}</p> : <div className="dsh-company-ledger">{snapshot.staffing_requests.map((request) => <div className="dsh-company-ledger__row" key={request.id}><span className="dsh-company-ledger__kind">{request.id} · {request.action}</span><span className="dsh-company-ledger__reason">{request.candidate_name ?? request.employee_id ?? ''} · {request.status}</span><time className="dsh-company-ledger__time" dateTime={new Date(request.updated_at).toISOString()}>{formatRelative(request.updated_at, t)}</time></div>)}</div>}</section>
     </div>
   )

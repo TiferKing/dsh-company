@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { consumeApproval, createApproval, expirePendingApprovals, requireApproved, resolveApproval } from '../src/approvals.js'
+import { employeeMoneyTotals, recordMoneyUsage, releaseMoneyReservation, reserveMoneyTurn } from '../src/money.js'
 import { resolveConfig, validateApprovalPayload } from '../src/schemas.js'
 import { companyState } from './fixtures.js'
 
@@ -54,6 +55,168 @@ test('money budget approval applies atomically and terminal request cannot be re
   assert.throws(() => resolveApproval(state, resolveConfig({ stateRoot: '/tmp/dsh-company-test-state' }), {
     approvalId: approval.id, decision: 'approved', source: 'tool', humanStatement: 'Again',
   }), /already approved/)
+})
+
+test('employee budget approvals capture the original ceiling and apply independently of the company total', () => {
+  const state = companyState()
+  state.employees[0]!.isHr = true
+  const payload = {
+    newTotalMicros: 100_000_000, expectedTotalMicros: 100_000_000,
+    employeeAllocations: [{ id: 'e1', budgetMicros: 10_000_000 }],
+  }
+  const approval = createApproval(state, 'founder', { kind: 'budget_change', summary: 'Set a separate HR ceiling', payload })
+  assert.deepEqual(approval.payload, {
+    ...payload, employeeAllocations: [{ id: 'e1', budgetMicros: 10_000_000, expectedBudgetMicros: 100_000_000 }],
+  })
+  assert.deepEqual(payload.employeeAllocations, [{ id: 'e1', budgetMicros: 10_000_000 }], 'caller-owned payload is not mutated')
+
+  const result = resolveApproval(state, resolveConfig(), { approvalId: approval.id, decision: 'approved', source: 'ui' })
+  assert.equal(result.applied, true)
+  assert.equal(state.employees[0]!.budgetMicros, 10_000_000)
+  assert.equal(state.moneyBudget.totalMicros, 100_000_000)
+  assert.equal(state.moneyBudget.spentMicros, 0)
+})
+
+test('an older employee budget approval cannot overwrite a newer ceiling while the company total stays unchanged', () => {
+  const state = companyState()
+  const older = createApproval(state, 'founder', {
+    kind: 'budget_change', summary: 'Earlier HR ceiling',
+    payload: { newTotalMicros: 100_000_000, expectedTotalMicros: 100_000_000, employeeAllocations: [{ id: 'e1', budgetMicros: 20_000_000 }] },
+  })
+  const newer = createApproval(state, 'founder', {
+    kind: 'budget_change', summary: 'Revised HR ceiling',
+    payload: { newTotalMicros: 100_000_000, expectedTotalMicros: 100_000_000, employeeAllocations: [{ id: 'e1', budgetMicros: 10_000_000 }] },
+  })
+  resolveApproval(state, resolveConfig(), { approvalId: newer.id, decision: 'approved', source: 'ui' })
+  const result = resolveApproval(state, resolveConfig(), { approvalId: older.id, decision: 'approved', source: 'ui' })
+  assert.equal(result.stale, true)
+  assert.equal(result.applied, false)
+  assert.equal(older.status, 'cancelled')
+  assert.match(older.resolution!.note!, /employee e1 monetary ceiling changed/)
+  assert.equal(state.employees[0]!.budgetMicros, 10_000_000)
+  assert.equal(state.moneyBudget.totalMicros, 100_000_000)
+})
+
+test('legacy employee budget approvals remain readable but require a fresh request before applying', () => {
+  const state = companyState()
+  const payload = {
+    newTotalMicros: 100_000_000, expectedTotalMicros: 100_000_000,
+    employeeAllocations: [{ id: 'e1', budgetMicros: 10_000_000 }],
+  }
+  assert.doesNotThrow(() => validateApprovalPayload('budget_change', payload))
+  const approval = createApproval(state, 'founder', { kind: 'budget_change', summary: 'Legacy HR ceiling request', payload })
+  approval.payload = payload // Persisted requests from older versions have no captured employee ceiling.
+  const result = resolveApproval(state, resolveConfig(), { approvalId: approval.id, decision: 'approved', source: 'ui' })
+  assert.equal(result.stale, true)
+  assert.equal(approval.status, 'cancelled')
+  assert.match(approval.resolution!.note!, /budget precondition is missing; request a new budget approval/)
+  assert.equal(state.employees[0]!.budgetMicros, 100_000_000)
+})
+
+test('employee budget approvals reject an explicitly stale original ceiling without creating a request', () => {
+  const state = companyState()
+  assert.throws(() => createApproval(state, 'founder', {
+    kind: 'budget_change', summary: 'Stale HR ceiling',
+    payload: { newTotalMicros: 100_000_000, expectedTotalMicros: 100_000_000, employeeAllocations: [{ id: 'e1', budgetMicros: 10_000_000, expectedBudgetMicros: 20_000_000 }] },
+  }), /employee e1 monetary ceiling changed/)
+  assert.equal(state.approvals.length, 0)
+  assert.equal(state.counters.approval, 0)
+  assert.throws(() => validateApprovalPayload('budget_change', {
+    newTotalMicros: 100_000_000, expectedTotalMicros: 100_000_000,
+    employeeAllocations: [{ id: 'e1', budgetMicros: 10_000_000, expectedBudgetMicros: -1 }],
+  }), /expectedBudgetMicros must be a safe integer/)
+})
+
+test('employee budget approvals reject duplicate targets before capturing or applying any allocation', () => {
+  const state = companyState()
+  assert.throws(() => createApproval(state, 'founder', {
+    kind: 'budget_change', summary: 'Ambiguous employee ceiling',
+    payload: {
+      newTotalMicros: 100_000_000, expectedTotalMicros: 100_000_000,
+      employeeAllocations: [{ id: 'e1', budgetMicros: 10_000_000 }, { id: 'e1', budgetMicros: 20_000_000 }],
+    },
+  }), /duplicate employee id e1/)
+  assert.equal(state.approvals.length, 0)
+  assert.equal(state.counters.approval, 0)
+  assert.equal(state.employees[0]!.budgetMicros, 100_000_000)
+})
+
+test('legacy duplicate employee budget targets remain readable but cancel the approval', () => {
+  const state = companyState()
+  const payload = {
+    newTotalMicros: 100_000_000, expectedTotalMicros: 100_000_000,
+    employeeAllocations: [
+      { id: 'e1', budgetMicros: 10_000_000, expectedBudgetMicros: 100_000_000 },
+      { id: 'e1', budgetMicros: 20_000_000, expectedBudgetMicros: 100_000_000 },
+    ],
+  }
+  assert.doesNotThrow(() => validateApprovalPayload('budget_change', payload))
+  const approval = createApproval(state, 'founder', {
+    kind: 'budget_change', summary: 'Legacy duplicate employee targets',
+    payload: { ...payload, employeeAllocations: [payload.employeeAllocations[0]!] },
+  })
+  approval.payload = payload // Historical payload validation must not make the entire company unreadable.
+  const result = resolveApproval(state, resolveConfig(), { approvalId: approval.id, decision: 'approved', source: 'ui' })
+  assert.equal(result.stale, true)
+  assert.equal(result.applied, false)
+  assert.equal(approval.status, 'cancelled')
+  assert.match(approval.resolution!.note!, /duplicate employee id e1; request a new budget approval/)
+  assert.equal(state.employees[0]!.budgetMicros, 100_000_000)
+})
+
+test('employee budget approvals reject missing and retired targets both when requested and when resolved', () => {
+  for (const target of ['missing', 'retired'] as const) {
+    const state = companyState()
+    const input = {
+      kind: 'budget_change' as const, summary: 'Change employee ceiling',
+      payload: { newTotalMicros: 100_000_000, expectedTotalMicros: 100_000_000, employeeAllocations: [{ id: 'e1', budgetMicros: 10_000_000 }] },
+    }
+    const approval = createApproval(state, 'founder', input)
+    if (target === 'missing') state.employees = []
+    else state.employees[0]!.status = 'retired'
+    assert.throws(() => createApproval(state, 'founder', input), /must target an active employee/)
+    const result = resolveApproval(state, resolveConfig(), { approvalId: approval.id, decision: 'approved', source: 'ui' })
+    assert.equal(result.stale, true)
+    assert.equal(approval.status, 'cancelled')
+    assert.match(approval.resolution!.note!, /employee e1 is no longer active/)
+  }
+})
+
+test('employee budget reductions recheck spending and reservations added after the request', () => {
+  for (const exposure of ['spent', 'reserved'] as const) {
+    const state = companyState()
+    state.moneyBudget.prices[0]!.inputCacheMissMicrosPerMillion = 1_000_000
+    const approval = createApproval(state, 'founder', {
+      kind: 'budget_change', summary: 'Reduce employee ceiling to zero',
+      payload: { newTotalMicros: 100_000_000, expectedTotalMicros: 100_000_000, employeeAllocations: [{ id: 'e1', budgetMicros: 0 }] },
+    })
+    const reservationId = reserveMoneyTurn(state, { employeeId: 'e1', provider: 'mock', model: 'mock-model' })
+    if (exposure === 'spent') {
+      recordMoneyUsage(state, { sessionId: 'employee-session', eventSeq: 1, turn: 1, step: 1, employeeId: 'e1', provider: 'mock', model: 'mock-model', usage: { inputTokens: 5, outputTokens: 0 }, at: Date.now() })
+      releaseMoneyReservation(state, reservationId)
+    }
+    assert.throws(() => resolveApproval(state, resolveConfig(), { approvalId: approval.id, decision: 'approved', source: 'ui' }), /employee e1 budget is below spent plus reserved micros/)
+    assert.equal(approval.status, 'pending')
+    assert.equal(state.employees[0]!.budgetMicros, 100_000_000)
+  }
+})
+
+test('employee budget may equal the current spent plus reserved amount', () => {
+  const state = companyState()
+  state.moneyBudget.prices[0]!.inputCacheMissMicrosPerMillion = 1_000_000
+  reserveMoneyTurn(state, { employeeId: 'e1', provider: 'mock', model: 'mock-model' })
+  recordMoneyUsage(state, { sessionId: 'employee-session', eventSeq: 1, turn: 1, step: 1, employeeId: 'e1', provider: 'mock', model: 'mock-model', usage: { inputTokens: 5, outputTokens: 0 }, at: Date.now() })
+  const totals = employeeMoneyTotals(state, 'e1')
+  assert.ok(totals.spentMicros > 0 && totals.reservedMicros > 0)
+  const budgetMicros = totals.spentMicros + totals.reservedMicros
+  const approval = createApproval(state, 'founder', {
+    kind: 'budget_change', summary: 'Keep enough budget for committed usage',
+    payload: { newTotalMicros: 100_000_000, expectedTotalMicros: 100_000_000, employeeAllocations: [{ id: 'e1', budgetMicros }] },
+  })
+  const result = resolveApproval(state, resolveConfig(), { approvalId: approval.id, decision: 'approved', source: 'ui' })
+  assert.equal(result.applied, true)
+  assert.equal(state.employees[0]!.budgetMicros, budgetMicros)
+  assert.equal(employeeMoneyTotals(state, 'e1').availableMicros, 0)
 })
 
 test('expired pending approvals are swept before they can exhaust the cap', () => {

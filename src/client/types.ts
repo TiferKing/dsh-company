@@ -1,4 +1,6 @@
 /** Browser-safe wire contract for the dsh-company HTTP snapshot. */
+import type { SnapshotDirectory, SnapshotPage, SnapshotQuery, CompanySnapshot as HostSnapshot } from '../types.js'
+export type { SnapshotDirectory, SnapshotPage, SnapshotQuery } from '../types.js'
 
 import {
   APPROVAL_KINDS,
@@ -108,6 +110,9 @@ export interface SafeOrgUnitView {
   child_ids: string[]
   position_ids: string[]
   load: SafeDepartmentLoadView
+  child_count?: number
+  position_count?: number
+  money_summary?: { budget_micros: number; spent_micros: number; available_micros: number }
 }
 
 export interface SafePositionView {
@@ -117,6 +122,7 @@ export interface SafePositionView {
   reports_to_position_id?: string
   responsibilities: string[]
   employee_ids: string[]
+  employee_count?: number
 }
 
 export type TicketStatus = 'filed' | 'triaged' | 'dispatched' | 'resolved' | 'closed'
@@ -389,11 +395,16 @@ export interface CompanySnapshot {
     health: { status: 'healthy' | 'degraded' | 'manual_pause' | 'halted'; reason?: string; detail?: string; detectedAt?: number; resumable: boolean }
     updated_at: number
     founder_session_id?: string
+    max_employees?: number | 'unlimited'
   }
+  directory?: SnapshotDirectory
+  execution?: HostSnapshot['execution']
   org_units: SafeOrgUnitView[]
   positions: SafePositionView[]
   staffing_requests: SafeStaffingRequestView[]
   employees: SafeEmployeeView[]
+  /** Client-only visible activity prefix, loaded independently of the main employee page. */
+  activity_employees?: SafeEmployeeView[]
   products: SafeProductView[]
   work: SafeWorkView[]
   tickets: SafeTicketView[]
@@ -650,6 +661,12 @@ function parseOrgUnit(value: unknown, path: string): SafeOrgUnitView {
     child_ids: strings(input.child_ids ?? [], `${path}.child_ids`, 128),
     position_ids: strings(input.position_ids ?? [], `${path}.position_ids`, 256),
     load: parseDepartmentLoad(input.load, `${path}.load`),
+    child_count: optionalInteger(input.child_count, `${path}.child_count`),
+    position_count: optionalInteger(input.position_count, `${path}.position_count`),
+    money_summary: input.money_summary === undefined ? undefined : (() => {
+      const money = record(input.money_summary, `${path}.money_summary`)
+      return { budget_micros: nonNegativeNumber(money.budget_micros, `${path}.money_summary.budget_micros`), spent_micros: nonNegativeNumber(money.spent_micros, `${path}.money_summary.spent_micros`), available_micros: nonNegativeNumber(money.available_micros, `${path}.money_summary.available_micros`) }
+    })(),
   })
 }
 
@@ -660,7 +677,8 @@ function parsePosition(value: unknown, path: string): SafePositionView {
     org_unit_id: nonBlankString(input.org_unit_id, `${path}.org_unit_id`, 128),
     reports_to_position_id: optionalString(input.reports_to_position_id, `${path}.reports_to_position_id`, 128),
     responsibilities: strings(input.responsibilities ?? [], `${path}.responsibilities`, 256),
-    employee_ids: strings(input.employee_ids ?? [], `${path}.employee_ids`, 64),
+    employee_ids: strings(input.employee_ids ?? [], `${path}.employee_ids`, 100),
+    employee_count: optionalInteger(input.employee_count, `${path}.employee_count`),
   })
 }
 
@@ -1090,6 +1108,46 @@ function parseCharterOutline(value: unknown, path: string): SafeCharterClauseVie
   return array(value, path, 512).map((clause, index) => parseCharterClause(clause, `${path}[${index}]`, 1))
 }
 
+function parsePage(value: unknown, path: string): SnapshotPage {
+  const input = record(value, path)
+  const total = integer(input.total, `${path}.total`)
+  const filtered = integer(input.filtered_total, `${path}.filtered_total`)
+  const offset = integer(input.offset, `${path}.offset`)
+  const limit = integer(input.limit, `${path}.limit`)
+  const returned = integer(input.returned, `${path}.returned`)
+  const next = input.next_offset === null ? null : integer(input.next_offset, `${path}.next_offset`)
+  if (limit < 1 || limit > 100 || returned > limit || filtered > total || (returned > 0 && offset + returned > filtered) || next !== (offset + returned < filtered ? offset + returned : null)) fail(path, 'a consistent bounded directory page')
+  return { total, filtered_total: filtered, offset, limit, returned, next_offset: next }
+}
+
+function parseDirectory(value: unknown): SnapshotDirectory {
+  const input = record(value, 'snapshot.directory')
+  const employee = record(input.employees, 'snapshot.directory.employees')
+  const rawQuery = record(employee.query, 'snapshot.directory.employees.query')
+  const query: SnapshotQuery = {}
+  for (const key of ['employeeOffset', 'employeeLimit', 'orgOffset', 'orgLimit', 'positionOffset', 'positionLimit'] as const) if (rawQuery[key] !== undefined) query[key] = integer(rawQuery[key], `snapshot.directory.query.${key}`)
+  for (const key of ['employeeSearch', 'employeeId', 'employeeOrgUnitId', 'employeePositionId', 'orgId', 'positionId'] as const) if (rawQuery[key] !== undefined) query[key] = string(rawQuery[key], `snapshot.directory.query.${key}`, 256)
+  if (rawQuery.employeeStatus !== undefined) query.employeeStatus = enumValue(rawQuery.employeeStatus, ['all', 'active', 'retired', 'running'] as const, 'snapshot.directory.query.employeeStatus')
+  if (rawQuery.employeeExactStatus !== undefined) query.employeeExactStatus = enumValue(rawQuery.employeeExactStatus, EMPLOYEE_STATUSES, 'snapshot.directory.query.employeeExactStatus')
+  const summary = record(input.summary, 'snapshot.directory.summary')
+  const counts = record(summary.employee_statuses, 'snapshot.directory.summary.employee_statuses')
+  return {
+    employees: { ...parsePage(employee, 'snapshot.directory.employees'), query },
+    org_units: parsePage(input.org_units, 'snapshot.directory.org_units'), positions: parsePage(input.positions, 'snapshot.directory.positions'),
+    summary: {
+      employees: integer(summary.employees, 'snapshot.directory.summary.employees'), active_employees: integer(summary.active_employees, 'snapshot.directory.summary.active_employees'),
+      retired_employees: integer(summary.retired_employees, 'snapshot.directory.summary.retired_employees'), running_employees: integer(summary.running_employees, 'snapshot.directory.summary.running_employees'),
+      org_units: integer(summary.org_units, 'snapshot.directory.summary.org_units'), positions: integer(summary.positions, 'snapshot.directory.summary.positions'),
+      employee_statuses: Object.fromEntries(EMPLOYEE_STATUSES.map((status) => [status, integer(counts[status], `snapshot.directory.summary.employee_statuses.${status}`)])),
+    },
+  }
+}
+
+function parseExecution(value: unknown): NonNullable<HostSnapshot['execution']> {
+  const input = record(value, 'snapshot.execution')
+  return { mode: enumValue(input.mode, ['adaptive', 'fixed', 'unlimited'] as const, 'snapshot.execution.mode'), running: integer(input.running, 'snapshot.execution.running'), limit: input.limit === null ? null : integer(input.limit, 'snapshot.execution.limit'), waiting: integer(input.waiting, 'snapshot.execution.waiting'), reason: optionalString(input.reason, 'snapshot.execution.reason', 256), retry_at: optionalInteger(input.retry_at, 'snapshot.execution.retry_at') }
+}
+
 /** Validate and copy a Host snapshot, dropping every unknown field. */
 export function parseCompanySnapshot(value: unknown): CompanySnapshot {
   const input = record(unwrapSnapshot(value), 'snapshot')
@@ -1098,18 +1156,19 @@ export function parseCompanySnapshot(value: unknown): CompanySnapshot {
   const viewer = record(input.viewer, 'snapshot.viewer')
   const company = record(input.company, 'snapshot.company')
   const budget = parseBudget(input.budget, 'snapshot.budget')
+  const directory = input.directory === undefined ? undefined : parseDirectory(input.directory)
   const employees = uniqueIds(
-    array(input.employees, 'snapshot.employees', 256).map((item, index) =>
+    array(input.employees, 'snapshot.employees', directory === undefined ? 256 : 100).map((item, index) =>
       parseEmployee(item, `snapshot.employees[${index}]`),
     ),
     'snapshot.employees',
   )
   const orgUnits = uniqueIds(
-    array(input.org_units ?? [], 'snapshot.org_units', 256).map((item, index) => parseOrgUnit(item, `snapshot.org_units[${index}]`)),
+    array(input.org_units ?? [], 'snapshot.org_units', directory === undefined ? 256 : 100).map((item, index) => parseOrgUnit(item, `snapshot.org_units[${index}]`)),
     'snapshot.org_units',
   )
   const positions = uniqueIds(
-    array(input.positions ?? [], 'snapshot.positions', 1_000).map((item, index) => parsePosition(item, `snapshot.positions[${index}]`)),
+    array(input.positions ?? [], 'snapshot.positions', directory === undefined ? 1_000 : 100).map((item, index) => parsePosition(item, `snapshot.positions[${index}]`)),
     'snapshot.positions',
   )
   const staffingRequests = uniqueIds(
@@ -1153,16 +1212,17 @@ export function parseCompanySnapshot(value: unknown): CompanySnapshot {
   )
 
   const employeeIds = new Set(employees.map((employee) => employee.id))
+  if (directory !== undefined && (directory.employees.returned !== employees.length || directory.org_units.returned !== orgUnits.length || directory.positions.returned !== positions.length)) fail('snapshot.directory', 'returned counts matching the directory arrays')
   const productIds = new Set(products.map((product) => product.id))
   const workIds = new Set(work.map((item) => item.id))
   const orgUnitIds = new Set(orgUnits.map((unit) => unit.id))
   const positionIds = new Set(positions.map((position) => position.id))
-  for (const unit of orgUnits) {
+  for (const unit of directory === undefined ? orgUnits : []) {
     if (unit.parent_id !== undefined && !orgUnitIds.has(unit.parent_id)) fail(`snapshot.org_units.${unit.id}.parent_id`, 'a known org unit id')
     if (unit.child_ids.some((id) => !orgUnitIds.has(id))) fail(`snapshot.org_units.${unit.id}.child_ids`, 'known org unit ids')
     if (unit.position_ids.some((id) => !positionIds.has(id))) fail(`snapshot.org_units.${unit.id}.position_ids`, 'known position ids')
   }
-  for (const position of positions) {
+  for (const position of directory === undefined ? positions : []) {
     if (!orgUnitIds.has(position.org_unit_id)) fail(`snapshot.positions.${position.id}.org_unit_id`, 'a known org unit id')
     if (position.employee_ids.some((id) => !employeeIds.has(id))) fail(`snapshot.positions.${position.id}.employee_ids`, 'known employee ids')
   }
@@ -1173,13 +1233,15 @@ export function parseCompanySnapshot(value: unknown): CompanySnapshot {
     }
   }
   for (const authorization of temporaryAuthorizations) {
-    if (!employeeIds.has(authorization.employee_id)) fail(`snapshot.temporary_authorizations.${authorization.id}.employee_id`, 'a known employee id')
+    if (directory === undefined && !employeeIds.has(authorization.employee_id)) fail(`snapshot.temporary_authorizations.${authorization.id}.employee_id`, 'a known employee id')
     if (authorization.uses.some((use) => !workIds.has(use.work_id))) fail(`snapshot.temporary_authorizations.${authorization.id}.uses`, 'known work ids')
   }
 
   return compactOptional({
     schema_version: COMPANY_SNAPSHOT_SCHEMA_VERSION,
     revision: integer(input.revision, 'snapshot.revision'),
+    directory,
+    execution: input.execution === undefined ? undefined : parseExecution(input.execution),
     viewer: {
       role: enumValue(viewer.role, ['founder', 'employee'] as const, 'snapshot.viewer.role'),
       participant_id: nonBlankString(viewer.participant_id, 'snapshot.viewer.participant_id', 128),
@@ -1198,6 +1260,7 @@ export function parseCompanySnapshot(value: unknown): CompanySnapshot {
       health: parseHealth(company.health, 'snapshot.company.health'),
       updated_at: integer(company.updated_at, 'snapshot.company.updated_at'),
       founder_session_id: optionalString(company.founder_session_id, 'snapshot.company.founder_session_id', 256),
+      max_employees: company.max_employees === 'unlimited' ? 'unlimited' as const : optionalInteger(company.max_employees, 'snapshot.company.max_employees'),
     }),
     org_units: orgUnits,
     positions,

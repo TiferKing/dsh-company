@@ -21,7 +21,9 @@ import {
   resolveAuthorizationAdmission,
 } from './authorizations.js'
 import { SubagentError } from '@deepseek-ai/dsh-subagent'
-import { deliverEmployee, untrustedParticipantMessage } from './employees.js'
+import { activeSelection, deliverEmployee, untrustedParticipantMessage } from './employees.js'
+import { HR_ASSESSMENT_REMINDER } from './hr-policy.js'
+import { CompanyExecutionDeferredError, ensureCompanyExecution, hasEmployeeExecution } from './execution.js'
 import { handleEmployeeOperationalFailure } from './accounting.js'
 import type { CompanyRuntime, SchedulerHandle } from './runtime.js'
 import { makeMailboxRoom, type CompanyStore } from './state.js'
@@ -33,6 +35,7 @@ const MAX_ATTEMPT_DELIVERIES = 3
 const STAFFING_REDELIVERY_COOLDOWN_MS = 5 * 60_000
 const BACKLOG_STEER_COOLDOWN_MS = 30 * 60_000
 const DELIVERY_RETRY_MS = 30_000
+const EMPLOYEE_BATCH_SIZE = 64
 
 export function installCompanyScheduler(
   ctx: Context,
@@ -40,7 +43,11 @@ export function installCompanyScheduler(
   store: CompanyStore,
   runtime?: Pick<CompanyRuntime, 'recoverWorkspace' | 'reprobeModels'>,
 ): SchedulerHandle {
-  const queues = new Map<string, Promise<void>>()
+  const execution = ensureCompanyExecution(ctx, config, store)
+  const readState = (cwd: string) => typeof store.readActiveView === 'function' ? store.readActiveView(cwd) : store.readActive.call(store, cwd)
+  const cursors = new Map<string, number>()
+  const maintenanceCursors = new Map<string, number>()
+  const queues = new Map<string, { rerun: boolean; promise: Promise<void> }>()
   const lifecycle = new AbortController()
   let disposed = false
   const workspaceKeys = new Map<string, string>()
@@ -68,9 +75,19 @@ export function installCompanyScheduler(
     wakeups.set(key, { at, timer })
   }
 
+  const defer = (cwd: string | undefined, delayMs: number): void => {
+    if (cwd === undefined || disposed) return
+    void store.pathsForCwd(cwd, false).then(({ workspace }) => {
+      if (disposed) return
+      workspaceKeys.set(cwd, workspace.key)
+      scheduleWakeup(cwd, delayMs)
+    }).catch((error) => ctx.logger.warn(`dsh-company resource retry failed: ${String(error)}`))
+  }
+  execution.setWakeup(defer)
+
   const backlogSteeredAt = new Map<string, number>()
   const steerBacklog = async (cwd: string, founder: Agent): Promise<void> => {
-    const state = await store.readActive(cwd)
+    const state = await readState(cwd)
     if (state === undefined || state.phase !== 'operating') return
     const pending = state.workItems.filter((work) => work.status === 'pending' && work.reassigning !== true && work.ticketId === undefined)
     if (pending.length === 0) return
@@ -104,47 +121,69 @@ export function installCompanyScheduler(
     }
   }
 
-  const enqueue = async (cwd: string | undefined, suppliedFounder?: Agent): Promise<void> => {
+  const enqueue = async (cwd: string | undefined): Promise<void> => {
     if (disposed || lifecycle.signal.aborted || cwd === undefined) return
     const key = (await store.pathsForCwd(cwd, false)).workspace.key
     if (disposed || lifecycle.signal.aborted) return
     workspaceKeys.set(cwd, key)
-    const previous = queues.get(key) ?? Promise.resolve()
-    const next = previous.catch(() => undefined).then(async () => {
-      if (lifecycle.signal.aborted) return
-      clearWakeup(key)
-      await driveWorkspace(cwd, suppliedFounder)
-    })
-    queues.set(key, next)
-    try {
-      await next
-    } finally {
-      if (queues.get(key) === next) queues.delete(key)
+    const existing = queues.get(key)
+    if (existing !== undefined) {
+      // Collapse any number of concurrent UI/status/event wakeups into at most
+      // one follow-up pass. The old Promise chain retained one closure per kick
+      // whenever state I/O became slower than the wakeup rate.
+      existing.rerun = true
+      return existing.promise
     }
+    const pump: { rerun: boolean; promise: Promise<void> } = {
+      rerun: true,
+      promise: Promise.resolve(),
+    }
+    pump.promise = Promise.resolve().then(async () => {
+      try {
+        do {
+          pump.rerun = false
+          if (lifecycle.signal.aborted) return
+          clearWakeup(key)
+          await driveWorkspace(cwd)
+        } while (pump.rerun && !lifecycle.signal.aborted)
+      } finally {
+        // Remove the completed pump before another microtask can join it and
+        // set rerun after the loop has already decided to stop.
+        if (queues.get(key) === pump) queues.delete(key)
+      }
+    })
+    queues.set(key, pump)
+    return pump.promise
   }
 
-  const driveWorkspace = async (cwd: string, suppliedFounder?: Agent): Promise<void> => {
+  const driveWorkspace = async (cwd: string): Promise<void> => {
     if (lifecycle.signal.aborted) return
-    let state = await store.readActive(cwd)
+    let state = await readState(cwd)
     if (lifecycle.signal.aborted) return
     if (state === undefined) return
-    const founder = suppliedFounder?.id === state.founderSessionId
-      ? suppliedFounder
-      : ctx.agents.get(SessionId(state.founderSessionId))
+    execution.observe(state, cwd)
+    // Only a currently registered founder can authorize continuation. Callers
+    // may still hold an old Agent across a Host unload/reload boundary.
+    const founder = ctx.agents.get(SessionId(state.founderSessionId))
     if (founder === undefined || String(founder.id) !== state.founderSessionId) return
     if (runtime !== undefined && (state.phase === 'provisioning' || state.employees.some((employee) => employee.status === 'provisioning') || state.workItems.some((work) => work.reassigning === true))) {
       await runtime.recoverWorkspace(founder)
-      state = await store.readActive(cwd) ?? state
+      state = await readState(cwd) ?? state
     }
-    await reconcileOrphanedTurnReservations(cwd, state)
-    if (lifecycle.signal.aborted) return
-    state = await store.readActive(cwd) ?? state
+    // Classify expired preparations before releasing turn reservations: the
+    // release helpers clear the work/HR pointers needed to identify an
+    // assignment that was prepared but never accepted.
     await reconcileExpiredPrepared(cwd, state)
     if (lifecycle.signal.aborted) return
-    state = await store.readActive(cwd) ?? state
+    state = await readState(cwd) ?? state
+    state = await reconcileEmployeeActivity(cwd, state)
+    if (lifecycle.signal.aborted) return
+    await reconcileOrphanedTurnReservations(cwd, state)
+    if (lifecycle.signal.aborted) return
+    state = await readState(cwd) ?? state
     await fanoutGovernanceNotifications(cwd)
     if (lifecycle.signal.aborted) return
-    state = await store.readActive(cwd) ?? state
+    state = await readState(cwd) ?? state
     if (state.phase !== 'operating') return
     // Context windows and route availability are admission inputs. Never turn a
     // stale topology marker off without re-probing the actual DSH registry.
@@ -153,7 +192,7 @@ export function installCompanyScheduler(
       try {
         await runtime.reprobeModels(founder, state.revision, lifecycle.signal)
         if (lifecycle.signal.aborted) return
-        state = await store.readActive(cwd) ?? state
+        state = await readState(cwd) ?? state
       } catch (probeError) {
         if (lifecycle.signal.aborted) return
         ctx.logger.warn(`dsh-company automatic model reprobe failed: ${String(probeError)}`)
@@ -162,11 +201,18 @@ export function installCompanyScheduler(
       }
     }
     await deliverFounderMailbox(cwd, founder)
-    for (const row of state.employees) {
+    const start = (cursors.get(state.id) ?? 0) % Math.max(1, state.employees.length)
+    for (let scanned = 0; scanned < Math.min(EMPLOYEE_BATCH_SIZE, state.employees.length); scanned += 1) {
+      const index = (start + scanned) % state.employees.length
+      const row = state.employees[index]!
+      cursors.set(state.id, (index + 1) % state.employees.length)
       if (disposed) return
-      const fresh = await store.readActive(cwd)
+      const fresh = await readState(cwd)
       if (fresh === undefined || fresh.phase !== 'operating') return
       const employee = fresh.employees.find((candidate) => candidate.id === row.id)
+      // Rebuild diagnostic waiting state only for tasks that still exist.
+      // Cancellation or retirement must not leave a phantom queue entry.
+      if (employee?.sessionId !== undefined) execution.clearWaiting(employee.sessionId)
       if (employee === undefined || !['idle', 'working'].includes(employee.status) || employee.operationalBlock !== undefined || employee.sessionId === undefined) continue
       const live = ctx.agents.get(SessionId(employee.sessionId))
       try {
@@ -177,7 +223,7 @@ export function installCompanyScheduler(
           // strand work after a cold unload or child loss. An idle (or
           // unloaded/ready) live child that ended its turn without a terminal
           // update is re-driven with the SAME attempt instead of being stranded.
-          if (live !== undefined && live.status === 'running') continue
+          if (hasEmployeeExecution(live)) continue
           await recoverOpenAttempt(cwd, founder, employee, open)
           continue
         }
@@ -185,7 +231,7 @@ export function installCompanyScheduler(
           ? fresh.staffingRequests.find((request) => request.hrEmployeeId === employee.id && request.status === 'in_review')
           : undefined
         if (staffingReview !== undefined) {
-          if (live !== undefined && live.status === 'running') continue
+          if (hasEmployeeExecution(live)) continue
           await recoverStaffingAssessment(cwd, founder, employee, staffingReview)
           continue
         }
@@ -201,6 +247,10 @@ export function installCompanyScheduler(
         if (await deliverOneQueuedMessage(cwd, founder, employee)) continue
         await dispatchOne(cwd, founder, employee.id)
       } catch (error) {
+        if (error instanceof CompanyExecutionDeferredError) {
+          scheduleWakeup(cwd, error.retryAfterMs)
+          continue
+        }
         if (error instanceof CompanyMoneyBudgetError || error instanceof CompanyUnpricedModelError) {
           await handleEmployeeOperationalFailure(ctx, store, cwd, employee.id, {
             kind: error instanceof CompanyUnpricedModelError ? 'unpriced_model' : 'money_budget',
@@ -213,8 +263,9 @@ export function installCompanyScheduler(
         }
       }
     }
+    if (state.employees.length > EMPLOYEE_BATCH_SIZE) scheduleWakeup(cwd, config.executionRetryMs)
     await steerBacklog(cwd, founder)
-    const remaining = await store.readActive(cwd)
+    const remaining = await readState(cwd)
     if (remaining?.phase !== 'operating') return
     for (const request of remaining.staffingRequests) {
       if (request.status !== 'pending' || request.lastDeliveredAt === undefined) continue
@@ -227,8 +278,8 @@ export function installCompanyScheduler(
   }
 
   const fanoutGovernanceNotifications = async (cwd: string): Promise<void> => {
-    for (let delivered = 0; delivered < config.maxEmployees; delivered += 1) {
-      const visible = await store.readActive(cwd)
+    for (let delivered = 0; delivered < EMPLOYEE_BATCH_SIZE; delivered += 1) {
+      const visible = await readState(cwd)
       const notice = visible?.governanceNotifications.find((candidate) => candidate.employeeIds.some((id) => !candidate.deliveredEmployeeIds.includes(id)))
       if (visible === undefined || notice === undefined) {
         if (visible?.governanceNotifications.some((candidate) => candidate.employeeIds.length === candidate.deliveredEmployeeIds.length) === true) {
@@ -259,10 +310,37 @@ export function installCompanyScheduler(
       })
       if (!result.result) return
     }
+    scheduleWakeup(cwd, config.executionRetryMs)
+  }
+
+  const reconcileEmployeeActivity = async (cwd: string, snapshot: CompanyState): Promise<CompanyState> => {
+    // Status events emitted while the plugin was absent cannot update its
+    // durable ledger. A saved `working` flag is not evidence of a live turn.
+    const stopped = snapshot.employees.filter((employee) => employee.status === 'working')
+      .map((employee) => ({ employee, live: employee.sessionId === undefined ? undefined : ctx.agents.get(SessionId(employee.sessionId)) }))
+      .filter(({ live }) => !hasEmployeeExecution(live))
+    if (stopped.length === 0) return snapshot
+    const reconciled = await store.transact(cwd, {
+      actor: 'scheduler', type: 'employee.activity_reconciled', summary: 'Reconciled saved working employees with current Host activity',
+    }, (state) => {
+      if (lifecycle.signal.aborted || state.id !== snapshot.id) return
+      for (const { employee: previous, live: observedLive } of stopped) {
+        const employee = state.employees.find((candidate) => candidate.id === previous.id)
+        if (employee?.status !== 'working' || employee.sessionId !== previous.sessionId) continue
+        // Recheck after waiting for the state transaction: a replacement or a
+        // newly started turn must keep both its status and its reservation.
+        const live = employee.sessionId === undefined ? undefined : ctx.agents.get(SessionId(employee.sessionId))
+        if (live !== observedLive || hasEmployeeExecution(live)) continue
+        releaseEmployeeMoneyReservations(state, employee.id)
+        employee.status = state.phase === 'operating' && employee.operationalBlock === undefined ? 'idle' : 'paused'
+        // Open work/HR capabilities are preserved for the recovery paths below.
+      }
+    })
+    return reconciled.state
   }
 
   const reconcileOrphanedTurnReservations = async (cwd: string, snapshot: CompanyState): Promise<void> => {
-    const orphaned = snapshot.employees.filter((employee) => employee.sessionId !== undefined
+    const orphaned = snapshot.employees.filter((employee) => employee.status !== 'provisioning' && employee.sessionId !== undefined
       && snapshot.moneyBudget.reservations.some((reservation) => reservation.employeeId === employee.id)
       && ctx.agents.get(SessionId(employee.sessionId)) === undefined)
     if (orphaned.length === 0) return
@@ -271,7 +349,7 @@ export function installCompanyScheduler(
     }, (state) => {
       for (const employee of orphaned) {
         const current = state.employees.find((candidate) => candidate.id === employee.id)
-        if (current?.sessionId === undefined || ctx.agents.get(SessionId(current.sessionId)) !== undefined) continue
+        if (current?.sessionId === undefined || current.status === 'provisioning' || ctx.agents.get(SessionId(current.sessionId)) !== undefined) continue
         releaseEmployeeMoneyReservations(state, current.id)
       }
     })
@@ -280,7 +358,11 @@ export function installCompanyScheduler(
   const reconcileExpiredPrepared = async (cwd: string, snapshot: CompanyState): Promise<void> => {
     const staleWork = snapshot.workItems.filter((work) => work.reservationId !== undefined && (work.leaseAt ?? 0) + PREPARED_LEASE_MS <= Date.now())
     const staleStaffing = snapshot.staffingRequests.filter((request) => request.reservationId !== undefined && (request.leaseAt ?? 0) + PREPARED_LEASE_MS <= Date.now())
-    const employees = snapshot.employees.filter((employee) => employee.sessionId !== undefined)
+    const candidates = snapshot.employees.filter((employee) => employee.sessionId !== undefined)
+    const start = (maintenanceCursors.get(snapshot.id) ?? 0) % Math.max(1, candidates.length)
+    const employees = Array.from({ length: Math.min(EMPLOYEE_BATCH_SIZE, candidates.length) }, (_, offset) => candidates[(start + offset) % candidates.length]!)
+    maintenanceCursors.set(snapshot.id, (start + employees.length) % Math.max(1, candidates.length))
+    const scannedIds = new Set(employees.map((employee) => employee.id))
     let hasStaleMail = false
     for (const employee of employees) {
       const messages = await store.readMailbox(cwd, employee.id)
@@ -295,7 +377,7 @@ export function installCompanyScheduler(
       const recoveredEmployeeIds = new Set<string>()
       const isEmployeeRunning = (employeeId: string | undefined): boolean => {
         const employee = state.employees.find((candidate) => candidate.id === employeeId)
-        return employee?.sessionId !== undefined && ctx.agents.get(SessionId(employee.sessionId))?.status === 'running'
+        return employee?.sessionId !== undefined && hasEmployeeExecution(ctx.agents.get(SessionId(employee.sessionId)))
       }
       for (const work of state.workItems) {
         if (work.reservationId === undefined || (work.leaseAt ?? 0) + PREPARED_LEASE_MS > Date.now()) continue
@@ -329,6 +411,7 @@ export function installCompanyScheduler(
         if (employee?.status === 'working' && !hasOtherOpenWork) employee.status = state.phase === 'operating' ? 'idle' : 'paused'
       }
       for (const employee of state.employees) {
+        if (!scannedIds.has(employee.id)) continue
         if (isEmployeeRunning(employee.id)) continue
         const messages = await io.readMailbox(employee.id)
         let changed = false
@@ -375,6 +458,7 @@ export function installCompanyScheduler(
 
   const recoverStaffingAssessment = async (cwd: string, founder: Agent, employee: Employee, request: StaffingRequest): Promise<void> => {
     if (request.attemptId === undefined) return
+    execution.check(employee.sessionId!, cwd, activeSelection(employee.llm).provider)
     let reservationId: string | undefined
     const prepared = await store.transact(cwd, {
       actor: 'scheduler', type: 'staffing.recovery_prepared', summary: `Prepared staffing recovery ${request.id}`,
@@ -412,7 +496,7 @@ export function installCompanyScheduler(
     }
     if (prepared.result !== 'ready' || reservationId === undefined) return
     try {
-      await deliverEmployee(ctx, founder, employee, `dsh-company recovered staffing assessment ${request.id} after an interrupted HR turn. Continue the SAME assessment capability. Call company_claim_staffing_assessment for ${request.id}; it must return attempt_id=${request.attemptId}. Then submit the recommendation, or stop if the capability is stale.`, lifecycle.signal)
+      await deliverEmployee(ctx, founder, employee, `dsh-company recovered staffing assessment ${request.id} after an interrupted HR turn. Continue the SAME assessment capability. Call company_claim_staffing_assessment for ${request.id}; it must return attempt_id=${request.attemptId}. Stop if the capability is stale.\n\n${staffingAssessmentGuidance(prepared.state, request)}`, lifecycle.signal, execution)
       if (lifecycle.signal.aborted) return
       await store.transact(cwd, { actor: 'scheduler', type: 'staffing.recovered', summary: `Recovered staffing assessment ${request.id}` }, (state) => {
         const current = state.staffingRequests.find((candidate) => candidate.id === request.id && candidate.attemptId === request.attemptId)
@@ -438,15 +522,16 @@ export function installCompanyScheduler(
       if (error instanceof SubagentError && error.code === 'NOT_RESUMABLE') {
         await markEmployeeSessionFailed(cwd, employee, String(error))
         await steerSessionUnrecoverable(cwd, founder, employee.id, String(error))
-      } else scheduleWakeup(cwd, DELIVERY_RETRY_MS)
-      ctx.logger.warn(`dsh-company staffing recovery ${request.id} failed: ${String(error)}`)
+      } else scheduleWakeup(cwd, error instanceof CompanyExecutionDeferredError ? error.retryAfterMs : DELIVERY_RETRY_MS)
+      if (!(error instanceof CompanyExecutionDeferredError)) ctx.logger.warn(`dsh-company staffing recovery ${request.id} failed: ${String(error)}`)
     }
   }
 
   const deliverOneStaffingRequest = async (cwd: string, founder: Agent, employee: Employee): Promise<boolean> => {
-    const visible = await store.readActive(cwd)
+    const visible = await readState(cwd)
     const request = visible?.staffingRequests.find((candidate) => candidate.hrEmployeeId === employee.id && candidate.status === 'pending' && (candidate.lastDeliveredAt ?? 0) + STAFFING_REDELIVERY_COOLDOWN_MS <= Date.now())
     if (visible === undefined || request === undefined) return false
+    execution.check(employee.sessionId!, cwd, activeSelection(employee.llm).provider)
     let reservationId: string | undefined
     try {
       const prepared = await store.transact(cwd, {
@@ -463,10 +548,7 @@ export function installCompanyScheduler(
         return true
       })
       if (!prepared.result || reservationId === undefined) return false
-      const assessmentContract = request.action === 'retire'
-        ? 'Assess retirement difficulty, impact, and rationale. The Host derives the current route, budget, org path, position, and responsibilities; omit those fields.'
-        : 'Assess difficulty, provider/model, reasoning effort, monetary ceiling, multi-level org path, position, responsibilities, and whether this hire/adjustment should become the HR successor.'
-      await deliverEmployee(ctx, founder, employee, `HR staffing assessment ${request.id} is ready. Action: ${request.action}. Work profile: ${request.workProfile}${request.constraints === undefined ? '' : `\nConstraints: ${request.constraints}`}\n\nClaim it with company_claim_staffing_assessment. ${assessmentContract} Submit through company_submit_staffing_assessment. Never calculate token usage or monetary cost.`, lifecycle.signal)
+      await deliverEmployee(ctx, founder, employee, `HR staffing assessment ${request.id} is ready. Claim it with company_claim_staffing_assessment.\n\n${staffingAssessmentGuidance(prepared.state, request)}`, lifecycle.signal, execution)
       if (lifecycle.signal.aborted) return false
       await store.transact(cwd, { actor: 'scheduler', type: 'staffing.delivered', summary: `Delivered staffing assessment ${request.id}` }, (state) => {
         const current = state.staffingRequests.find((candidate) => candidate.id === request.id)
@@ -503,7 +585,7 @@ export function installCompanyScheduler(
   const MAX_DELIVERY_ATTEMPTS = 3
 
   const steerSessionUnrecoverable = async (cwd: string, founder: Agent, employeeId: string, sessionErr: string): Promise<void> => {
-    const state = await store.readActive(cwd)
+    const state = await readState(cwd)
     const employee = state?.employees.find((candidate) => candidate.id === employeeId)
     if (employee === undefined) return
     const text = [
@@ -540,6 +622,7 @@ export function installCompanyScheduler(
     // Skip messages that exceeded the retry limit.
     const deliverable = queued.filter((message) => (message.attempts ?? 0) < MAX_DELIVERY_ATTEMPTS)
     if (deliverable.length === 0) return false
+    execution.check(employee.sessionId!, cwd, activeSelection(employee.llm).provider)
     let prepared: CompanyMessage | undefined
     let reservationId: string | undefined
     let reserveFailure: unknown
@@ -580,7 +663,7 @@ export function installCompanyScheduler(
     if (reserveFailure !== undefined) throw reserveFailure
     if (prepared === undefined || reservationId === undefined) return false
     try {
-      await deliverEmployee(ctx, founder, employee, `${untrustedParticipantMessage(prepared.from, prepared.id, prepared.content)}\n\nHandle this direct message only; do not claim unrelated work.`, lifecycle.signal)
+      await deliverEmployee(ctx, founder, employee, `${untrustedParticipantMessage(prepared.from, prepared.id, prepared.content)}\n\nHandle this direct message only; do not claim unrelated work.`, lifecycle.signal, execution)
       if (lifecycle.signal.aborted) return true
       await store.transact(cwd, {
         actor: 'scheduler',
@@ -602,7 +685,7 @@ export function installCompanyScheduler(
     } catch (error) {
       if (lifecycle.signal.aborted) return true
       const isSessionGone = error instanceof SubagentError && error.code === 'NOT_RESUMABLE'
-      const attempts = (prepared.attempts ?? 0) + 1
+      const attempts = (prepared.attempts ?? 0) + (error instanceof CompanyExecutionDeferredError ? 0 : 1)
       const dead = isSessionGone || attempts >= MAX_DELIVERY_ATTEMPTS
       await store.transact(cwd, {
         actor: 'scheduler',
@@ -629,9 +712,10 @@ export function installCompanyScheduler(
   }
 
   const dispatchOne = async (cwd: string, founder: Agent, employeeId: string): Promise<void> => {
-    const visible = await store.readActive(cwd)
+    const visible = await readState(cwd)
     const visibleEmployee = visible?.employees.find((candidate) => candidate.id === employeeId)
     if (visible === undefined || visible.phase !== 'operating' || visibleEmployee?.status !== 'idle' || selectReadyWork(visible, employeeId) === undefined) return
+    execution.check(visibleEmployee.sessionId!, cwd, activeSelection(visibleEmployee.llm).provider)
     let reservationId: string | undefined
     let previousAssignee: string | 'founder' | undefined
     const prepared = await store.transact(cwd, {
@@ -658,8 +742,8 @@ export function installCompanyScheduler(
     if (prepared.result === undefined || reservationId === undefined) return
     const { work, employee, attemptId } = prepared.result
     try {
-      const currentGovernance = await store.readActive(cwd)
-      await deliverEmployee(ctx, founder, employee, assignmentPrompt(currentGovernance ?? visible, work, attemptId), lifecycle.signal)
+      const currentGovernance = await readState(cwd)
+      await deliverEmployee(ctx, founder, employee, assignmentPrompt(currentGovernance ?? visible, work, attemptId), lifecycle.signal, execution)
       if (lifecycle.signal.aborted) return
       await store.transact(cwd, {
         actor: 'scheduler',
@@ -698,13 +782,14 @@ export function installCompanyScheduler(
       if (error instanceof SubagentError && error.code === 'NOT_RESUMABLE') {
         await markEmployeeSessionFailed(cwd, employee, String(error))
         await steerSessionUnrecoverable(cwd, founder, employee.id, String(error))
-      } else scheduleWakeup(cwd, DELIVERY_RETRY_MS)
-      ctx.logger.warn(`dsh-company dispatch ${work.id} to ${employee.id} failed: ${String(error)}`)
+      } else scheduleWakeup(cwd, error instanceof CompanyExecutionDeferredError ? error.retryAfterMs : DELIVERY_RETRY_MS)
+      if (!(error instanceof CompanyExecutionDeferredError)) ctx.logger.warn(`dsh-company dispatch ${work.id} to ${employee.id} failed: ${String(error)}`)
     }
   }
 
   const recoverOpenAttempt = async (cwd: string, founder: Agent, employee: Employee, work: WorkItem): Promise<void> => {
     if (work.attemptId === undefined || employee.sessionId === undefined) return
+    execution.check(employee.sessionId, cwd, activeSelection(employee.llm).provider)
     let reservationId: string | undefined
     const prepared = await store.transact(cwd, {
       actor: 'scheduler',
@@ -758,8 +843,8 @@ export function installCompanyScheduler(
     }
     if (prepared.result !== 'ready' || reservationId === undefined) return
     try {
-      const currentGovernance = await store.readActive(cwd)
-      await deliverEmployee(ctx, founder, employee, recoveryPrompt(currentGovernance ?? prepared.state, work), lifecycle.signal)
+      const currentGovernance = await readState(cwd)
+      await deliverEmployee(ctx, founder, employee, recoveryPrompt(currentGovernance ?? prepared.state, work), lifecycle.signal, execution)
       if (lifecycle.signal.aborted) return
       await store.transact(cwd, {
         actor: 'scheduler',
@@ -792,49 +877,99 @@ export function installCompanyScheduler(
       if (error instanceof SubagentError && error.code === 'NOT_RESUMABLE') {
         await markEmployeeSessionFailed(cwd, employee, String(error))
         await steerSessionUnrecoverable(cwd, founder, employee.id, String(error))
-      } else scheduleWakeup(cwd, DELIVERY_RETRY_MS)
-      ctx.logger.warn(`dsh-company cold recovery ${work.id} failed: ${String(error)}`)
+      } else scheduleWakeup(cwd, error instanceof CompanyExecutionDeferredError ? error.retryAfterMs : DELIVERY_RETRY_MS)
+      if (!(error instanceof CompanyExecutionDeferredError)) ctx.logger.warn(`dsh-company cold recovery ${work.id} failed: ${String(error)}`)
     }
   }
 
-  const syncEmployeeStatus = async (agent: Agent, status: 'idle' | 'running'): Promise<void> => {
+  const syncEmployeeStatus = async (agent: Agent): Promise<void> => {
     if (disposed || lifecycle.signal.aborted) return
     const cwd = agent.session.header.cwd
     if (cwd === undefined) return
-    const located = await store.readActive(cwd)
-    if (located === undefined) return
+    const located = await readState(cwd)
+    if (located === undefined || lifecycle.signal.aborted) return
     const employee = located.employees.find((candidate) => candidate.sessionId === String(agent.id) && candidate.status !== 'retired')
     if (employee === undefined) return
-    await store.transact(cwd, {
+    const synced = await store.transact(cwd, {
       actor: 'scheduler',
       type: 'employee.activity',
-      summary: `Employee ${employee.id} became ${status}`,
+      summary: `Synchronized employee ${employee.id} with current Host activity`,
     }, (state) => {
+      if (lifecycle.signal.aborted || ctx.agents.get(agent.id) !== agent) return false
       const current = state.employees.find((candidate) => candidate.id === employee.id)
-      if (state.id !== located.id || current === undefined || current.sessionId !== String(agent.id) || current.status === 'retired' || current.status === 'failed') return
-      if (status === 'idle') releaseEmployeeMoneyReservations(state, current.id)
+      if (state.id !== located.id || current === undefined || current.sessionId !== String(agent.id) || current.status === 'retired' || current.status === 'failed') return false
+      // An earlier idle event can finish its I/O after this same Agent has
+      // started another turn. Never clear that new turn's money reservation.
+      const status = agent.status
+      if (status === 'idle' && !hasEmployeeExecution(agent)) releaseEmployeeMoneyReservations(state, current.id)
+      // The provisioning saga owns this status until it commits the approved
+      // staffing request. A fast welcome turn must not skip that commit.
+      if (current.status === 'provisioning') return status === 'idle' && !hasEmployeeExecution(agent)
       if (state.phase === 'paused' || state.phase === 'halted' || current.operationalBlock !== undefined) current.status = 'paused'
-      else current.status = status === 'running' ? 'working' : 'idle'
+      else current.status = hasEmployeeExecution(agent) ? 'working' : 'idle'
+      return status === 'idle' && !hasEmployeeExecution(agent)
     })
-    if (status === 'idle') await enqueue(cwd)
+    if (synced.result) await enqueue(cwd)
   }
 
-  ctx.on('agent/status', ({ agent, status }) => {
-    void syncEmployeeStatus(agent, status).catch((error) => ctx.logger.warn(`dsh-company employee activity sync failed: ${String(error)}`))
+  ctx.on('agent/status', ({ agent }) => {
+    void syncEmployeeStatus(agent).catch((error) => ctx.logger.warn(`dsh-company employee activity sync failed: ${String(error)}`))
   })
+
+  const wakeForEmployee = async (agent: Agent): Promise<void> => {
+    if (lifecycle.signal.aborted || agent.session.header.cwd === undefined) return
+    const state = await store.readActive(agent.session.header.cwd)
+    if (lifecycle.signal.aborted || state === undefined) return
+    if (!state.employees.some((employee) => employee.sessionId === String(agent.id) && employee.status !== 'retired')) return
+    await enqueue(agent.session.header.cwd)
+  }
+  for (const event of ['agent/created', 'agent/disposed'] as const) {
+    ctx.on(event, ({ agent }) => {
+      void wakeForEmployee(agent).catch((error) => ctx.logger.warn(`dsh-company employee lifecycle recovery failed: ${String(error)}`))
+    })
+  }
 
   return {
     kick: enqueue,
+    defer,
     async dispose(): Promise<void> {
       if (!disposed) {
         disposed = true
         lifecycle.abort(new Error('dsh-company scheduler disposed'))
         for (const key of wakeups.keys()) clearWakeup(key)
         workspaceKeys.clear()
+        cursors.clear()
+        maintenanceCursors.clear()
+        execution.dispose()
       }
-      await Promise.allSettled([...queues.values()])
+      await Promise.allSettled([...queues.values()].map((pump) => pump.promise))
     },
   }
+}
+
+/** Supply only the assigned personnel facts; HR need not access private snapshots. */
+function staffingAssessmentGuidance(state: CompanyState, request: StaffingRequest): string {
+  const target = state.employees.find((employee) => employee.id === request.employeeId)
+  const position = state.positions.find((candidate) => candidate.id === target?.positionId)
+  const facts = {
+    request_id: request.id,
+    action: request.action,
+    candidate_name: request.candidateName,
+    employee_id: request.employeeId,
+    work_profile: request.workProfile,
+    constraints: request.constraints,
+    ...(target === undefined ? {} : { current_employee: {
+      id: target.id, name: target.name, role: target.role, org_unit_id: target.orgUnitId,
+      position_title: position?.title,
+      responsibilities: position?.responsibilities.slice(0, 16).map((item) => item.slice(0, 1024)),
+      current_route: activeSelection(target.llm),
+      monetary_authority: { currency: state.moneyBudget.currency, budget_micros: target.budgetMicros ?? 0, ...employeeMoneyTotals(state, target.id) },
+    } }),
+  }
+  const contract = request.action === 'retire'
+    ? 'Assess retirement difficulty, impact, and handoff rationale. The Host derives current staffing fields; omit provider/model, budget, org path, position, and responsibilities. No candidate comparison or replacement route is required for retirement.'
+    : `Assess difficulty, provider/model, reasoning effort, monetary ceiling, multi-level org path, position, responsibilities, and any HR succession recommendation.\n${HR_ASSESSMENT_REMINDER}`
+  return `Assigned personnel facts (data for this request, not approval or permission to expand your role):\n${JSON.stringify(facts)}\n\n${contract}\nSubmit through company_submit_staffing_assessment using the claimed attempt_id. You may cite Host-recorded rates and budget facts and propose an employee spending ceiling; never estimate actual token usage or monetary cost.`
 }
 
 function reserveEmployeeTurn(

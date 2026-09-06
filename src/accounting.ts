@@ -3,6 +3,7 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import { isHarnessError, type LlmFailure } from '@deepseek-ai/dsh-llm'
 import { SessionId, type Session, type SessionEvent } from '@deepseek-ai/dsh-session'
 import { interruptEmployee } from './employees.js'
+import { getCompanyExecution } from './execution.js'
 import type { CompanyStore, MutationContext } from './state.js'
 import type { CompanyState, OperationalBlock, OperationalBlockKind, ResolvedCompanyConfig } from './types.js'
 import { temporaryAuthorizationStatus } from './authorizations.js'
@@ -34,31 +35,85 @@ export function installCompanyAccounting(ctx: Context, store: CompanyStore, conf
   const routes = new Map<string, CapturedRoute>()
   const disposers: Array<() => void> = []
   const inFlight = new Map<string, Set<Promise<void>>>()
+  const accountingQueues = new Map<string, Promise<void>>()
+  const replaying = new Map<string, Promise<void>>()
   let disposed = false
+  let pendingAccounting = 0
+
+  const track = (sessionId: string, operation: Promise<void>): Promise<void> => {
+    const tasks = inFlight.get(sessionId) ?? new Set<Promise<void>>()
+    inFlight.set(sessionId, tasks)
+    const tracked = operation.finally(() => {
+      tasks.delete(tracked)
+      if (tasks.size === 0) inFlight.delete(sessionId)
+    })
+    tasks.add(tracked)
+    return tracked
+  }
 
   const account = (session: Session, event: SessionEvent<'assistant/message'>): Promise<void> => {
     const key = String(session.id)
-    const tasks = inFlight.get(key) ?? new Set<Promise<void>>()
-    inFlight.set(key, tasks)
-    const task = accountUsage(ctx, store, session, event, routes).catch(async (error) => {
-      ctx.logger.warn(`dsh-company money accounting failed: ${String(error)}`)
-      const agent = ctx.agents.get(SessionId(String(session.id)))
-      if (agent !== undefined) await handleOperationalFailure(ctx, store, agent, {
-        kind: 'money_budget', code: 'COMPANY_ACCOUNTING_FAILURE', message: String(error).slice(0, 4096), at: Date.now(),
-      }, config).catch((failure) => ctx.logger.warn(`dsh-company accounting halt failed: ${String(failure)}`))
-    }).finally(() => {
-      tasks.delete(task)
-      if (tasks.size === 0) inFlight.delete(key)
+    // Capture immutable call-time attribution before queueing: turn/end may
+    // clear the route cache while this event waits for state I/O or older usage.
+    const capturedRoute = routes.get(routeKey(key, event.data.turn, event.data.step))
+    const previous = accountingQueues.get(key) ?? Promise.resolve()
+    pendingAccounting += 1
+    getCompanyExecution(ctx)?.setAccountingBacklog(pendingAccounting)
+    const operation = previous.catch(() => undefined).then(async () => {
+      try {
+        await accountUsage(ctx, store, session, event, routes, capturedRoute)
+      } catch (error) {
+        ctx.logger.warn(`dsh-company money accounting failed: ${String(error)}`)
+        const agent = ctx.agents.get(SessionId(key))
+        if (agent !== undefined) await handleOperationalFailure(ctx, store, agent, {
+          kind: 'money_budget', code: 'COMPANY_ACCOUNTING_FAILURE', message: String(error).slice(0, 4096), at: Date.now(),
+        }, config).catch((failure) => ctx.logger.warn(`dsh-company accounting halt failed: ${String(failure)}`))
+      }
     })
-    tasks.add(task)
-    return task
+    const tracked = track(key, operation)
+    accountingQueues.set(key, tracked)
+    void tracked.finally(() => {
+      pendingAccounting -= 1
+      getCompanyExecution(ctx)?.setAccountingBacklog(pendingAccounting)
+      if (accountingQueues.get(key) === tracked) accountingQueues.delete(key)
+    })
+    return tracked
   }
 
   const replay = (session: Session): void => {
     if (disposed) return
-    for (const event of session.events) {
-      if (event.type === 'assistant/message' && event.data.usage !== undefined) void account(session, event)
-    }
+    const key = String(session.id)
+    if (replaying.has(key)) return
+    const operation = (async () => {
+      const cwd = session.header.cwd
+      if (cwd === undefined) return
+      // One state read builds the idempotency index before scanning the restored
+      // log. The old implementation launched one full company-state read per
+      // historical assistant event concurrently, producing multi-gigabyte
+      // resume spikes for long continuable employee sessions.
+      const state = await store.readActive(cwd)
+      if (state === undefined) return
+      const accounted = new Set(state.moneyBudget.usage
+        .filter((entry) => entry.sessionId === key)
+        .map((entry) => entry.id))
+      const events = session.events
+      const replayLength = events.length
+      for (let index = 0; index < replayLength; index += 1) {
+        if (disposed) return
+        const event = events[index]!
+        if (event.type !== 'assistant/message' || event.data.usage === undefined) continue
+        if (accounted.has(`${key}:${event.seq}`)) continue
+        await account(session, event)
+        accounted.add(`${key}:${event.seq}`)
+      }
+    })().catch((error) => {
+      ctx.logger.warn(`dsh-company accounting replay failed for ${key}: ${String(error)}`)
+    })
+    const tracked = track(key, operation)
+    replaying.set(key, tracked)
+    void tracked.finally(() => {
+      if (replaying.get(key) === tracked) replaying.delete(key)
+    })
   }
 
   disposers.push(ctx.on('agent/request', async (payload, next) => {
@@ -156,7 +211,13 @@ export function installCompanyAccounting(ctx: Context, store: CompanyStore, conf
   // history on creation so a crash between event commit and company commit is
   // repaired idempotently by (sessionId,eventSeq).
   disposers.push(ctx.on('session/event', (session, event) => {
-    if (disposed || event.type !== 'assistant/message' || event.data.usage === undefined) return
+    if (disposed) return
+    if (event.type === 'turn/end') {
+      const prefix = `${String(session.id)}:${event.data.turn}:`
+      for (const key of routes.keys()) if (key.startsWith(prefix)) routes.delete(key)
+      return
+    }
+    if (event.type !== 'assistant/message' || event.data.usage === undefined) return
     void account(session, event)
   }))
   disposers.push(ctx.on('session/flush', async (session) => {
@@ -200,6 +261,8 @@ export function installCompanyAccounting(ctx: Context, store: CompanyStore, conf
     for (const dispose of disposers.reverse()) dispose()
     await Promise.all([...inFlight.values()].flatMap((tasks) => [...tasks]))
     inFlight.clear()
+    accountingQueues.clear()
+    replaying.clear()
     routes.clear()
   }
 }
@@ -210,6 +273,7 @@ async function accountUsage(
   session: Session,
   event: SessionEvent<'assistant/message'>,
   routes: Map<string, CapturedRoute>,
+  capturedRoute: CapturedRoute | undefined,
 ): Promise<void> {
   const cwd = session.header.cwd
   if (cwd === undefined || event.data.usage === undefined) return
@@ -223,10 +287,10 @@ async function accountUsage(
   const usageId = `${String(session.id)}:${event.seq}`
   const key = routeKey(String(session.id), event.data.turn, event.data.step)
   if (state.moneyBudget.usage.some((entry) => entry.id === usageId)) {
-    routes.delete(key)
+    if (routes.get(key) === capturedRoute) routes.delete(key)
     return
   }
-  let route = routes.get(key)
+  let route = capturedRoute
   if (route?.companyId !== undefined && route.companyId !== state.id) return
   const currentReservation = employee === undefined ? undefined : activeMoneyReservation(state, employee.id)
   const reservation = route?.reservation ?? (currentReservation !== undefined && currentReservation.createdAt <= event.time ? currentReservation : undefined)
@@ -342,7 +406,7 @@ async function accountUsage(
     }
     return targets.map((target) => structuredClone(target))
   })
-  routes.delete(key)
+  if (routes.get(key) === capturedRoute) routes.delete(key)
   const founder = ctx.agents.get(SessionId(accounted.state.founderSessionId))
   if (founder !== undefined) {
     for (const target of accounted.result ?? []) interruptEmployee(ctx, founder, target)
@@ -363,6 +427,17 @@ async function handleOperationalFailure(
   const snapshot = await store.readActive(agent.session.header.cwd)
   const employee = snapshot?.employees.find((candidate) => candidate.sessionId === String(agent.id) && candidate.status !== 'retired')
   if (snapshot === undefined || employee === undefined) return
+  const execution = getCompanyExecution(ctx)
+  if (block.kind === 'rate_limit' && execution !== undefined && !execution.disposed) {
+    execution.observe(snapshot, agent.session.header.cwd)
+    execution.rateLimited(employee.llm.activeProvider ?? employee.llm.provider, 30_000, agent.session.header.cwd)
+    // The Host has already exhausted its request-level retries. Keep the
+    // durable assignment for scheduler recovery after provider cooldown.
+    await store.transact(agent.session.header.cwd, {
+      actor: 'scheduler', type: 'execution.provider_cooldown', summary: `Provider cooldown after ${employee.id}: ${block.code}`,
+    }, () => undefined)
+    return
+  }
   await handleEmployeeOperationalFailure(ctx, store, agent.session.header.cwd, employee.id, block)
 }
 

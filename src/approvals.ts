@@ -7,7 +7,7 @@ import type {
 } from './types.js'
 import { normalizeMultilineString } from './paths.js'
 import { adjustMoneyBudgetTotal, pricingMatrixDigest, replaceModelPrices, resolveRateSnapshot } from './money.js'
-import { validateApprovalPayload, isRecord, normalizeCurrency, normalizeModelPrices } from './schemas.js'
+import { validateApprovalPayload, isRecord, normalizeEmployeeLimit, normalizeCurrency, normalizeModelPrices } from './schemas.js'
 import type { ModelPriceInput } from './types.js'
 
 export interface ApprovalResolutionInput {
@@ -41,6 +41,22 @@ export function createApproval(
   if (input.expiresAt !== undefined && (!Number.isSafeInteger(input.expiresAt) || input.expiresAt <= Date.now())) {
     throw new Error('approval expires_at must be a future Unix epoch millisecond timestamp')
   }
+  const payload = structuredClone(input.payload)
+  if (input.kind === 'budget_change' && isRecord(payload) && Array.isArray(payload.employeeAllocations)) {
+    const employeeIds = new Set<unknown>()
+    for (const allocation of payload.employeeAllocations) {
+      if (!isRecord(allocation)) throw new Error('employee allocation must be an object')
+      if (employeeIds.has(allocation.id)) throw new Error(`budget_change.employeeAllocations contains duplicate employee id ${String(allocation.id)}`)
+      employeeIds.add(allocation.id)
+      const employee = state.employees.find((candidate) => candidate.id === allocation.id && candidate.status !== 'retired')
+      if (employee === undefined) throw new Error(`employee allocation ${String(allocation.id)} must target an active employee`)
+      const expectedBudgetMicros = employee.budgetMicros ?? 0
+      if (allocation.expectedBudgetMicros !== undefined && allocation.expectedBudgetMicros !== expectedBudgetMicros) {
+        throw new Error(`employee ${employee.id} monetary ceiling changed; request a new budget approval`)
+      }
+      allocation.expectedBudgetMicros = expectedBudgetMicros
+    }
+  }
   state.counters.approval += 1
   const approval: ApprovalRequest = {
     id: `a${state.counters.approval}`,
@@ -49,7 +65,7 @@ export function createApproval(
     requestedBy,
     summary,
     ...(detail === undefined ? {} : { detail }),
-    payload: structuredClone(input.payload),
+    payload,
     risk: input.risk ?? defaultRisk(input.kind),
     requestedAt: Date.now(),
     ...(input.requestedFromUserMessageId === undefined ? {} : { requestedFromUserMessageId: input.requestedFromUserMessageId }),
@@ -162,14 +178,31 @@ function approvalPreconditionError(state: CompanyState, approval: ApprovalReques
       if (approval.payload.companyId !== state.id) return 'company id changed'
       return undefined
     case 'budget_change':
-      return approval.payload.expectedTotalMicros === state.moneyBudget.totalMicros ? undefined : 'money budget total changed'
+      if (approval.payload.expectedTotalMicros !== state.moneyBudget.totalMicros) return 'money budget total changed'
+      if (Array.isArray(approval.payload.employeeAllocations)) {
+        const employeeIds = new Set<unknown>()
+        for (const allocation of approval.payload.employeeAllocations) {
+          if (!isRecord(allocation)) return 'employee allocation is not an object'
+          if (employeeIds.has(allocation.id)) return `employee budget request contains duplicate employee id ${String(allocation.id)}; request a new budget approval`
+          employeeIds.add(allocation.id)
+          const employee = state.employees.find((candidate) => candidate.id === allocation.id && candidate.status !== 'retired')
+          if (employee === undefined) return `employee ${String(allocation.id)} is no longer active`
+          if (allocation.expectedBudgetMicros === undefined) return `employee ${employee.id} budget precondition is missing; request a new budget approval`
+          if (allocation.expectedBudgetMicros !== (employee.budgetMicros ?? 0)) return `employee ${employee.id} monetary ceiling changed`
+        }
+      }
+      return undefined
     case 'pricing_change':
       if (approval.payload.expectedCurrency !== state.moneyBudget.currency) return 'money budget currency changed'
       if (approval.payload.expectedPricingRevision !== state.moneyBudget.pricingRevision) return 'pricing revision changed'
       if (approval.payload.expectedDigest !== pricingDigest(state)) return 'pricing matrix changed'
       return undefined
     case 'governance_change':
-      return approval.payload.expectedGovernanceRevision === state.governanceRevision ? undefined : 'governance revision changed'
+      if (approval.payload.expectedGovernanceRevision !== state.governanceRevision) return 'governance revision changed'
+      if (typeof approval.payload.maxEmployees === 'number' && approval.payload.maxEmployees < state.employees.filter((employee) => employee.status !== 'retired').length) {
+        return 'requested employee ceiling is below current active headcount; retire employees and request a new approval'
+      }
+      return undefined
     case 'temporary_authorization':
       if (approval.payload.action === 'revoke') {
         const id = approval.payload.authorizationId
@@ -244,6 +277,8 @@ function applyApprovedPayload(state: CompanyState, config: ResolvedCompanyConfig
       return true
     }
     case 'governance_change': {
+      // This branch only runs after the human decision and revision/headcount checks.
+      if (approval.payload.maxEmployees !== undefined) state.limits.maxEmployees = normalizeEmployeeLimit(approval.payload.maxEmployees)
       if (approval.payload.slogan !== undefined) state.slogan = String(approval.payload.slogan).normalize('NFC').trim()
       if (approval.payload.mission !== undefined) state.mission = String(approval.payload.mission).normalize('NFC').trim()
       if (approval.payload.charter !== undefined) state.formation.charter = String(approval.payload.charter).normalize('NFC').trim()
@@ -317,7 +352,7 @@ function applyMoneyAllocations(state: CompanyState, productRaw: JsonValue | unde
     for (const allocation of employeeRaw) {
       if (!isRecord(allocation)) throw new Error('employee allocation must be an object')
       const employee = state.employees.find((candidate) => candidate.id === allocation.id)
-      if (employee === undefined) throw new Error(`unknown employee allocation ${String(allocation.id)}`)
+      if (employee === undefined || employee.status === 'retired') throw new Error(`employee allocation ${String(allocation.id)} must target an active employee`)
       const budget = allocation.budgetMicros as number
       const spent = state.moneyBudget.usage.filter((entry) => entry.employeeId === employee.id).reduce((sum, entry) => sum + entry.costMicros, 0)
       const reserved = state.moneyBudget.reservations.filter((entry) => entry.employeeId === employee.id).reduce((sum, entry) => sum + entry.remainingMicros, 0)

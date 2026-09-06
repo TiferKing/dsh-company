@@ -64,7 +64,7 @@ test('web mutations execute and persist for loopback pages, fail closed for anyt
     const staged = await harness.runtime.bootstrap(harness.founder, {
       name: 'Draft Co', mission: 'Build one bounded tool.', charter: '1. Original clause.',
       firstProduct: { name: 'Tool', summary: 'One tool.', productRoot: 'tool', successCriteria: ['Tests pass'], budgetMicros: 1_000_000 },
-      totalBudgetMicros: 1_000_000, currency: 'CNY', draftedBy: 'ai',
+      totalBudgetMicros: 1_000_000, hrBudgetMicros: 100_000, currency: 'CNY', draftedBy: 'ai',
     })
 
     // Remote clients never mutate, regardless of payload quality.
@@ -130,7 +130,7 @@ test('Web temporary authorization follows request → approval → atomic grant'
     await harness.runtime.bootstrap(harness.founder, {
       name: 'Approval Co', mission: 'Test authorization governance.', charter: '1. Human approval is required.',
       firstProduct: { name: 'Tool', summary: 'One tool.', productRoot: 'tool', successCriteria: ['Tests pass'], budgetMicros: 1_000_000 },
-      totalBudgetMicros: 1_000_000, currency: 'CNY', draftedBy: 'ai',
+      totalBudgetMicros: 1_000_000, hrBudgetMicros: 100_000, currency: 'CNY', draftedBy: 'ai',
       modelPrices: [{ provider: 'mock', model: 'mock-model', inputCacheMissMicrosPerMillion: 0, inputCacheHitMicrosPerMillion: 0, outputMicrosPerMillion: 0 }],
     })
     await harness.runtime.approveBootstrap(harness.founder, 'Approved and start.', { source: 'ui' })
@@ -163,7 +163,7 @@ test('web budget/pricing requests work without any founder chat anchor', async (
     await harness.runtime.bootstrap(harness.founder, {
       name: 'Draft Co', mission: 'Build one bounded tool.', charter: '1. Original clause.',
       firstProduct: { name: 'Tool', summary: 'One tool.', productRoot: 'tool', successCriteria: ['Tests pass'], budgetMicros: 1_000_000 },
-      totalBudgetMicros: 1_000_000, currency: 'CNY', draftedBy: 'ai',
+      totalBudgetMicros: 1_000_000, hrBudgetMicros: 100_000, currency: 'CNY', draftedBy: 'ai',
       modelPrices: [{ provider: 'mock', model: 'mock-model', inputCacheMissMicrosPerMillion: 0, inputCacheHitMicrosPerMillion: 0, outputMicrosPerMillion: 0 }],
     })
     await harness.runtime.approveBootstrap(harness.founder, 'Approved and start.', { source: 'ui' })

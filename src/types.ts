@@ -9,11 +9,21 @@ export const COMPANY_SNAPSHOT_SCHEMA_VERSION = 5 as const
 export const COMPANY_PHASES = ['staged', 'provisioning', 'provisioning_failed', 'operating', 'paused', 'halted', 'archived'] as const
 export type CompanyPhase = (typeof COMPANY_PHASES)[number]
 
+/** A saved finite ceiling remains binding until an explicit human-approved change. */
+export type EmployeeLimit = number | 'unlimited'
+export type ExecutionMode = 'adaptive' | 'fixed' | 'unlimited'
+
 export interface CompanyConfig {
   stateRoot?: string
   subagentProvider?: string
   memberMaxDepth?: number
-  maxEmployees?: number
+  maxEmployees?: EmployeeLimit
+  executionMode?: ExecutionMode
+  maxConcurrentEmployees?: number
+  executionMemoryHighWatermark?: number
+  executionLagHighWatermarkMs?: number
+  executionMaxPendingWrites?: number
+  executionRetryMs?: number
   maxProducts?: number
   maxWorkItems?: number
   maxOpenWorkItems?: number
@@ -40,7 +50,13 @@ export interface ResolvedCompanyConfig {
   stateRootDisplay: string
   subagentProvider: string
   memberMaxDepth: number
-  maxEmployees: number
+  maxEmployees: EmployeeLimit
+  executionMode: ExecutionMode
+  maxConcurrentEmployees: number
+  executionMemoryHighWatermark: number
+  executionLagHighWatermarkMs: number
+  executionMaxPendingWrites: number
+  executionRetryMs: number
   maxProducts: number
   maxWorkItems: number
   maxOpenWorkItems: number
@@ -62,7 +78,7 @@ export interface ResolvedCompanyConfig {
 }
 
 export interface LimitsSnapshot {
-  maxEmployees: number
+  maxEmployees: EmployeeLimit
   maxProducts: number
   maxWorkItems: number
   maxOpenWorkItems: number
@@ -708,6 +724,9 @@ export interface SafeOrgUnitView {
   child_ids: string[]
   position_ids: string[]
   load: DepartmentLoadView
+  child_count?: number
+  position_count?: number
+  money_summary?: { budget_micros: number; spent_micros: number; available_micros: number }
 }
 
 export interface SafePositionView {
@@ -717,6 +736,7 @@ export interface SafePositionView {
   reports_to_position_id?: string
   responsibilities: string[]
   employee_ids: string[]
+  employee_count?: number
 }
 
 export interface SafeStaffingRequestView {
@@ -878,6 +898,39 @@ export interface SafeModelCatalogView {
   errors: Array<{ provider: string; message: string }>
 }
 
+export interface SnapshotQuery {
+  employeeOffset?: number
+  employeeLimit?: number
+  employeeSearch?: string
+  employeeStatus?: 'all' | 'active' | 'retired' | 'running'
+  employeeExactStatus?: EmployeeStatus
+  employeeId?: string
+  employeeOrgUnitId?: string
+  employeePositionId?: string
+  orgOffset?: number
+  orgId?: string
+  orgLimit?: number
+  positionOffset?: number
+  positionId?: string
+  positionLimit?: number
+}
+
+export interface SnapshotPage {
+  total: number
+  filtered_total: number
+  offset: number
+  limit: number
+  returned: number
+  next_offset: number | null
+}
+
+export interface SnapshotDirectory {
+  employees: SnapshotPage & { query: SnapshotQuery }
+  org_units: SnapshotPage
+  positions: SnapshotPage
+  summary: { employees: number; active_employees: number; retired_employees: number; running_employees: number; org_units: number; positions: number; employee_statuses: Record<string, number> }
+}
+
 /** Canonical Host/Web wire projection. */
 export interface CompanySnapshot {
   schema_version: typeof COMPANY_SNAPSHOT_SCHEMA_VERSION
@@ -900,7 +953,10 @@ export interface CompanySnapshot {
     updated_at: number
     founder_session_id?: string
     health: CompanyHealth
+    max_employees?: number | 'unlimited'
   }
+  directory?: SnapshotDirectory
+  execution?: { mode: 'adaptive' | 'fixed' | 'unlimited'; running: number; limit: number | null; waiting: number; reason?: string; retry_at?: number }
   org_units: SafeOrgUnitView[]
   positions: SafePositionView[]
   staffing_requests: SafeStaffingRequestView[]
@@ -1012,6 +1068,7 @@ export interface BootstrapInput {
   charter: string
   firstProduct: FormationProductInput
   totalBudgetMicros: number
+  hrBudgetMicros: number
   currency: string
   modelPrices?: ModelPriceInput[]
   draftedBy?: 'ai' | 'user'
@@ -1028,6 +1085,7 @@ export interface EditFormationInput {
   charter?: string
   firstProduct?: Partial<FormationProductInput>
   totalBudgetMicros?: number
+  hrBudgetMicros?: number
   currency?: string
   modelPrices?: ModelPriceInput[]
   hrName?: string
@@ -1040,12 +1098,14 @@ export interface GovernanceChangeInput {
   slogan?: string
   mission?: string
   charter?: string
+  maxEmployees?: EmployeeLimit
   expectedGovernanceRevision?: number
 }
 
 export interface BudgetChangeInput {
   totalBudgetMicros?: number
   productBudgets?: Array<{ productId: string; budgetMicros: number }>
+  employeeBudgets?: Array<{ employeeId: string; budgetMicros: number }>
   modelPrices?: ModelPriceInput[]
   expectedPricingRevision?: number
 }

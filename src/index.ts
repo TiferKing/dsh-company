@@ -8,6 +8,7 @@ import type {} from '@deepseek-ai/dsh-settings/types'
 import type {} from '@deepseek-ai/dsh-system-prompt'
 import type {} from '@deepseek-ai/dsh-tools'
 import { installCompanyAccounting } from './accounting.js'
+import { getCompanyExecution } from './execution.js'
 import { interruptEmployee } from './employees.js'
 import { installCompanyRoutes } from './http.js'
 import { installCompanyPrompt } from './prompt.js'
@@ -25,7 +26,13 @@ export const Config: z<CompanyConfig> = z.object({
   stateRoot: z.string(),
   subagentProvider: z.string().default('spawn'),
   memberMaxDepth: z.natural().max(32).default(1),
-  maxEmployees: z.natural().min(1).max(32).default(8),
+  maxEmployees: z.union([z.natural().min(1).max(Number.MAX_SAFE_INTEGER), z.const('unlimited')]).default('unlimited'),
+  executionMode: z.union([z.const('adaptive'), z.const('fixed'), z.const('unlimited')]).default('adaptive'),
+  maxConcurrentEmployees: z.natural().min(1).max(Number.MAX_SAFE_INTEGER).default(8),
+  executionMemoryHighWatermark: z.number().min(0.1).max(0.95).default(0.8),
+  executionLagHighWatermarkMs: z.natural().min(1).max(60_000).default(200),
+  executionMaxPendingWrites: z.natural().min(1).max(Number.MAX_SAFE_INTEGER).default(32),
+  executionRetryMs: z.natural().min(100).max(60_000).default(1000),
   maxProducts: z.natural().min(1).max(64).default(8),
   maxWorkItems: z.natural().min(1).max(1000).default(128),
   maxOpenWorkItems: z.natural().min(1).max(1000).default(32),
@@ -93,7 +100,19 @@ export function apply(ctx: Context, input: CompanyConfig = {}): void {
   })
   ctx.effect(() => {
     queueMicrotask(() => {
-      if (active) for (const root of ctx.agents.roots()) recover(root)
+      void (async () => {
+        if (!active) return
+        const roots = ctx.agents.roots()
+        // Restore occupancy across all loaded companies before any startup
+        // recovery starts additional children in the shared Host.
+        await Promise.all(roots.map(async (root) => {
+          try {
+            const state = await store.readActiveView(root.session.header.cwd)
+            if (active && state !== undefined && String(root.id) === state.founderSessionId) getCompanyExecution(ctx)?.observe(state, root.session.header.cwd)
+          } catch (error) { ctx.logger.warn(`dsh-company startup inventory failed: ${String(error)}`) }
+        }))
+        if (active) for (const root of roots) recover(root)
+      })().catch((error) => ctx.logger.warn(`dsh-company startup inventory failed: ${String(error)}`))
     })
     return async () => {
       active = false

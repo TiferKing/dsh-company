@@ -7,7 +7,9 @@ import { createApproval, consumeApproval, requireApproved, resolveApproval } fro
 import {
   adjustMoneyBudgetTotal,
   activeMoneyReservation,
+  CompanyMoneyBudgetError,
   CompanyUnpricedModelError,
+  employeeMoneyTotals,
   matchModelPrice,
   pricingMatrixDigest,
   releaseEmployeeMoneyReservations,
@@ -35,7 +37,7 @@ import {
   type SelectionRuntime,
 } from './employees.js'
 import { normalizeMultilineString, normalizeString, normalizeWorkspaceRelative } from './paths.js'
-import { assertAcyclic, isRecord, currencyUnitsToMicros, normalizeCurrency, normalizeModelPrices, validateApprovalPayload } from './schemas.js'
+import { assertAcyclic, isRecord, currencyUnitsToMicros, effectiveEmployeeLimit, normalizeEmployeeLimit, normalizeCurrency, normalizeModelPrices, validateApprovalPayload } from './schemas.js'
 import { makeMailboxRoom, RevisionConflictError, type CompanyStore, type MutationContext } from './state.js'
 import { COMPANY_STATE_SCHEMA_VERSION } from './types.js'
 import type {
@@ -48,6 +50,7 @@ import type {
   CompanyActor,
   CompanyMessage,
   CompanySnapshot,
+  SnapshotQuery,
   CompanyState,
   CompanyUiAction,
   CreateProductInput,
@@ -83,9 +86,11 @@ import {
   validateDependencyReplacement,
 } from './work.js'
 import { buildSnapshot } from './snapshot.js'
+import { CompanyExecutionDeferredError, ensureCompanyExecution } from './execution.js'
 
 export interface SchedulerHandle {
   kick(cwd: string | undefined, suppliedFounder?: Agent): Promise<void>
+  defer?(cwd: string | undefined, delayMs: number): void
   dispose?(): void | Promise<void>
 }
 
@@ -104,6 +109,7 @@ export class CompanyRuntime {
   readonly config: ResolvedCompanyConfig
   readonly store: CompanyStore
   readonly selections: SelectionRuntime
+  private readonly execution: ReturnType<typeof ensureCompanyExecution>
   private scheduler?: SchedulerHandle
   private closing = false
   private modelTopologyEpoch = 0
@@ -114,6 +120,7 @@ export class CompanyRuntime {
     this.ctx = ctx
     this.config = config
     this.store = store
+    this.execution = ensureCompanyExecution(ctx, config, store)
     this.selections = installEmployeeSelectionRuntime(ctx, store)
   }
 
@@ -123,6 +130,7 @@ export class CompanyRuntime {
 
   stopAdmission(): void {
     this.closing = true
+    this.execution.dispose()
   }
 
   noteModelTopologyChange(): void {
@@ -175,7 +183,6 @@ export class CompanyRuntime {
       await this.continueStaffingProvisioning(founder, employee.id, request.id, known.has(employee.sessionId!))
       state = await this.store.readActive(founder.session.header.cwd) ?? state
     }
-    this.kick(founder.session.header.cwd, founder)
   }
 
   async bootstrap(founder: Agent, input: BootstrapInput): Promise<{ companyId: string; phase: string; revision: number; stateRootDisplay: string }> {
@@ -192,6 +199,7 @@ export class CompanyRuntime {
     const slogan = normalizeString(input.slogan ?? deriveSlogan(mission), 'company slogan', 160)
     const charter = normalizeMultilineString(input.charter, 'company charter', 32_768)
     const totalBudgetMicros = boundedMicros(input.totalBudgetMicros, this.config.maxMoneyBudgetMicros, 'total_budget_micros')
+    const hrBudgetMicros = boundedMicros(input.hrBudgetMicros, totalBudgetMicros, 'hr_budget_micros')
     const currency = normalizeCurrency(input.currency)
     const modelPrices = input.modelPrices === undefined
       ? this.config.modelPrices.map((price) => ({ ...structuredClone(price), updatedAt: now }))
@@ -206,17 +214,19 @@ export class CompanyRuntime {
       ...(input.hrReasoningEffort === undefined ? {} : { reasoningEffort: input.hrReasoningEffort }),
     })
     let modelCatalog: CompanyState['modelCatalog'] = { stale: true, generation: 0, models: [], errors: [] }
-    try {
-      if (typeof this.ctx.llm.listProviders === 'function') modelCatalog = await probeRegisteredModels(this.ctx, modelCatalog)
-    } catch (error) {
-      modelCatalog = { stale: true, generation: 0, models: [], errors: [{ provider: '*', message: boundedError(error) }] }
-    }
     const formationRoutes = [
       { provider: hrSelection.provider, model: hrSelection.model },
       ...(hrSelection.fallback === undefined ? [] : [hrSelection.fallback]),
     ]
+    // Seed exact HR routes before probing so unadvertised primary/fallback
+    // models also acquire the context and reasoning metadata needed to start.
     for (const route of formationRoutes) if (!modelCatalog.models.some((candidate) => candidate.provider === route.provider && candidate.model === route.model)) {
-      modelCatalog.models.push({ provider: route.provider, model: route.model, name: route.model, advertised: false, available: true })
+      modelCatalog.models.push({ provider: route.provider, model: route.model, name: route.model, advertised: false, available: false })
+    }
+    try {
+      if (typeof this.ctx.llm.listProviders === 'function') modelCatalog = await probeRegisteredModels(this.ctx, modelCatalog)
+    } catch (error) {
+      modelCatalog = { ...modelCatalog, stale: true, errors: [{ provider: '*', message: boundedError(error) }] }
     }
     const companyId = `c_${randomUUID()}`
     const state: CompanyState = {
@@ -268,9 +278,8 @@ export class CompanyRuntime {
       hrEmployeeId: 'e1',
       employees: [{
         id: 'e1', name: hrName, role: 'Head of People & Model Governance',
-        orgUnitId: 'ou2', positionId: 'pos1', isHr: true, budgetMicros: totalBudgetMicros,
+        orgUnitId: 'ou2', positionId: 'pos1', isHr: true, budgetMicros: hrBudgetMicros,
         status: 'planned', llm: hrSelection,
-        executionPrompt: 'Assess staffing work difficulty and submit structured, bounded model-route and reasoning-effort recommendations. Never estimate or report token usage or money; the plugin accounts for those programmatically.',
       }],
       products: [{
         id: 'p1', name: normalizeString(input.firstProduct.name, 'first product name', 200),
@@ -295,18 +304,21 @@ export class CompanyRuntime {
     this.assertAdmission()
     const located = await this.requireFounder(founder)
     const currentHr = located.state.hrEmployeeId === undefined ? undefined : located.state.employees.find((employee) => employee.id === located.state.hrEmployeeId)
-    if ((input.hrName !== undefined || input.hrProvider !== undefined || input.hrModel !== undefined || input.hrReasoningEffort !== undefined) && currentHr === undefined) throw new Error('formation has no HR lead to edit')
+    if ((input.hrName !== undefined || input.hrProvider !== undefined || input.hrModel !== undefined || input.hrReasoningEffort !== undefined || input.hrBudgetMicros !== undefined) && currentHr === undefined) throw new Error('formation has no HR lead to edit')
     if ((input.hrProvider === undefined) !== (input.hrModel === undefined)) throw new Error('hr_provider and hr_model must be supplied together')
     const currentHrRoute = currentHr === undefined ? undefined : activeSelection(currentHr.llm)
     const requestedEffort = input.hrReasoningEffort?.trim().toLowerCase() === 'default' ? undefined : input.hrReasoningEffort?.trim()
     const editHrSelection = (input.hrProvider !== undefined && (input.hrProvider.trim() !== currentHrRoute?.provider || input.hrModel?.trim() !== currentHrRoute.model))
       || (input.hrReasoningEffort !== undefined && requestedEffort !== currentHrRoute?.reasoningEffort)
     const hrSelection = !editHrSelection ? undefined : await resolveEmployeeSelection(this.ctx, founder, this.config, {
-      provider: input.hrProvider ?? currentHr?.llm.provider,
-      model: input.hrModel ?? currentHr?.llm.model,
-      ...(input.hrReasoningEffort === undefined ? {} : { reasoningEffort: input.hrReasoningEffort }),
+      provider: input.hrProvider ?? currentHrRoute?.provider,
+      model: input.hrModel ?? currentHrRoute?.model,
+      reasoningEffort: input.hrReasoningEffort ?? 'default',
     })
-    const hrModelInfo = hrSelection === undefined ? undefined : await this.ctx.llm.resolveModelInfo(hrSelection.provider, hrSelection.model).catch(() => undefined)
+    const hrModelInfos = hrSelection === undefined ? [] : await Promise.all([
+      { provider: hrSelection.provider, model: hrSelection.model },
+      ...(hrSelection.fallback === undefined ? [] : [hrSelection.fallback]),
+    ].map(async (route) => ({ ...route, info: await this.ctx.llm.resolveModelInfo(route.provider, route.model).catch(() => undefined) })))
     const workspace = (await this.store.pathsForCwd(founder.session.header.cwd, false)).workspace.canonicalPath
     const result = await this.store.transact(founder.session.header.cwd, {
       expectedRevision,
@@ -321,26 +333,43 @@ export class CompanyRuntime {
       const first = state.formation.firstProductId === undefined ? undefined : state.products.find((product) => product.id === state.formation.firstProductId)
       if (first === undefined) throw new Error('formation has no first product to edit')
       const hr = state.hrEmployeeId === undefined ? undefined : state.employees.find((employee) => employee.id === state.hrEmployeeId)
-      if ((input.hrName !== undefined || hrSelection !== undefined) && hr === undefined) throw new Error('formation has no HR lead to edit')
+      if ((input.hrName !== undefined || hrSelection !== undefined || input.hrBudgetMicros !== undefined) && hr === undefined) throw new Error('formation has no HR lead to edit')
+      const total = boundedMicros(input.totalBudgetMicros ?? state.moneyBudget.totalMicros, this.config.maxMoneyBudgetMicros, 'total_budget_micros')
+      // Validate the final pair before route edits can release reservations.
+      // Changing the company ceiling never implicitly changes HR authority.
+      if (hr !== undefined) {
+        const budget = boundedMicros(input.hrBudgetMicros ?? hr.budgetMicros ?? 0, this.config.maxMoneyBudgetMicros, 'hr_budget_micros')
+        if (budget > total) throw new Error('HR monetary ceiling exceeds company budget; explicitly adjust hr_budget together with total_budget')
+        if (input.hrBudgetMicros !== undefined) {
+          const usage = employeeMoneyTotals(state, hr.id)
+          if (budget < usage.spentMicros + usage.reservedMicros) throw new Error('HR monetary ceiling cannot be below spent plus reserved micros')
+          hr.budgetMicros = budget
+        }
+      }
       if (hr !== undefined) {
         if (input.hrName !== undefined) hr.name = normalizeString(input.hrName, 'hr_name', 200)
         if (hrSelection !== undefined) {
           releaseEmployeeMoneyReservations(state, hr.id)
           hr.llm = hrSelection
-          const capability = {
-            provider: hrSelection.provider,
-            model: hrSelection.model,
-            name: hrModelInfo?.name ?? hrSelection.model,
-            ...(hrModelInfo?.description === undefined ? {} : { description: hrModelInfo.description }),
-            ...(hrModelInfo?.inputModalities === undefined ? {} : { inputModalities: [...hrModelInfo.inputModalities] }),
-            ...(hrModelInfo?.context?.contextWindow === undefined ? {} : { contextWindow: hrModelInfo.context.contextWindow }),
-            ...(hrModelInfo?.defaultMaxTokens === undefined ? {} : { defaultMaxTokens: hrModelInfo.defaultMaxTokens }),
-            advertised: state.modelCatalog.models.some((model) => model.provider === hrSelection.provider && model.model === hrSelection.model && model.advertised),
-            available: true,
+          for (const { provider, model, info } of hrModelInfos) {
+            const catalogIndex = state.modelCatalog.models.findIndex((candidate) => candidate.provider === provider && candidate.model === model)
+            const capability = {
+              provider, model, name: info?.name ?? model,
+              ...(info?.description === undefined ? {} : { description: info.description }),
+              ...(info?.inputModalities === undefined ? {} : { inputModalities: [...info.inputModalities] }),
+              ...(info?.context?.contextWindow === undefined ? {} : { contextWindow: info.context.contextWindow }),
+              ...(info?.defaultMaxTokens === undefined ? {} : { defaultMaxTokens: info.defaultMaxTokens }),
+              ...(info?.reasoning === undefined ? {} : {
+                reasoningEfforts: info.reasoning.efforts.map((effort) => ({ id: String(effort.id), name: effort.name,
+                  ...(effort.description === undefined ? {} : { description: effort.description }) })),
+                ...(info.reasoning.defaultEffort === undefined ? {} : { defaultReasoningEffort: String(info.reasoning.defaultEffort) }),
+              }),
+              advertised: state.modelCatalog.models[catalogIndex]?.advertised ?? false,
+              available: info !== undefined,
+            }
+            if (catalogIndex < 0) state.modelCatalog.models.push(capability)
+            else state.modelCatalog.models[catalogIndex] = capability
           }
-          const catalogIndex = state.modelCatalog.models.findIndex((model) => model.provider === hrSelection.provider && model.model === hrSelection.model)
-          if (catalogIndex < 0) state.modelCatalog.models.push(capability)
-          else state.modelCatalog.models[catalogIndex] = { ...state.modelCatalog.models[catalogIndex]!, ...capability }
           hr.sessionId = allocateEmployeeSessionId()
           hr.status = 'planned'
           hr.failure = undefined
@@ -371,11 +400,9 @@ export class CompanyRuntime {
         }
       }
       if (input.totalBudgetMicros !== undefined) {
-        const total = boundedMicros(input.totalBudgetMicros, this.config.maxMoneyBudgetMicros, 'total_budget_micros')
         const nextFirstProductBudget = input.firstProduct?.budgetMicros ?? first.budgetMicros ?? 0
         if (nextFirstProductBudget > total) throw new Error('first product monetary budget exceeds company monetary budget')
         if (input.firstProduct?.budgetMicros !== undefined) first.budgetMicros = boundedMicros(input.firstProduct.budgetMicros, total, 'first_product.budget_micros')
-        if (hr !== undefined && (hr.budgetMicros ?? 0) > total) hr.budgetMicros = total
         adjustMoneyBudgetTotal(state, total)
       }
       if (input.firstProduct !== undefined) {
@@ -590,7 +617,7 @@ export class CompanyRuntime {
       } else {
         if (request.status !== 'approved') throw new Error('staffing recommendation must be human-approved before hiring')
         const activeHeadcount = state.employees.filter((candidate) => candidate.status !== 'retired').length
-        if (activeHeadcount >= Math.min(state.limits.maxEmployees, this.config.maxEmployees)) throw new Error('active employee headcount cap reached')
+        if (activeHeadcount >= effectiveEmployeeLimit(state.limits.maxEmployees, this.config.maxEmployees)) throw new Error('active employee headcount cap reached')
         if (state.employees.some((candidate) => candidate.status !== 'retired' && candidate.name.localeCompare(name, undefined, { sensitivity: 'accent' }) === 0)) throw new Error(`active employee name ${JSON.stringify(name)} already exists`)
         const approval = requireApproved(state, input.approvalId, 'organization_change', (payload) => isRecord(payload) && payload.action === 'hire' && payload.staffingRequestId === request.id && (payload.designateAsHr === true) === (recommendation.designateAsHr === true))
         const orgUnit = ensureOrgPath(state, recommendation.orgPath)
@@ -617,7 +644,7 @@ export class CompanyRuntime {
     if (employee.status !== 'provisioning') return employee
     let childAccepted = false
     try {
-      await startEmployee(this.ctx, this.config, this.selections, founder, prepared.state, employee, signal ?? new AbortController().signal)
+      await startEmployee(this.ctx, this.config, this.selections, founder, prepared.state, employee, signal ?? new AbortController().signal, undefined, this.execution)
       childAccepted = true
       const accepted = await this.store.transact(founder.session.header.cwd, {
         actor: 'scheduler', type: 'employee.provisioned', summary: `Employee ${employee.id} continuable session accepted`,
@@ -636,6 +663,7 @@ export class CompanyRuntime {
       if (accepted.state.phase === 'operating') this.kick(founder.session.header.cwd, founder)
       return accepted.result
     } catch (error) {
+      if (error instanceof CompanyExecutionDeferredError || this.closing || this.execution.disposed) return employee
       if (childAccepted && employee.sessionId !== undefined) {
         await this.ctx.subagents.drainContinuableChildren(founder, [SessionId(employee.sessionId)]).catch(() => undefined)
         await this.store.recordRetiredSession(founder.session.header.cwd, employee.sessionId).catch(() => undefined)
@@ -833,7 +861,7 @@ export class CompanyRuntime {
     }
     let childAccepted = false
     try {
-      await startEmployee(this.ctx, this.config, this.selections, founder, prepared.state, prepared.result, signal ?? new AbortController().signal, handoff)
+      await startEmployee(this.ctx, this.config, this.selections, founder, prepared.state, prepared.result, signal ?? new AbortController().signal, handoff, this.execution)
       childAccepted = true
       const accepted = await this.store.transact(founder.session.header.cwd, {
         actor: 'scheduler', type: 'employee.reprovisioned', summary: `Employee ${prepared.result.id} accepted its adjusted route`,
@@ -852,6 +880,7 @@ export class CompanyRuntime {
       this.kick(founder.session.header.cwd, founder)
       return accepted.result
     } catch (error) {
+      if (error instanceof CompanyExecutionDeferredError || this.closing || this.execution.disposed) return prepared.result
       if (childAccepted && prepared.result.sessionId !== undefined) {
         await this.ctx.subagents.drainContinuableChildren(founder, [SessionId(prepared.result.sessionId)]).catch(() => undefined)
         await this.store.recordRetiredSession(founder.session.header.cwd, prepared.result.sessionId).catch(() => undefined)
@@ -1175,11 +1204,18 @@ export class CompanyRuntime {
     if (input.slogan !== undefined) payload.slogan = normalizeString(input.slogan, 'company slogan', 160)
     if (input.mission !== undefined) payload.mission = normalizeMultilineString(input.mission, 'company mission', 16_384)
     if (input.charter !== undefined) payload.charter = normalizeMultilineString(input.charter, 'company charter', 32_768)
-    if (Object.keys(payload).length === 1) throw new Error('governance change requires slogan, mission, or charter')
+    if (input.maxEmployees !== undefined) {
+      const limit = normalizeEmployeeLimit(input.maxEmployees)
+      if (limit !== 'unlimited' && limit < located.state.employees.filter((employee) => employee.status !== 'retired').length) {
+        throw new Error('maxEmployees cannot be below current active headcount; retire employees first')
+      }
+      payload.maxEmployees = limit
+    }
+    if (Object.keys(payload).length === 1) throw new Error('governance change requires slogan, mission, charter, or maxEmployees')
     return this.requestApproval(founder, {
       kind: 'governance_change',
       summary: `Change company identity/governance at revision ${expected}`,
-      detail: `Update ${Object.keys(payload).filter((key) => key !== 'expectedGovernanceRevision').join(', ')} at governance revision ${expected}. The new values take effect only after human approval.`,
+      detail: `Update ${Object.keys(payload).filter((key) => key !== 'expectedGovernanceRevision').join(', ')} at governance revision ${expected}.${payload.maxEmployees === undefined ? '' : ` Employee ceiling: ${located.state.limits.maxEmployees} -> ${payload.maxEmployees}; host ceiling: ${this.config.maxEmployees}.`} The new values take effect only after human approval.`,
       payload,
       risk: 'high',
     }, expectedRevision, source)
@@ -1192,8 +1228,8 @@ export class CompanyRuntime {
     // chat anchor is used when present but never required.
     const approvalUserMessage = latestGenuineUserMessage(founder)
     if (source === 'tool' && approvalUserMessage === undefined) throw new Error('budget/pricing requests require a genuine founder-session user message anchor')
-    if (input.totalBudgetMicros === undefined && input.productBudgets === undefined && input.modelPrices === undefined) {
-      throw new Error('budget change requires a company budget, product allocation, or price matrix change')
+    if (input.totalBudgetMicros === undefined && !input.productBudgets?.length && !input.employeeBudgets?.length && input.modelPrices === undefined) {
+      throw new Error('budget change requires a company budget, product allocation, employee ceiling, or price matrix change')
     }
     const result = await this.store.transact(founder.session.header.cwd, {
       ...(expectedRevision === undefined ? {} : { expectedRevision }),
@@ -1202,22 +1238,36 @@ export class CompanyRuntime {
       this.assertSameCompany(located.state, state)
       this.assertFounderState(founder, state)
       const approvals: ApprovalRequest[] = []
-      if (input.totalBudgetMicros !== undefined || input.productBudgets !== undefined) {
+      if (input.totalBudgetMicros !== undefined || input.productBudgets?.length || input.employeeBudgets?.length) {
         const total = boundedMicros(input.totalBudgetMicros ?? state.moneyBudget.totalMicros, this.config.maxMoneyBudgetMicros, 'total_budget')
         const allocations = (input.productBudgets ?? []).map((allocation) => {
           if (!state.products.some((product) => product.id === allocation.productId)) throw new Error(`unknown product ${allocation.productId}`)
           return { id: allocation.productId, budgetMicros: boundedMicros(allocation.budgetMicros, this.config.maxMoneyBudgetMicros, `product ${allocation.productId} budget`) }
         })
+        const employeeAllocations = (input.employeeBudgets ?? []).map((allocation) => {
+          const employee = state.employees.find((candidate) => candidate.id === allocation.employeeId && candidate.status !== 'retired')
+          if (employee === undefined) throw new Error(`unknown or retired employee ${allocation.employeeId}`)
+          const budgetMicros = boundedMicros(allocation.budgetMicros, total, `employee ${employee.id} budget`)
+          const usage = employeeMoneyTotals(state, employee.id)
+          if (budgetMicros < usage.spentMicros + usage.reservedMicros) throw new Error(`employee ${employee.id} budget cannot be below spent plus reserved micros`)
+          return { id: employee.id, budgetMicros }
+        })
+        // Check all employee ceilings against the final proposed company total.
+        for (const employee of state.employees.filter((candidate) => candidate.status !== 'retired')) {
+          const budget = employeeAllocations.find((allocation) => allocation.id === employee.id)?.budgetMicros ?? employee.budgetMicros ?? 0
+          if (budget > total) throw new Error(`employee ${employee.id} monetary ceiling exceeds company budget; include an explicit employee allocation`)
+        }
         const payload: Record<string, JsonValue> = {
           newTotalMicros: total,
           expectedTotalMicros: state.moneyBudget.totalMicros,
           productAllocations: allocations,
+          employeeAllocations,
           ...(state.moneyBudget.migrationRequired === true ? { legacyTreatment: 'accepted' } : {}),
         }
         approvals.push(createApproval(state, 'founder', {
           kind: 'budget_change',
-          summary: `Set company monetary budget to ${total} micros and update ${allocations.length} product allocations`,
-          detail: `Adjust the company monetary ceiling and ${allocations.length} product allocation(s)${allocations.length === 0 ? '' : ` (${allocations.map((entry) => `${entry.id}: ${entry.budgetMicros}`).join(', ')})`}. Money stays fully reserved-first; existing usage is never rewritten.`,
+          summary: `Set company monetary budget to ${total} micros and update ${allocations.length} product allocations and ${employeeAllocations.length} employee ceilings`,
+          detail: `Adjust the company monetary ceiling and ${allocations.length} product allocation(s)${allocations.length === 0 ? '' : ` (${allocations.map((entry) => `${entry.id}: ${entry.budgetMicros}`).join(', ')})`}, plus ${employeeAllocations.length} employee ceiling(s)${employeeAllocations.length === 0 ? '' : ` (${employeeAllocations.map((entry) => `${entry.id}: ${entry.budgetMicros}`).join(', ')})`}. Money stays fully reserved-first; existing usage is never rewritten.`,
           payload,
           risk: 'high',
           ...(approvalUserMessage === undefined ? {} : { requestedFromUserMessageId: String(approvalUserMessage.id) }),
@@ -1392,7 +1442,7 @@ export class CompanyRuntime {
         consumeApproval(resolved.approval)
       }
       if (input.decision === 'approved' && resolved.applied && resolved.approval.kind === 'governance_change') {
-        const changed = ['slogan', 'mission', 'charter'].filter((field) => isRecord(resolved.approval.payload) && resolved.approval.payload[field] !== undefined)
+        const changed = ['slogan', 'mission', 'charter', 'maxEmployees'].filter((field) => isRecord(resolved.approval.payload) && resolved.approval.payload[field] !== undefined)
         state.governanceNotifications.push({
           id: randomUUID(),
           governanceRevision: state.governanceRevision,
@@ -1497,12 +1547,13 @@ export class CompanyRuntime {
         const employee = requireEmployee(state, to)
         if (state.phase === 'operating' && employee.status === 'idle' && employee.operationalBlock === undefined) {
           try {
+            this.execution.check(employee.sessionId!, caller.session.header.cwd, activeSelection(employee.llm).provider)
             reservationId = this.reserveEmployeeTurn(state, employee, { messageId: message.id })
             message.reservationId = reservationId
             message.leaseAt = Date.now()
             message.deliveryState = 'reserved'
-          } catch {
-            message.deliveryState = 'held_budget'
+          } catch (error) {
+            message.deliveryState = error instanceof CompanyExecutionDeferredError ? 'queued' : 'held_budget'
           }
         }
       }
@@ -1531,7 +1582,7 @@ export class CompanyRuntime {
     const employee = queued.state.employees.find((candidate) => candidate.id === to)
     if (founder === undefined || employee === undefined) return message
     try {
-      await deliverEmployee(this.ctx, founder, employee, directMessagePrompt(message), signal ?? new AbortController().signal)
+      await deliverEmployee(this.ctx, founder, employee, directMessagePrompt(message), signal ?? new AbortController().signal, this.execution)
       await this.ackMessage(caller.session.header.cwd, to, message.id)
     } catch (error) {
       await this.releaseMessage(caller.session.header.cwd, to, message.id, reservationId, error)
@@ -1539,19 +1590,21 @@ export class CompanyRuntime {
     return message
   }
 
-  async status(caller: Agent, archived = false): Promise<CompanySnapshot> {
+  async status(caller: Agent, archived = false, query: SnapshotQuery = {}): Promise<CompanySnapshot> {
     const participant = await this.requireParticipant(caller, archived)
     const inbox = archived ? [] : await this.store.readMailbox(caller.session.header.cwd, participant.actor.id)
-    if (!archived) this.kick(caller.session.header.cwd, participant.actor.kind === 'founder' ? caller : this.liveFounder(participant.state))
-    return buildSnapshot(this.ctx, participant.state, participant.actor, inbox, this.config.uiPollMs)
+    // Status is a pure read. Scheduler admission is driven by startup recovery,
+    // mutations, agent status, durable wakeups, and explicit messages—not by
+    // every Web poll or company_status call.
+    return buildSnapshot(this.ctx, participant.state, participant.actor, inbox, this.config.uiPollMs, query)
   }
 
-  async webPublicStatus(locator: Agent, archived = false): Promise<CompanySnapshot> {
+  async webPublicStatus(locator: Agent, archived = false, query: SnapshotQuery = {}): Promise<CompanySnapshot> {
     let state = await this.store.readActive(locator.session.header.cwd)
     if (state !== undefined) state = await this.reflectModelTopologyStaleness(locator.session.header.cwd, state)
     if (state === undefined && archived) state = (await this.store.readArchived(locator.session.header.cwd))[0]
     if (state === undefined) throw new Error('no company exists for this workspace')
-    const snapshot = buildSnapshot(this.ctx, state, { kind: 'employee', id: 'web-readonly', sessionId: '' }, [], this.config.uiPollMs)
+    const snapshot = buildSnapshot(this.ctx, state, { kind: 'employee', id: 'web-readonly', sessionId: '' }, [], this.config.uiPollMs, query)
     snapshot.viewer.permissions = []
     return snapshot
   }
@@ -2090,7 +2143,7 @@ export class CompanyRuntime {
       try {
         if (employee.sessionId !== undefined && !known.has(employee.sessionId)) {
           try {
-            await startEmployee(this.ctx, this.config, this.selections, founder, state, employee, new AbortController().signal)
+            await startEmployee(this.ctx, this.config, this.selections, founder, state, employee, new AbortController().signal, undefined, this.execution)
           } catch (error) {
             if (!isFallbackEligible(error) || employee.llm.fallback === undefined) throw error
             const fallbackState = await this.store.transact(founder.session.header.cwd, {
@@ -2103,7 +2156,7 @@ export class CompanyRuntime {
             })
             state = fallbackState.state
             employee = fallbackState.result
-            await startEmployee(this.ctx, this.config, this.selections, founder, state, employee, new AbortController().signal)
+            await startEmployee(this.ctx, this.config, this.selections, founder, state, employee, new AbortController().signal, undefined, this.execution)
           }
         }
         await this.store.transact(founder.session.header.cwd, {
@@ -2116,6 +2169,7 @@ export class CompanyRuntime {
           current.failure = undefined
         })
       } catch (error) {
+        if (error instanceof CompanyExecutionDeferredError || this.closing || this.execution.disposed) return this.requireActiveState(founder)
         await this.failProvisioning(founder, generationId, employeeId, error)
         return this.requireActiveState(founder)
       }
@@ -2141,7 +2195,7 @@ export class CompanyRuntime {
     let childAccepted = sessionExists
     try {
       if (!sessionExists) {
-        await startEmployee(this.ctx, this.config, this.selections, founder, state, employee, new AbortController().signal)
+        await startEmployee(this.ctx, this.config, this.selections, founder, state, employee, new AbortController().signal, undefined, this.execution)
         childAccepted = true
       }
       await this.store.transact(founder.session.header.cwd, {
@@ -2160,6 +2214,7 @@ export class CompanyRuntime {
         request.updatedAt = Date.now()
       })
     } catch (error) {
+      if (error instanceof CompanyExecutionDeferredError || this.closing || this.execution.disposed) return
       if (childAccepted && !sessionExists && employee.sessionId !== undefined) {
         await this.ctx.subagents.drainContinuableChildren(founder, [SessionId(employee.sessionId)]).catch(() => undefined)
         await this.store.recordRetiredSession(founder.session.header.cwd, employee.sessionId).catch(() => undefined)
@@ -2244,8 +2299,8 @@ export class CompanyRuntime {
       const messages = await io.readMailbox(to)
       const message = messages.find((candidate) => candidate.id === messageId)
       if (message !== undefined) {
-        message.attempts = (message.attempts ?? 0) + 1
-        message.deliveryState = message.attempts >= MAX_MESSAGE_DELIVERY_ATTEMPTS ? 'dead' : 'queued'
+        if (!(error instanceof CompanyExecutionDeferredError)) message.attempts = (message.attempts ?? 0) + 1
+        message.deliveryState = (message.attempts ?? 0) >= MAX_MESSAGE_DELIVERY_ATTEMPTS ? 'dead' : 'queued'
         message.reservationId = undefined
         message.leaseAt = undefined
         await io.writeMailbox(to, messages)
@@ -2281,12 +2336,17 @@ export class CompanyRuntime {
     if (allocated > state.moneyBudget.totalMicros) throw new Error('product monetary allocations exceed the company monetary budget')
     for (const employee of state.employees) if (employee.status !== 'retired' && (employee.budgetMicros ?? 0) > state.moneyBudget.totalMicros) throw new Error(`employee ${employee.id} monetary ceiling exceeds company budget`)
     const admissionProbe = structuredClone(state)
-    reserveMoneyTurn(admissionProbe, {
-      employeeId: hr.id,
-      provider: hr.llm.provider,
-      model: hr.llm.model,
-      ...(hr.llm.fallback === undefined ? {} : { fallback: hr.llm.fallback }),
-    })
+    try {
+      reserveMoneyTurn(admissionProbe, {
+        employeeId: hr.id,
+        provider: hr.llm.provider,
+        model: hr.llm.model,
+        ...(hr.llm.fallback === undefined ? {} : { fallback: hr.llm.fallback }),
+      })
+    } catch (error) {
+      if (error instanceof CompanyMoneyBudgetError) error.message = `Initial HR cannot start: ${error.message}. Review hr_budget, total_budget, and the selected model routes.`
+      throw error
+    }
     assertAcyclic(state.workItems)
     for (const work of state.workItems) validateWorkReferences(state, work)
   }
@@ -2323,6 +2383,7 @@ export class CompanyRuntime {
     if (state !== undefined) state = await this.reflectModelTopologyStaleness(caller.session.header.cwd, state)
     if (state === undefined && archived) state = (await this.store.readArchived(caller.session.header.cwd))[0]
     if (state === undefined) throw new Error('no company exists for this workspace')
+    this.execution.observe(state, caller.session.header.cwd)
     return { state, actor: this.actorFor(state, caller) }
   }
 
@@ -2337,6 +2398,7 @@ export class CompanyRuntime {
   private async requireActiveState(caller: Agent): Promise<CompanyState> {
     const state = await this.store.readActive(caller.session.header.cwd)
     if (state === undefined) throw new Error('no active company exists for this workspace')
+    this.execution.observe(state, caller.session.header.cwd)
     return this.reflectModelTopologyStaleness(caller.session.header.cwd, state)
   }
 
@@ -2621,6 +2683,7 @@ function parseUiAction(type: CompanyUiAction['type'], payload: JsonValue): Compa
         ...(typeof value.mission === 'string' ? { mission: value.mission } : {}),
         ...(typeof value.charter === 'string' ? { charter: value.charter } : {}),
         ...(value.total_budget === undefined ? {} : { totalBudgetMicros: currencyUnitsToMicros(value.total_budget, 'total_budget') }),
+        ...(value.hr_budget === undefined ? {} : { hrBudgetMicros: currencyUnitsToMicros(value.hr_budget, 'hr_budget') }),
         ...(typeof value.currency === 'string' ? { currency: value.currency } : {}),
         ...(modelPrices === undefined ? {} : { modelPrices }),
         ...(typeof value.hr_name === 'string' ? { hrName: value.hr_name } : {}),
@@ -2658,6 +2721,7 @@ function parseUiAction(type: CompanyUiAction['type'], payload: JsonValue): Compa
         ...(typeof value.slogan === 'string' ? { slogan: value.slogan } : {}),
         ...(typeof value.mission === 'string' ? { mission: value.mission } : {}),
         ...(typeof value.charter === 'string' ? { charter: value.charter } : {}),
+        ...(value.max_employees === undefined ? {} : { maxEmployees: normalizeEmployeeLimit(value.max_employees, 'max_employees') }),
         ...(typeof value.expected_governance_revision === 'number' ? { expectedGovernanceRevision: value.expected_governance_revision } : {}),
       } }
     case 'request_budget_change': {
@@ -2666,9 +2730,14 @@ function parseUiAction(type: CompanyUiAction['type'], payload: JsonValue): Compa
         if (!isRecord(row) || typeof row.product_id !== 'string' || row.product_budget === undefined) throw new Error(`product_budgets[${index}] is incomplete`)
         return { productId: row.product_id, budgetMicros: currencyUnitsToMicros(row.product_budget, `product_budgets[${index}].product_budget`) }
       }) : undefined
+      const employeeBudgets = Array.isArray(value.employee_budgets) ? value.employee_budgets.map((row, index) => {
+        if (!isRecord(row) || typeof row.employee_id !== 'string' || row.budget === undefined) throw new Error(`employee_budgets[${index}] is incomplete`)
+        return { employeeId: row.employee_id, budgetMicros: currencyUnitsToMicros(row.budget, `employee_budgets[${index}].budget`) }
+      }) : undefined
       return { type, input: {
         ...(value.total_budget === undefined ? {} : { totalBudgetMicros: currencyUnitsToMicros(value.total_budget, 'total_budget') }),
         ...(productBudgets === undefined ? {} : { productBudgets }),
+        ...(employeeBudgets === undefined ? {} : { employeeBudgets }),
         ...(modelPrices === undefined ? {} : { modelPrices }),
         ...(typeof value.expected_pricing_revision === 'number' ? { expectedPricingRevision: value.expected_pricing_revision } : {}),
       } }

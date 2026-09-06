@@ -5,8 +5,9 @@ import type { Context } from '@deepseek-ai/cordis'
 import { SessionId } from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import { isRecord } from './schemas.js'
+import { normalizeSnapshotQuery } from './snapshot.js'
 import { RevisionConflictError, type CompanyRuntime } from './runtime.js'
-import type { CompanyActionRequest, CompanySnapshot, CompanyUiActionName, JsonValue, ResolvedCompanyConfig } from './types.js'
+import type { CompanyActionRequest, CompanySnapshot, CompanyUiActionName, JsonValue, ResolvedCompanyConfig, SnapshotQuery } from './types.js'
 
 const STATE_PATH = '/plugins/dsh-company/state'
 const ACTION_PATH = '/plugins/dsh-company/action'
@@ -40,12 +41,22 @@ async function handleSnapshot(ctx: Context, runtime: CompanyRuntime, config: Res
   if (agent === undefined) return json(res, 404, { error: 'session_not_found', message: 'sessionId does not identify an exact live agent' })
   const archivedValue = url.searchParams.get('archived')
   if (archivedValue !== null && archivedValue !== '0' && archivedValue !== '1') return json(res, 400, { error: 'invalid_request', message: 'archived must be 0 or 1' })
+  let query: SnapshotQuery
+  try {
+    const values: Record<string, unknown> = {}
+    for (const [key, value] of url.searchParams) {
+      if (key === 'sessionId' || key === 'archived') continue
+      if (!['employeeOffset', 'employeeLimit', 'employeeSearch', 'employeeStatus', 'employeeExactStatus', 'employeeId', 'employeeOrgUnitId', 'employeePositionId', 'orgOffset', 'orgLimit', 'orgId', 'positionOffset', 'positionLimit', 'positionId'].includes(key)) throw new Error(`unknown snapshot query ${key}`)
+      values[key] = key.endsWith('Offset') || key.endsWith('Limit') ? (/^\d+$/u.test(value) ? Number(value) : NaN) : value
+    }
+    query = normalizeSnapshotQuery(values as SnapshotQuery)
+  } catch (error) { return json(res, 400, { error: 'invalid_request', message: error instanceof Error ? error.message : 'invalid snapshot query' }) }
   let snapshot
   if (isRemoteUiRequest(req)) {
     // Remote browsers never receive participant identity: same trust line the
     // host's own settings UI draws (loopback writes, remote memory mirror).
     try {
-      snapshot = await runtime.webPublicStatus(agent, archivedValue === '1')
+      snapshot = await runtime.webPublicStatus(agent, archivedValue === '1', query)
     } catch (error) {
       if (error instanceof Error && error.message === 'no company exists for this workspace') {
         throw new HttpError(404, 'company_not_found', error.message)
@@ -58,7 +69,7 @@ async function handleSnapshot(ctx: Context, runtime: CompanyRuntime, config: Res
     // founder session gets the full editable founder view, employee sessions
     // get their role-filtered view.
     try {
-      snapshot = await runtime.status(agent, archivedValue === '1')
+      snapshot = await runtime.status(agent, archivedValue === '1', query)
     } catch (error) {
       if (error instanceof Error && error.message === 'no company exists for this workspace') {
         throw new HttpError(404, 'company_not_found', error.message)
@@ -204,12 +215,13 @@ function validateActionPayload(action: CompanyUiActionName, payload: Record<stri
       requireNonBlank(payload.confirmation, 'approve_bootstrap confirmation')
       return
     case 'edit_formation': {
-      const allowed = new Set(['name', 'slogan', 'mission', 'charter', 'first_product', 'total_budget', 'currency', 'model_prices', 'hr_name', 'hr_provider', 'hr_model', 'hr_reasoning_effort'])
+      const allowed = new Set(['name', 'slogan', 'mission', 'charter', 'first_product', 'total_budget', 'currency', 'model_prices', 'hr_name', 'hr_provider', 'hr_model', 'hr_reasoning_effort', 'hr_budget'])
       assertClosed(payload, allowed, `${action} payload`)
       if (Object.keys(payload).length === 0) throw new HttpError(400, 'invalid_request', 'edit_formation payload must change at least one field')
       for (const key of ['name', 'slogan', 'mission', 'charter', 'currency', 'hr_name', 'hr_provider', 'hr_model', 'hr_reasoning_effort']) if (payload[key] !== undefined) requireNonBlank(payload[key], `edit_formation ${key}`)
       if ((payload.hr_provider === undefined) !== (payload.hr_model === undefined)) throw new HttpError(400, 'invalid_request', 'hr_provider and hr_model must be supplied together')
       if (payload.total_budget !== undefined) validateHumanMoney(payload.total_budget, 'total_budget')
+      if (payload.hr_budget !== undefined) validateHumanMoney(payload.hr_budget, 'hr_budget')
       if (payload.first_product !== undefined) {
         if (!isRecord(payload.first_product)) throw new HttpError(400, 'invalid_request', 'first_product must be an object')
         assertClosed(payload.first_product, new Set(['name', 'summary', 'product_root', 'success_criteria', 'product_budget']), 'first_product')
@@ -247,8 +259,8 @@ function validateActionPayload(action: CompanyUiActionName, payload: Record<stri
       if (payload.expected_governance_revision !== undefined && (!Number.isSafeInteger(payload.expected_governance_revision) || (payload.expected_governance_revision as number) < 1)) throw new HttpError(400, 'invalid_request', 'expected_governance_revision must be a positive safe integer')
       return
     case 'request_budget_change': {
-      assertClosed(payload, new Set(['total_budget', 'product_budgets', 'model_prices', 'expected_pricing_revision']), `${action} payload`)
-      if (payload.total_budget === undefined && payload.product_budgets === undefined && payload.model_prices === undefined) throw new HttpError(400, 'invalid_request', `${action} must change a budget or price`)
+      assertClosed(payload, new Set(['total_budget', 'product_budgets', 'employee_budgets', 'model_prices', 'expected_pricing_revision']), `${action} payload`)
+      if (payload.total_budget === undefined && payload.product_budgets === undefined && payload.employee_budgets === undefined && payload.model_prices === undefined) throw new HttpError(400, 'invalid_request', `${action} must change a budget or price`)
       if (payload.total_budget !== undefined) validateHumanMoney(payload.total_budget, 'total_budget')
       if (payload.product_budgets !== undefined) {
         if (!Array.isArray(payload.product_budgets)) throw new HttpError(400, 'invalid_request', 'product_budgets must be an array')
@@ -257,6 +269,18 @@ function validateActionPayload(action: CompanyUiActionName, payload: Record<stri
           assertClosed(row, new Set(['product_id', 'product_budget']), `product_budgets[${index}]`)
           requireNonBlank(row.product_id, `product_budgets[${index}] product_id`)
           validateHumanMoney(row.product_budget, `product_budgets[${index}] product_budget`)
+        }
+      }
+      if (payload.employee_budgets !== undefined) {
+        if (!Array.isArray(payload.employee_budgets) || payload.employee_budgets.length === 0) throw new HttpError(400, 'invalid_request', 'employee_budgets must be a non-empty array')
+        const ids = new Set<string>()
+        for (const [index, row] of payload.employee_budgets.entries()) {
+          if (!isRecord(row)) throw new HttpError(400, 'invalid_request', `employee_budgets[${index}] must be an object`)
+          assertClosed(row, new Set(['employee_id', 'budget']), `employee_budgets[${index}]`)
+          requireNonBlank(row.employee_id, `employee_budgets[${index}] employee_id`)
+          if (ids.has(row.employee_id as string)) throw new HttpError(400, 'invalid_request', 'employee_budgets contains duplicate employee ids')
+          ids.add(row.employee_id as string)
+          validateHumanMoney(row.budget, `employee_budgets[${index}] budget`)
         }
       }
       if (payload.model_prices !== undefined) {
@@ -370,6 +394,7 @@ function publicErrorMessage(value: string): string {
 
 function json(res: ServerResponse, status: number, value: unknown, extraHeaders: Record<string, string> = {}): void {
   const body = JSON.stringify(value)
+  if (status < 400 && Buffer.byteLength(body) > 16 * 1024 * 1024) return json(res, 413, { error: 'snapshot_too_large', message: 'Company response exceeds 16 MiB; request a smaller directory page.' })
   res.writeHead(status, {
     'content-type': 'application/json; charset=utf-8',
     'cache-control': 'no-store',

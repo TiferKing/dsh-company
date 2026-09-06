@@ -1,10 +1,10 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-agent'
 import { SessionId } from '@deepseek-ai/dsh-session'
-import { availableMoney, employeeMoneyTotals, employeeTokenTotals, matchModelPrice, productMoneyTotals, productTokenTotals } from './money.js'
+import { availableMoney, matchModelPrice, productMoneyTotals, productTokenTotals } from './money.js'
 import { parseCharterClauses } from './charter.js'
 import { temporaryAuthorizationStatus } from './authorizations.js'
-import { COMPANY_SNAPSHOT_SCHEMA_VERSION } from './types.js'
+import { COMPANY_SNAPSHOT_SCHEMA_VERSION, EMPLOYEE_STATUSES } from './types.js'
 import type {
   CompanyActor,
   CompanyMessage,
@@ -19,8 +19,11 @@ import type {
   SafeProductView,
   SafeTicketView,
   SafeWorkView,
+  SnapshotQuery,
+  SnapshotPage,
 } from './types.js'
 import { workBlockedReasons } from './work.js'
+import { getCompanyExecution } from './execution.js'
 
 const FOUNDER_PERMISSIONS = [
   'bootstrap.approve', 'employee.manage', 'product.manage', 'work.plan', 'work.reassign',
@@ -34,7 +37,38 @@ const HISTORY_LIMIT = 100
 const WORK_DETAIL_LIMIT = 32
 const INBOX_LIMIT = 100
 const MODEL_CATALOG_LIMIT = 1_000
-const RETIRED_EMPLOYEE_LIMIT = 200
+export const DIRECTORY_PAGE_LIMIT = 100
+
+export function normalizeSnapshotQuery(query: SnapshotQuery = {}): SnapshotQuery {
+  const normalized: SnapshotQuery = {}
+  for (const key of ['employeeOffset', 'orgOffset', 'positionOffset', 'employeeLimit', 'orgLimit', 'positionLimit'] as const) {
+    const value = query[key]
+    if (value === undefined) continue
+    if (!Number.isSafeInteger(value) || value < (key.endsWith('Limit') ? 1 : 0) || (key.endsWith('Limit') && value > DIRECTORY_PAGE_LIMIT)) throw new Error(`invalid snapshot ${key}`)
+    normalized[key] = value
+  }
+  for (const key of ['employeeSearch', 'employeeId', 'employeeOrgUnitId', 'employeePositionId', 'orgId', 'positionId'] as const) {
+    const value = query[key]
+    if (value === undefined || value === '') continue
+    if (typeof value !== 'string' || value.length > 256) throw new Error(`invalid snapshot ${key}`)
+    if (value.trim() !== '') normalized[key] = value.trim()
+  }
+  if (query.employeeStatus !== undefined) {
+    if (!['all', 'active', 'retired', 'running'].includes(query.employeeStatus)) throw new Error('invalid snapshot employeeStatus')
+    normalized.employeeStatus = query.employeeStatus
+  }
+  if (query.employeeExactStatus !== undefined) {
+    if (!EMPLOYEE_STATUSES.includes(query.employeeExactStatus)) throw new Error('invalid snapshot employeeExactStatus')
+    normalized.employeeExactStatus = query.employeeExactStatus
+  }
+  return normalized
+}
+
+function pageRows<T>(rows: readonly T[], offset = 0, limit = 50, total = rows.length): { rows: T[]; page: SnapshotPage } {
+  const start = rows.length === 0 ? 0 : offset >= rows.length ? Math.floor((rows.length - 1) / limit) * limit : offset
+  const items = rows.slice(start, start + limit)
+  return { rows: items, page: { total, filtered_total: rows.length, offset: start, limit, returned: items.length, next_offset: start + items.length < rows.length ? start + items.length : null } }
+}
 
 /** Build the canonical schema-v5 snake_case Host/Web projection. */
 export function buildSnapshot(
@@ -43,7 +77,9 @@ export function buildSnapshot(
   actor: CompanyActor,
   inbox: CompanyMessage[],
   pollAfterMs?: number,
+  queryInput: SnapshotQuery = {},
 ): CompanySnapshot {
+  const query = normalizeSnapshotQuery(queryInput)
   const now = Date.now()
   const founderView = actor.kind === 'founder'
   const visibleAuthorizations = state.temporaryAuthorizations.filter((authorization) => founderView || authorization.employeeId === actor.id)
@@ -54,33 +90,52 @@ export function buildSnapshot(
     if (employee.sessionId === undefined) return []
     return ctx.agents.get(SessionId(employee.sessionId))?.status === 'running' ? [employee.id] : []
   }))
-  // Keep the employee records needed to interpret the visible authorization
-  // audit. Independent history slicing can otherwise create dangling IDs and
-  // make an otherwise valid company snapshot fail client validation.
-  const authorizationEmployeeIds = new Set(authorizationRows.map((authorization) => authorization.employeeId))
-  const retiredEmployees = state.employees.filter((employee) => employee.status === 'retired')
-  const retainedRetired = new Set(retiredEmployees.filter((employee) => authorizationEmployeeIds.has(employee.id)).map((employee) => employee.id))
-  for (const employee of [...retiredEmployees].reverse()) {
-    if (retainedRetired.size >= RETIRED_EMPLOYEE_LIMIT) break
-    retainedRetired.add(employee.id)
+  const search = query.employeeSearch?.toLocaleLowerCase()
+  const filteredEmployees = state.employees.filter((employee) =>
+    (query.employeeStatus !== 'active' || employee.status !== 'retired')
+    && (query.employeeStatus !== 'retired' || employee.status === 'retired')
+    && (query.employeeStatus !== 'running' || (employee.status !== 'retired' && liveRunning.has(employee.id)))
+    && (query.employeeId === undefined || employee.id === query.employeeId)
+    && (query.employeeExactStatus === undefined || employee.status === query.employeeExactStatus)
+    && (query.employeeOrgUnitId === undefined || employee.orgUnitId === query.employeeOrgUnitId)
+    && (query.employeePositionId === undefined || employee.positionId === query.employeePositionId)
+    && (search === undefined || `${employee.id} ${employee.name} ${employee.role}`.toLocaleLowerCase().includes(search)))
+  const employeePage = pageRows(filteredEmployees, query.employeeOffset, query.employeeLimit, state.employees.length)
+  const projectedEmployees = employeePage.rows
+  const totals = new Map(state.employees.map((employee) => [employee.id, { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0, totalTokens: 0, spentMicros: 0, reservedMicros: 0, availableMicros: 0, pricedCalls: 0, unpricedCalls: 0 }]))
+  for (const entry of state.moneyBudget.usage) {
+    const total = totals.get(entry.employeeId)
+    if (total === undefined) continue
+    for (const key of ['inputTokens', 'outputTokens', 'cacheReadTokens', 'cacheWriteTokens', 'reasoningTokens', 'totalTokens'] as const) total[key] += entry[key]
+    total.spentMicros += entry.costMicros
+    if (entry.priced) total.pricedCalls += 1
+    else total.unpricedCalls += 1
   }
-  const projectedEmployees = state.employees.filter((employee) => employee.status !== 'retired' || retainedRetired.has(employee.id))
+  for (const entry of state.moneyBudget.reservations) {
+    const total = totals.get(entry.employeeId)
+    if (total !== undefined) total.reservedMicros += entry.remainingMicros
+  }
+  for (const employee of state.employees) {
+    const total = totals.get(employee.id)!
+    total.availableMicros = Math.max(0, (employee.budgetMicros ?? 0) - total.spentMicros - total.reservedMicros)
+  }
+  const orgById = new Map(state.orgUnits.map((unit) => [unit.id, unit]))
   const employees: SafeEmployeeView[] = projectedEmployees.map((employee) => {
     const live = employee.sessionId === undefined ? undefined : ctx.agents.get(SessionId(employee.sessionId))
+    // A persisted working flag can outlive its process. Only the Host can
+    // establish that a turn is running; lifecycle state remains separate.
     const activity: SafeEmployeeView['activity'] = employee.status === 'retired'
       ? 'retired'
-      : live?.status === 'running' || employee.status === 'working'
+      : liveRunning.has(employee.id)
         ? 'running'
-        : live?.status === 'idle' || employee.status === 'idle' || employee.status === 'paused'
+        : live?.status === 'idle' || (live === undefined && (employee.status === 'idle' || employee.status === 'paused'))
           ? 'idle'
           : 'ready'
     const showPrivate = founderView || employee.id === actor.id
-    const orgUnitName = employee.orgUnitId === undefined ? undefined : state.orgUnits.find((unit) => unit.id === employee.orgUnitId)?.name
-    const tokenUsage = employeeTokenTotals(state, employee.id)
-    const money = employeeMoneyTotals(state, employee.id)
-    const employeeMoneyUsage = state.moneyBudget.usage.filter((entry) => entry.employeeId === employee.id)
-    const pricedCalls = employeeMoneyUsage.filter((entry) => entry.priced).length
-    const unpricedCalls = employeeMoneyUsage.length - pricedCalls
+    const orgUnitName = employee.orgUnitId === undefined ? undefined : orgById.get(employee.orgUnitId)?.name
+    const tokenUsage = totals.get(employee.id)!
+    const money = tokenUsage
+    const { pricedCalls, unpricedCalls } = tokenUsage
     return {
       id: employee.id,
       name: employee.name,
@@ -123,25 +178,35 @@ export function buildSnapshot(
     }
   })
 
-  const requiredOrgIds = new Set<string>([
-    ...state.orgUnits.filter((unit) => unit.parentId === undefined).map((unit) => unit.id),
-    ...state.employees.filter((employee) => employee.status !== 'retired').flatMap((employee) => employee.orgUnitId === undefined ? [] : [employee.orgUnitId]),
-    ...state.workItems.filter((work) => !['completed', 'failed', 'cancelled'].includes(work.status)).flatMap((work) => work.eligibleOrgUnitIds ?? []),
-    ...state.orgUnits.slice(-HISTORY_LIMIT).map((unit) => unit.id),
-  ])
-  for (const unitId of [...requiredOrgIds]) {
-    let unit = state.orgUnits.find((candidate) => candidate.id === unitId)
+  const orgPage = pageRows(state.orgUnits.filter((unit) => query.orgId === undefined || unit.id === query.orgId), query.orgOffset, query.orgLimit, state.orgUnits.length)
+  const positionPage = pageRows(state.positions.filter((position) => query.positionId === undefined || position.id === query.positionId), query.positionOffset, query.positionLimit, state.positions.length)
+  const projectedOrgUnits = orgPage.rows
+  const projectedPositions = positionPage.rows
+  const openByEmployee = new Map<string, number>()
+  for (const work of state.workItems) if (work.assigneeId !== undefined && ['pending', 'claimed', 'in_progress'].includes(work.status)) openByEmployee.set(work.assigneeId, (openByEmployee.get(work.assigneeId) ?? 0) + 1)
+  const positionCounts = new Map<string, number>()
+  const orgCounts = new Map(state.orgUnits.map((unit) => [unit.id, { people: 0, open: 0, sum: 0, max: 0, budget: 0, spent: 0, available: 0, children: 0, positions: 0 }]))
+  for (const unit of state.orgUnits) {
+    const parent = unit.parentId === undefined ? undefined : orgCounts.get(unit.parentId)
+    if (parent !== undefined) parent.children += 1
+  }
+  for (const position of state.positions) orgCounts.get(position.orgUnitId)!.positions += 1
+  for (const employee of state.employees) {
+    if (employee.status === 'retired') continue
+    if (employee.positionId !== undefined) positionCounts.set(employee.positionId, (positionCounts.get(employee.positionId) ?? 0) + 1)
+    const money = totals.get(employee.id)!
+    const open = openByEmployee.get(employee.id) ?? 0
+    const effective = Math.max(open, liveRunning.has(employee.id) ? 1 : 0)
+    let unit = employee.orgUnitId === undefined ? undefined : orgById.get(employee.orgUnitId)
     const seen = new Set<string>()
-    while (unit?.parentId !== undefined && !seen.has(unit.id)) {
+    while (unit !== undefined && !seen.has(unit.id)) {
       seen.add(unit.id)
-      requiredOrgIds.add(unit.parentId)
-      unit = state.orgUnits.find((candidate) => candidate.id === unit!.parentId)
+      const count = orgCounts.get(unit.id)!
+      count.people += 1; count.open += open; count.sum += effective; count.max = Math.max(count.max, effective)
+      count.budget += employee.budgetMicros ?? 0; count.spent += money.spentMicros; count.available += money.availableMicros
+      unit = unit.parentId === undefined ? undefined : orgById.get(unit.parentId)
     }
   }
-  const projectedOrgUnits = state.orgUnits.filter((unit) => requiredOrgIds.has(unit.id))
-  const activePositionIds = new Set(state.employees.filter((employee) => employee.status !== 'retired').flatMap((employee) => employee.positionId === undefined ? [] : [employee.positionId]))
-  const recentPositionIds = new Set(state.positions.slice(-HISTORY_LIMIT).map((position) => position.id))
-  const projectedPositions = state.positions.filter((position) => requiredOrgIds.has(position.orgUnitId) && (activePositionIds.has(position.id) || recentPositionIds.has(position.id)))
   const orgUnits = projectedOrgUnits.map((unit) => ({
     id: unit.id,
     name: unit.name,
@@ -151,7 +216,10 @@ export function buildSnapshot(
     ...(unit.managerEmployeeId === undefined ? {} : { manager_employee_id: unit.managerEmployeeId }),
     child_ids: projectedOrgUnits.filter((candidate) => candidate.parentId === unit.id).map((candidate) => candidate.id),
     position_ids: projectedPositions.filter((position) => position.orgUnitId === unit.id).map((position) => position.id),
-    load: orgLoad(state, unit.id, liveRunning),
+    load: orgLoad(orgCounts.get(unit.id)!),
+    child_count: orgCounts.get(unit.id)!.children,
+    position_count: orgCounts.get(unit.id)!.positions,
+    money_summary: { budget_micros: orgCounts.get(unit.id)!.budget, spent_micros: orgCounts.get(unit.id)!.spent, available_micros: orgCounts.get(unit.id)!.available },
   }))
   const positions = projectedPositions.map((position) => ({
     id: position.id,
@@ -159,7 +227,8 @@ export function buildSnapshot(
     org_unit_id: position.orgUnitId,
     ...(position.reportsToPositionId === undefined ? {} : { reports_to_position_id: position.reportsToPositionId }),
     responsibilities: boundedItems(position.responsibilities, 16, 1_024),
-    employee_ids: state.employees.filter((employee) => employee.positionId === position.id && employee.status !== 'retired').map((employee) => employee.id),
+    employee_ids: projectedEmployees.filter((employee) => employee.positionId === position.id && employee.status !== 'retired').map((employee) => employee.id),
+    employee_count: positionCounts.get(position.id) ?? 0,
   }))
   const activeStaffing = state.staffingRequests.filter((request) => !['rejected', 'applied'].includes(request.status))
   const recentStaffing = state.staffingRequests.filter((request) => ['rejected', 'applied'].includes(request.status)).slice(-HISTORY_LIMIT)
@@ -319,7 +388,6 @@ export function buildSnapshot(
   if (visibleApprovals.length > approvals.length) warnings.push(`Approval history is limited to the newest ${HISTORY_LIMIT} terminal requests.`)
   if (visibleAuthorizations.length > authorizationRows.length) warnings.push(`Temporary authorization history is limited to the newest ${HISTORY_LIMIT} terminal records.`)
   if (state.tickets.filter((ticket) => ticket.status === 'closed').length > HISTORY_LIMIT) warnings.push(`Closed ticket history is limited to the newest ${HISTORY_LIMIT} records.`)
-  if (state.orgUnits.length > projectedOrgUnits.length || state.positions.length > projectedPositions.length) warnings.push(`Organization history keeps active references plus the newest ${HISTORY_LIMIT} units and positions.`)
 
   const requiredModelKeys = new Set([
     ...state.employees.flatMap((employee) => [`${employee.llm.provider}\u0000${employee.llm.model}`, ...(employee.llm.fallback === undefined ? [] : [`${employee.llm.fallback.provider}\u0000${employee.llm.fallback.model}`])]),
@@ -351,6 +419,17 @@ export function buildSnapshot(
   return {
     schema_version: COMPANY_SNAPSHOT_SCHEMA_VERSION,
     revision: state.revision,
+    execution: getCompanyExecution(ctx)?.snapshot(state.id),
+    directory: {
+      employees: { ...employeePage.page, query }, org_units: orgPage.page, positions: positionPage.page,
+      summary: {
+        employees: state.employees.length, active_employees: state.employees.filter((employee) => employee.status !== 'retired').length,
+        retired_employees: state.employees.filter((employee) => employee.status === 'retired').length,
+        running_employees: state.employees.filter((employee) => employee.status !== 'retired' && liveRunning.has(employee.id)).length,
+        org_units: state.orgUnits.length, positions: state.positions.length,
+        employee_statuses: Object.fromEntries(EMPLOYEE_STATUSES.map((status) => [status, state.employees.filter((employee) => employee.status === status).length])),
+      },
+    },
     viewer: {
       role: actor.kind,
       participant_id: actor.id,
@@ -373,6 +452,7 @@ export function buildSnapshot(
         ...(state.health.reason === undefined ? {} : { reason: state.health.reason }),
         ...(state.health.detail === undefined ? {} : { detail: redactDiagnostic(state.health.detail, 4096) }),
       },
+      max_employees: state.limits.maxEmployees,
     },
     org_units: orgUnits,
     positions,
@@ -471,28 +551,7 @@ export function buildSnapshot(
   }
 }
 
-function orgLoad(state: CompanyState, rootId: string, liveRunning: ReadonlySet<string>): DepartmentLoadView {
-  const subtree = new Set<string>([rootId])
-  let changed = true
-  while (changed) {
-    changed = false
-    for (const unit of state.orgUnits) {
-      if (unit.parentId !== undefined && subtree.has(unit.parentId) && !subtree.has(unit.id)) {
-        subtree.add(unit.id)
-        changed = true
-      }
-    }
-  }
-  const employeeIds = [...new Set(state.employees
-    .filter((employee) => employee.status !== 'retired' && employee.orgUnitId !== undefined && subtree.has(employee.orgUnitId))
-    .map((employee) => employee.id))]
-  const raw = employeeIds.map((employeeId) => state.workItems.filter((work) => work.assigneeId === employeeId && ['pending', 'claimed', 'in_progress'].includes(work.status)).length)
-  const effective = employeeIds.map((employeeId, index) => Math.max(raw[index] ?? 0,
-    liveRunning.has(employeeId) || state.employees.find((employee) => employee.id === employeeId)?.status === 'working' ? 1 : 0))
-  const people = employeeIds.length
-  const open = raw.reduce((sum, value) => sum + value, 0)
-  const sum = effective.reduce((total, value) => total + value, 0)
-  const max = effective.length === 0 ? 0 : Math.max(...effective)
+function orgLoad({ people, open, sum, max }: { people: number; open: number; sum: number; max: number }): DepartmentLoadView {
   const band: DepartmentLoadView['band'] = people === 0 || sum === 0
     ? 'very_idle'
     : max >= 4 || sum > 3 * people

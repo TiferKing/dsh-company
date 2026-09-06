@@ -4,7 +4,7 @@
 
 `dsh-company` turns the current root session into a **Founder**, durable continuable subagents into **employees**, and organizes software development through a real company: staged formation with human approval, HR-first hiring, multi-level org tree, currency-denominated budgets, a three-rate model price matrix, dependency-DAG work items with attempt fencing, human tickets, typed approvals, and a crash-recoverable bounded audit window.
 
-Target host: exactly tested against `@deepseek-ai/dsh@0.1.1-rc.2`; current plugin version `0.16.0`. See the [logic architecture and data paths](docs/architecture.md).
+Target host: exactly tested against `@deepseek-ai/dsh@0.1.1-rc.2`; current plugin version `0.17.3`. See the [logic architecture and data paths](docs/architecture.md).
 
 ---
 
@@ -23,16 +23,25 @@ Delegation fails when the "CEO" agent starts doing the work itself, spawns untra
 
 ## Feature highlights
 
-- **Decision-first formation** — the AI drafts name/slogan/mission/charter/first-product/budgets/prices; a human edits and explicitly approves before anything starts. Bootstrap provisions exactly one HR lead.
+- **Decision-first formation** — the AI drafts name/slogan/mission/charter/first-product/company-budget/independent-HR-ceiling/prices; a human edits and explicitly approves before anything starts. Bootstrap provisions exactly one HR lead.
 - **HR governance** — hire/adjust assessments cover difficulty, route, reasoning effort, money, org path and position; retirement needs only difficulty and rationale because the Host derives current staffing facts. Every change then needs a human-approved `organization_change`.
 - **Charter as structured data** — the Host parses the charter text into a clause tree (`company.charter_outline`); the Web renders it as an expandable tree with zero client-side parsing.
 - **Recruiting page** — per-model enable switches (default off = 未启用) gate hiring: HR may only recommend enabled (three-rate priced) routes. Built-in price presets for OpenAI / DeepSeek / Zhipu BigModel models (USD/CNY matched) prefill on enable — presets never auto-enable anything.
 - **Tickets** — humans file product-issue tickets from the Web console; the founder (or a designated support engineer) triages and dispatches; the linked repair work auto-resolves the ticket; closing replies to the human.
 - **One authoritative ledger** — employee execution and Founder management calls enter the same micro-currency usage ledger; Token counts are derived analytics. Unpriced Founder calls remain conversationally available but are recorded as unknown-cost. Retired activation-credit/Token mirrors migrate out of the current schema.
-- **Recoverable transactions and audit** — a WAL commits state/audit/mailboxes together. `events.jsonl` is explicitly a bounded rolling window that evicts oldest rows, not an unlimited immutable legal ledger.
+- **Resource admission** — new companies have no fixed headcount ceiling by default. Adaptive execution starts at eight permits and adjusts for memory, event-loop delay, queued writes and provider cooldowns. Work, HR, mail and onboarding share admission; resource waiting does not consume delivery retries.
+- **Recoverable transactions and audit** — a WAL coordinates state, usage, audit and mailboxes. Usage and full audit append to separate history files; `events.jsonl` remains a bounded display window. Legacy inline histories migrate on the next successful write.
 - **Web safety and approval parity** — loopback writes require same-origin `Origin`, revision fencing, and the exact live Agent. A Web temporary-authorization confirmation creates an approval; the grant applies only when that approval is resolved.
-- **Cold recovery discipline** — provisioning, staffing, handoffs, accounting events, and open attempts recover after restart. One attempt accepts at most three assignment prompts without a terminal update.
+- **Cold recovery discipline** — provisioning, staffing, handoffs, accounting events, and open attempts recover after restart. Historical accounting reads company state once, pre-deduplicates, then replays missing usage serially per Session; one attempt accepts at most three assignment prompts.
 - **HR succession** — an approved recommendation can transfer singleton HR authority only after the successor session starts, allowing the original HR lead to retire normally.
+
+## Headcount and execution
+
+`maxEmployees` accepts a positive safe integer or `unlimited` (the default); the previous hard ceiling of 32 is removed. HR, paused and failed employees count toward a finite ceiling; retirees do not. Existing companies retain their saved limits. Request a governance change in Overview, or use `company_request_governance_change` with `max_employees: "unlimited"`, then approve it. An explicitly finite limit in the installed profile remains an additional ceiling.
+
+`executionMode: adaptive` starts at `maxConcurrentEmployees: 8` and grows gradually with resource headroom. `fixed` treats that value as a shared plugin Host execution ceiling and retains resource checks. `unlimited` disables numeric capacity and memory/lag/write-pressure admission; provider cooldowns, one turn per employee and business rules still apply. Defaults are a memory ratio of 0.8, event-loop delay of 200ms, queued write/accounting count of 32, and a resource retry interval of 1000ms.
+
+Employee, organization and position directories use server pagination (50 rows by default, at most 100), with company-wide totals. `maxOpenWorkItems` remains a separate ordinary-work limit (32 by default). Transactions still hydrate and validate the full business aggregate; history separation reduces disk write amplification but does not prove unlimited memory capacity or OOM-free long-term operation. See the [architecture](docs/architecture.md) for storage and recovery boundaries.
 
 ## Install
 
@@ -54,7 +63,22 @@ Restart the existing DSH Web process and refresh the original URL — do not sta
 
    A complete example you can paste directly:
 
-   > Form a company and appoint you as its CEO. The mission is "bring knowledge to everyone"; the first product is "an AI-based generative learning platform". Total budget 300 CNY with 250 CNY for the product. Set up Product, R&D, and QA departments with staffing; start with product definition — spare no budget on the product manager role, I want the best product definition — then hire architects, developers, and testers to match the defined features. Operate the company and report product progress and competitiveness regularly.
+   > Form a company and appoint you as its CEO. The mission is "bring knowledge to everyone"; the first product is "an AI-based generative learning platform". Total budget 300 CNY with 250 CNY for the product and an initial HR spending ceiling of 10 CNY. Set up Product, R&D, and QA departments with staffing; start with product definition — spare no budget on the product manager role, I want the best product definition — then hire architects, developers, and testers to match the defined features. Operate the company and report product progress and competitiveness regularly.
+
+Company, product, and employee limits constrain the same actual spending; setting a ceiling does not spend money. Propose the HR ceiling explicitly for human review: the example's 10 CNY is not a default, and paid models must pass startup admission. `company_bootstrap` requires `hr_budget`; changing the company total preserves the HR ceiling. After formation, request HR or other employee ceiling changes through the Audit page or `company_request_budget_change` with `employee_budgets`; human approval applies the change.
+
+You can specify the initial HR model in the formation request: “Use `model-id` from `provider-id` for the initial HR lead, with the model's default reasoning effort.” Replace these placeholders with a provider/model configured in the Host; HR may use a different model from the Founder. Include this `company_bootstrap` parameter fragment alongside the other formation fields:
+
+```json
+{
+  "hr_provider": "provider-id",
+  "hr_model": "model-id",
+  "hr_reasoning_effort": "default",
+  "hr_budget": 10
+}
+```
+
+Omitting both provider/model fields inherits and saves the Founder's route at creation. Before approval, use the Overview model selector or enter a route manually; tool edits require `hr_provider` and `hr_model` together. Changing the route in the form resets reasoning effort while preserving the HR budget. Selecting a model does not price or enable it: paid startup still requires complete pricing, context metadata, and sufficient budget.
 
 1. **Ask for a company** — in a DSH session whose workspace is your product repo, tell the agent to form a company with a concrete mission. It drafts the full proposal via `company_bootstrap` (staged; nothing starts).
 

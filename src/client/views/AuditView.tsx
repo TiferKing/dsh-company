@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { CompanyTranslate } from '../locales.js'
-import type { CompanySnapshot, SafeMoneyUsageView } from '../types.js'
+import type { CompanySnapshot, SafeMoneyUsageView, SnapshotQuery } from '../types.js'
+import { EmployeeDirectoryControls } from '../directory.js'
 import { ChartIcon, ChevronIcon, InfoIcon, PackageIcon, WalletIcon, WarningIcon } from '../icons.js'
-import { decimalMoneyToUnits, microsToInput } from './OverviewView.js'
+import { decimalMoneyToMicros, decimalMoneyToUnits, microsToInput } from './OverviewView.js'
 import {
   formatAbsolute,
   formatDecimal,
@@ -20,9 +21,47 @@ export interface AuditViewProps {
   canManageBudget?: boolean
   onRequestBudgetChange?(payload: Record<string, unknown>, expectedRevision: number): Promise<boolean>
   onOpenApprovals?(): void
+  onDirectoryQuery?(query: SnapshotQuery): void
 }
 
 const SEGMENT_COLORS = ['#3964fe', '#7c5cff', '#138a58', '#c57900', '#d83b46', '#1887a8', '#8a5b2d', '#6b7280'] as const
+
+type BudgetDraftResult =
+  | { ok: true; payload: Record<string, unknown> }
+  | { ok: false; reason: 'invalidMoney' | 'budgetAboveTotal' | 'budgetBelowCommitted' | 'productTotal' | 'unchanged'; name?: string }
+
+/** Compare currency drafts to approved ceilings; submit only changed allocations. */
+export function budgetDraftPayload(snapshot: CompanySnapshot, total: string, products: Record<string, string>, employees: Record<string, string>): BudgetDraftResult {
+  const totalMicros = decimalMoneyToMicros(total)
+  if (totalMicros === undefined) return { ok: false, reason: 'invalidMoney' }
+  if (totalMicros < snapshot.budget.spent_micros + snapshot.budget.reserved_micros) return { ok: false, reason: 'budgetBelowCommitted' }
+  const payload: Record<string, unknown> = {}
+  if (totalMicros !== snapshot.budget.total_micros) payload.total_budget = decimalMoneyToUnits(total)!
+  let productTotal = 0n
+  const productBudgets: Array<{ product_id: string; product_budget: string }> = []
+  for (const product of snapshot.products.filter((item) => item.status !== 'cancelled' && item.status !== 'retired')) {
+    const draft = products[product.id] ?? ''
+    const amount = decimalMoneyToMicros(draft)
+    if (amount === undefined) return { ok: false, reason: 'invalidMoney', name: product.name }
+    if (amount > totalMicros) return { ok: false, reason: 'budgetAboveTotal', name: product.name }
+    if (amount !== product.budget_micros && amount < (product.spent_micros ?? 0) + (product.reserved_micros ?? 0)) return { ok: false, reason: 'budgetBelowCommitted', name: product.name }
+    productTotal += BigInt(amount)
+    if (amount !== product.budget_micros) productBudgets.push({ product_id: product.id, product_budget: decimalMoneyToUnits(draft)! })
+  }
+  if (productTotal > BigInt(totalMicros)) return { ok: false, reason: 'productTotal' }
+  const employeeBudgets: Array<{ employee_id: string; budget: string }> = []
+  for (const employee of snapshot.employees.filter((item) => item.status !== 'retired')) {
+    const draft = employees[employee.id] ?? ''
+    const amount = decimalMoneyToMicros(draft)
+    if (amount === undefined) return { ok: false, reason: 'invalidMoney', name: employee.name }
+    if (amount > totalMicros) return { ok: false, reason: 'budgetAboveTotal', name: employee.name }
+    if (amount !== (employee.budget_micros ?? 0) && amount < (employee.spent_micros ?? 0) + (employee.reserved_micros ?? 0)) return { ok: false, reason: 'budgetBelowCommitted', name: employee.name }
+    if (amount !== (employee.budget_micros ?? 0)) employeeBudgets.push({ employee_id: employee.id, budget: decimalMoneyToUnits(draft)! })
+  }
+  if (productBudgets.length > 0) payload.product_budgets = productBudgets
+  if (employeeBudgets.length > 0) payload.employee_budgets = employeeBudgets
+  return Object.keys(payload).length === 0 ? { ok: false, reason: 'unchanged' } : { ok: true, payload }
+}
 
 function routeColor(provider: string, model: string): string {
   let hash = 2_166_136_261
@@ -117,8 +156,17 @@ export function AuditView(props: AuditViewProps): React.JSX.Element {
   const [openUsageId, setOpenUsageId] = useState<string>()
   const [totalBudgetDraft, setTotalBudgetDraft] = useState(() => microsToInput(budget.total_micros))
   const [productBudgetDrafts, setProductBudgetDrafts] = useState<Record<string, string>>(() => Object.fromEntries(snapshot.products.map((product) => [product.id, microsToInput(product.budget_micros)])))
+  const [employeeBudgetDrafts, setEmployeeBudgetDrafts] = useState<Record<string, string>>(() => Object.fromEntries(snapshot.employees.filter((employee) => employee.status !== 'retired').map((employee) => [employee.id, microsToInput(employee.budget_micros ?? 0)])))
   const [budgetError, setBudgetError] = useState<string>()
-  const budgetDirty = useRef(false)
+  const [budgetDirty, setBudgetDirty] = useState(false)
+  const draftSnapshot = useRef(snapshot)
+  const markBudgetDirty = (): void => {
+    if (!budgetDirty) {
+      draftSnapshot.current = snapshot
+      draftRevision.current = snapshot.revision
+    }
+    setBudgetDirty(true)
+  }
   const draftRevision = useRef(snapshot.revision)
   const previousCompanyId = useRef(snapshot.company.id)
   const lifetime = useMemo(
@@ -134,35 +182,44 @@ export function AuditView(props: AuditViewProps): React.JSX.Element {
   const unpricedCalls = lifetime.reduce((sum, item) => sum + item.unpriced_calls, 0)
   const spentPercent = percent(budget.spent_micros, budget.total_micros)
   const reservedPercent = percent(budget.reserved_micros, budget.total_micros)
-  const productBudgetTotal = snapshot.products.reduce((sum, product) => sum + (product.budget_micros ?? 0), 0)
+  // Freeze the edited page and its revision until submission or discard. A
+  // pagination request already in flight must not replace the draft's owners.
+  const editingSnapshot = budgetDirty ? draftSnapshot.current : snapshot
+  const activeProducts = editingSnapshot.products.filter((product) => product.status !== 'cancelled' && product.status !== 'retired')
+  const activeEmployees = editingSnapshot.employees.filter((employee) => employee.status !== 'retired')
+  const productBudgetTotal = activeProducts.reduce((sum, product) => sum + product.budget_micros, 0)
   useEffect(() => {
-    if (previousCompanyId.current !== snapshot.company.id) {
+    const companyChanged = previousCompanyId.current !== snapshot.company.id
+    if (companyChanged) {
       previousCompanyId.current = snapshot.company.id
-      budgetDirty.current = false
+      setBudgetDirty(false)
+      draftSnapshot.current = snapshot
       draftRevision.current = snapshot.revision
     }
-    if (!budgetDirty.current) {
+    if (!budgetDirty || companyChanged) {
+      draftSnapshot.current = snapshot
       draftRevision.current = snapshot.revision
       setTotalBudgetDraft(microsToInput(budget.total_micros))
       setProductBudgetDrafts(Object.fromEntries(snapshot.products.map((product) => [product.id, microsToInput(product.budget_micros)])))
+      setEmployeeBudgetDrafts(Object.fromEntries(snapshot.employees.filter((employee) => employee.status !== 'retired').map((employee) => [employee.id, microsToInput(employee.budget_micros ?? 0)])))
       setBudgetError(undefined)
     }
-  }, [snapshot.revision, snapshot.company.id])
+  }, [snapshot.revision, snapshot.company.id, snapshot.employees, budgetDirty])
   const requestBudgetChange = async (): Promise<void> => {
     if (props.onRequestBudgetChange === undefined) return
-    const totalBudgetUnits = decimalMoneyToUnits(totalBudgetDraft)
-    const productBudgets = snapshot.products.map((product) => ({ id: product.id, budget: decimalMoneyToUnits(productBudgetDrafts[product.id] ?? '') }))
-    if (totalBudgetUnits === undefined || productBudgets.some((product) => product.budget === undefined)) {
-      setBudgetError(t('formation.invalidMoney', { field: t('audit.companyBudget') }))
+    const draft = budgetDraftPayload(draftSnapshot.current, totalBudgetDraft, productBudgetDrafts, employeeBudgetDrafts)
+    if (!draft.ok) {
+      setBudgetError(draft.reason === 'productTotal'
+        ? t('audit.productBudgetAboveTotal')
+        : draft.reason === 'unchanged'
+          ? t('audit.budgetUnchanged')
+          : t(`formation.${draft.reason}`, { field: draft.name ?? t('audit.companyBudget') }))
       return
     }
     setBudgetError(undefined)
-    const succeeded = await props.onRequestBudgetChange({
-      total_budget: totalBudgetUnits,
-      product_budgets: productBudgets.map((product) => ({ product_id: product.id, product_budget: product.budget })),
-    }, draftRevision.current)
+    const succeeded = await props.onRequestBudgetChange(draft.payload, draftRevision.current)
     if (succeeded) {
-      budgetDirty.current = false
+      setBudgetDirty(false)
       props.onOpenApprovals?.()
     }
   }
@@ -194,19 +251,34 @@ export function AuditView(props: AuditViewProps): React.JSX.Element {
 
       <div className="dsh-company-audit-grid">
         <MoneyStat icon={<WalletIcon width="14" height="14" />} value={formatMoneyMicros(budget.total_micros, budget.currency, locale)} label={t('audit.companyBudget')} secondary={`${budget.currency} · revision ${budget.pricing_revision}`} />
-        <MoneyStat icon={<PackageIcon width="14" height="14" />} value={formatMoneyMicros(productBudgetTotal, budget.currency, locale)} label={t('audit.productBudget')} secondary={`${snapshot.products.length} ${t('tab.products')}`} />
+        <MoneyStat icon={<PackageIcon width="14" height="14" />} value={formatMoneyMicros(productBudgetTotal, budget.currency, locale)} label={t('audit.productBudget')} secondary={`${activeProducts.length} ${t('tab.products')}`} />
         <MoneyStat icon={<ChartIcon width="14" height="14" />} value={formatMoneyMicros(budget.spent_micros, budget.currency, locale)} label={t('audit.spent')} secondary={`${spentPercent}%`} />
         <MoneyStat icon={<InfoIcon width="14" height="14" />} value={formatMoneyMicros(budget.reserved_micros, budget.currency, locale)} label={t('audit.reserved')} secondary={`${reservedPercent}%`} />
         <MoneyStat icon={<WalletIcon width="14" height="14" />} value={formatMoneyMicros(budget.available_micros, budget.currency, locale)} label={t('audit.available')} />
       </div>
       <div className="dsh-company-product-budget-list">
-        <label><span>{t('audit.companyBudget')}</span>{props.canManageBudget ? <input inputMode="decimal" value={totalBudgetDraft} onChange={(event) => { budgetDirty.current = true; setTotalBudgetDraft(event.currentTarget.value) }} /> : <strong>{formatMoneyMicros(budget.total_micros, budget.currency, locale)}</strong>}</label>
-        {snapshot.products.map((product) => <label key={product.id}><span>{product.name}</span>{props.canManageBudget ? <input inputMode="decimal" value={productBudgetDrafts[product.id] ?? ''} onChange={(event) => { budgetDirty.current = true; setProductBudgetDrafts((current) => ({ ...current, [product.id]: event.currentTarget.value })) }} /> : <strong>{formatMoneyMicros(product.budget_micros, budget.currency, locale)}</strong>}</label>)}
+        <label><span>{t('audit.companyBudget')}</span>{props.canManageBudget ? <input inputMode="decimal" value={totalBudgetDraft} onChange={(event) => { markBudgetDirty(); setTotalBudgetDraft(event.currentTarget.value) }} /> : <strong>{formatMoneyMicros(budget.total_micros, budget.currency, locale)}</strong>}</label>
+        {activeProducts.map((product) => <label key={product.id}><span>{product.name}</span>{props.canManageBudget ? <input inputMode="decimal" value={productBudgetDrafts[product.id] ?? ''} onChange={(event) => { const value = event.currentTarget.value; markBudgetDirty(); setProductBudgetDrafts((current) => ({ ...current, [product.id]: value })) }} /> : <strong>{formatMoneyMicros(product.budget_micros, budget.currency, locale)}</strong>}</label>)}
       </div>
+      <section className="dsh-company-section">
+        <div className="dsh-company-section__head"><h3 className="dsh-company-section__title">{t('audit.employeeBudgets')}</h3><span className="dsh-company-section__count">{budget.currency}</span></div>
+        <p className="dsh-company-formation__hint">{t('formation.budgetHint')}</p>
+        <EmployeeDirectoryControls snapshot={editingSnapshot} t={t} busy={busy || budgetDirty} onQuery={props.onDirectoryQuery} />
+        {snapshot.directory === undefined || !budgetDirty ? null : <p className="dsh-company-formation__hint">{t('directory.unsaved')} <button type="button" className="dsh-company-action" disabled={busy} onClick={() => {
+          setBudgetDirty(false); draftRevision.current = snapshot.revision
+          setTotalBudgetDraft(microsToInput(budget.total_micros))
+          setProductBudgetDrafts(Object.fromEntries(snapshot.products.map((product) => [product.id, microsToInput(product.budget_micros)])))
+          setEmployeeBudgetDrafts(Object.fromEntries(activeEmployees.map((employee) => [employee.id, microsToInput(employee.budget_micros ?? 0)])))
+          setBudgetError(undefined)
+        }}>{t('directory.discard')}</button></p>}
+        <div className="dsh-company-product-budget-list">
+          {activeEmployees.map((employee) => <label key={employee.id}><span>{employee.name}{employee.is_hr ? ' · HR' : ''}</span>{props.canManageBudget ? <input inputMode="decimal" value={employeeBudgetDrafts[employee.id] ?? ''} onChange={(event) => { const value = event.currentTarget.value; markBudgetDirty(); setEmployeeBudgetDrafts((current) => ({ ...current, [employee.id]: value })) }} /> : <strong>{formatMoneyMicros(employee.budget_micros ?? 0, budget.currency, locale)}</strong>}</label>)}
+        </div>
+      </section>
       {budgetError === undefined ? null : <div className="dsh-company-banner dsh-company-section" data-tone="error" role="alert"><WarningIcon width="14" height="14" />{budgetError}</div>}
       {props.canManageBudget && props.onRequestBudgetChange !== undefined ? (
         <div className="dsh-company-inline-actions dsh-company-section">
-          <button type="button" className="dsh-company-action" data-variant="primary" disabled={busy || !budgetDirty.current} onClick={() => void requestBudgetChange()}>{t('audit.requestBudgetChange')}</button>
+          <button type="button" className="dsh-company-action" data-variant="primary" disabled={busy || !budgetDirty} onClick={() => void requestBudgetChange()}>{t('audit.requestBudgetChange')}</button>
         </div>
       ) : null}
 

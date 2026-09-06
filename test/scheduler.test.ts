@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { HR_ASSESSMENT_REMINDER } from '../src/hr-policy.js'
 import { mkdtemp, mkdir, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -10,6 +11,56 @@ import { CompanyStore } from '../src/state.js'
 import { releaseEmployeeMoneyReservations, reserveMoneyTurn } from '../src/money.js'
 import type { CompanyMessage, CompanyState } from '../src/types.js'
 import { companyState } from './fixtures.js'
+
+test('scheduler coalesces a burst of workspace kicks into one rerun', async () => {
+  let releaseFirst!: () => void
+  const first = new Promise<void>((resolve) => { releaseFirst = resolve })
+  let reads = 0
+  const store = {
+    pathsForCwd: async () => ({ workspace: { key: 'workspace-key' } }),
+    readActive: async () => {
+      reads += 1
+      if (reads === 1) await first
+      return undefined
+    },
+  } as any
+  const ctx = { logger: { warn: () => undefined }, agents: { get: () => undefined }, on: () => () => undefined } as any
+  const scheduler = installCompanyScheduler(ctx, resolveConfig({ stateRoot: '/tmp/dsh-company-scheduler-coalesce' }), store)
+  const firstKick = scheduler.kick('/workspace')
+  await Promise.resolve()
+  const burst = Array.from({ length: 100 }, () => scheduler.kick('/workspace'))
+  releaseFirst()
+  await Promise.all([firstKick, ...burst])
+  assert.equal(reads, 2, 'one running pass plus one coalesced rerun is the hard upper bound')
+  await scheduler.dispose?.()
+})
+
+test('scheduler preserves a wakeup arriving at the completed-pass boundary', async () => {
+  let reads = 0
+  let lateKick: Promise<void> | undefined
+  const store = {
+    pathsForCwd: async () => ({ workspace: { key: 'workspace-key' } }),
+    readActive: async () => {
+      reads += 1
+      if (reads === 1) {
+        // Let the last read finish, then start a new wakeup whose async path
+        // lookup completes just after the current pass decides it is done.
+        queueMicrotask(() => queueMicrotask(() => { lateKick = scheduler.kick('/workspace') }))
+      }
+      return undefined
+    },
+  } as any
+  const ctx = { logger: { warn: () => undefined }, agents: { get: () => undefined }, on: () => () => undefined } as any
+  const scheduler = installCompanyScheduler(ctx, resolveConfig({ stateRoot: '/tmp/dsh-company-scheduler-boundary' }), store)
+  try {
+    await scheduler.kick('/workspace')
+    assert.notEqual(lateKick, undefined)
+    await lateKick
+    assert.equal(reads, 2, 'the late wakeup must observe the workspace again instead of joining an already completed pass')
+  } finally {
+    await scheduler.dispose?.()
+  }
+})
 
 test('a disappeared continuable can cold-recover the same open attempt repeatedly', async () => {
   const base = await mkdtemp(join(tmpdir(), 'dsh-company-scheduler-'))
@@ -184,7 +235,8 @@ test('a stale idle event cannot release the replacement employee session reserva
     },
   } as unknown as CompanyStore
   const ctx = {
-    on: (_name: string, callback: typeof statusHandler) => { statusHandler = callback },
+    on: (name: string, callback: typeof statusHandler) => { if (name === 'agent/status') statusHandler = callback },
+    agents: { get: () => undefined },
     logger: { warn: () => undefined },
   } as any
   const scheduler = installCompanyScheduler(ctx, resolveConfig({}), store)
@@ -328,8 +380,8 @@ for (const stoppedBy of ['pause', 'archive', 'founder_unload'] as const) {
       if (stoppedBy === 'founder_unload') founderLive = false
       let readOnWake!: () => void
       const wakeRead = new Promise<void>((resolve) => { readOnWake = resolve })
-      const originalRead = store.readActive.bind(store)
-      t.mock.method(store, 'readActive', async (...args: Parameters<typeof store.readActive>) => {
+      const originalRead = store.readActiveView.bind(store)
+      t.mock.method(store, 'readActiveView', async (...args: Parameters<typeof store.readActiveView>) => {
         const active = stoppedBy === 'archive' ? undefined : await originalRead(...args)
         readOnWake()
         return active
@@ -416,16 +468,59 @@ async function withSchedulerScenario(
   }
 }
 
+for (const action of ['hire', 'adjust', 'retire'] as const) {
+  test(`HR ${action} delivery contains the assigned facts needed for its decision`, async () => {
+    await withSchedulerScenario(async ({ state, store, workspace, scheduler, founder, deliveries }) => {
+      state.workItems = []
+      state.employees[0]!.status = 'idle'
+      state.employees[0]!.isHr = true
+      state.employees[1]!.isHr = false
+      state.employees[1]!.name = 'Target engineer'
+      state.employees[1]!.executionPrompt = 'private target execution instructions'
+      state.employees[1]!.llm = { provider: 'original', model: 'original-model', fallback: { provider: 'backup', model: 'active-model' }, fallbackActive: true, activeProvider: 'backup', activeModel: 'active-model' }
+      state.hrEmployeeId = 'e1'
+      state.staffingRequests.push({
+        id: 'sr1', action, status: 'pending', requestedBy: 'founder', hrEmployeeId: 'e1',
+        ...(action === 'hire' ? { candidateName: 'Product architect' } : { employeeId: 'e2' }),
+        workProfile: 'Design interfaces with independently testable acceptance criteria.',
+        constraints: 'Quality is the priority; preserve the approved spending ceiling.',
+        createdAt: Date.now(), updatedAt: Date.now(),
+      })
+      state.counters.staffing = 1
+      await store.createStaged(workspace, state)
+      await scheduler.kick(workspace, founder)
+      assert.equal(deliveries.length, 1)
+      const delivered = deliveries[0]!
+      const facts = JSON.parse(delivered.split('\n').find((line) => line.startsWith('{"request_id"'))!)
+      assert.equal(facts.action, action)
+      assert.equal(facts.work_profile, state.staffingRequests[0]!.workProfile)
+      assert.equal(facts.constraints, state.staffingRequests[0]!.constraints)
+      if (action === 'hire') {
+        assert.equal(facts.candidate_name, 'Product architect')
+        assert.equal(facts.current_employee, undefined)
+      } else {
+        assert.equal(facts.employee_id, 'e2')
+        assert.equal(facts.current_employee.name, 'Target engineer')
+        assert.deepEqual(facts.current_employee.current_route, { provider: 'backup', model: 'active-model' })
+        assert.equal(facts.current_employee.monetary_authority.budget_micros, state.employees[1]!.budgetMicros)
+        assert.deepEqual(facts.current_employee.responsibilities, state.positions[0]!.responsibilities)
+      }
+      assert.doesNotMatch(delivered, /private target execution instructions/)
+      assert.equal(delivered.includes(HR_ASSESSMENT_REMINDER), action !== 'retire')
+    })
+  })
+}
+
 test('an interrupted in-review HR assessment cold-recovers the same capability', async () => {
   const base = await mkdtemp(join(tmpdir(), 'dsh-company-scheduler-staffing-recovery-'))
   const workspace = join(base, 'workspace')
   await mkdir(workspace)
   try {
-    let followups = 0
+    const followups: string[] = []
     const founder = { id: 'founder-session', session: { header: { cwd: workspace } }, steer: () => undefined } as any
     const ctx = {
       agents: { get(id: unknown) { return String(id) === 'founder-session' ? founder : undefined } },
-      subagents: { followup: async () => { followups += 1; return 'message' } }, logger: { warn: () => undefined }, on: () => () => undefined,
+      subagents: { followup: async (_parent: unknown, _id: unknown, content: Array<{ text: string }>) => { followups.push(content[0]!.text); return 'message' } }, logger: { warn: () => undefined }, on: () => () => undefined,
     } as any
     const config = resolveConfig({ stateRoot: join(base, 'state') })
     const store = new CompanyStore(config)
@@ -443,7 +538,11 @@ test('an interrupted in-review HR assessment cold-recovers the same capability',
     const scheduler = installCompanyScheduler(ctx, config, store)
     await scheduler.kick(workspace, founder)
     const saved = await store.readActive(workspace)
-    assert.equal(followups, 1)
+    assert.equal(followups.length, 1)
+    const facts = JSON.parse(followups[0]!.split('\n').find((line) => line.startsWith('{"request_id"'))!)
+    assert.equal(facts.candidate_name, 'Engineer', 'cold recovery re-supplies facts absent from the HR status projection')
+    assert.equal(facts.work_profile, 'Build.')
+    assert.ok(followups[0]!.includes(HR_ASSESSMENT_REMINDER))
     assert.equal(saved?.staffingRequests[0]?.status, 'in_review')
     assert.equal(saved?.staffingRequests[0]?.attemptId, '550e8400-e29b-41d4-a716-446655440030')
     assert.equal(saved?.staffingRequests[0]?.reviewDeliveryAttempts, 2)

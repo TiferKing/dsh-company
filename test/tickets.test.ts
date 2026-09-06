@@ -93,7 +93,7 @@ test('a ticket travels file → triage → dispatch → resolve → close with s
     await harness.runtime.bootstrap(harness.founder, {
       name: 'Draft Co', mission: 'Build one bounded tool.', charter: '1. Human approval governs.',
       firstProduct: { name: 'Tool', summary: 'One tool.', productRoot: 'tool', successCriteria: ['Tests pass'], budgetMicros: 1_000_000 },
-      totalBudgetMicros: 1_000_000, currency: 'CNY', draftedBy: 'ai',
+      totalBudgetMicros: 1_000_000, hrBudgetMicros: 100_000, currency: 'CNY', draftedBy: 'ai',
       modelPrices: [{ provider: 'mock', model: 'mock-model', inputCacheMissMicrosPerMillion: 0, inputCacheHitMicrosPerMillion: 0, outputMicrosPerMillion: 0 }],
     })
     await harness.runtime.approveBootstrap(harness.founder, 'Approved and start.', { source: 'ui' })
@@ -207,7 +207,7 @@ test('filing is bounded to operating companies and existing products', async () 
     await harness.runtime.bootstrap(harness.founder, {
       name: 'Draft Co', mission: 'Build one bounded tool.', charter: '1. Human approval governs.',
       firstProduct: { name: 'Tool', summary: 'One tool.', productRoot: 'tool', successCriteria: ['Tests pass'], budgetMicros: 1_000_000 },
-      totalBudgetMicros: 1_000_000, currency: 'CNY', draftedBy: 'ai',
+      totalBudgetMicros: 1_000_000, hrBudgetMicros: 100_000, currency: 'CNY', draftedBy: 'ai',
       modelPrices: [{ provider: 'mock', model: 'mock-model', inputCacheMissMicrosPerMillion: 0, inputCacheHitMicrosPerMillion: 0, outputMicrosPerMillion: 0 }],
     })
     await assert.rejects(() => harness.runtime.fileTicket(harness.founder, { productId: 'p1', title: 'x', description: 'y' }), /operating/)

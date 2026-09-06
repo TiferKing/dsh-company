@@ -2,8 +2,9 @@ import type { Context } from '@deepseek-ai/cordis'
 import { defineTool, type JsonValue, type ParameterSchemaSpec, type ToolRunContext } from '@deepseek-ai/dsh-tools'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { CompanyRuntime } from './runtime.js'
-import { PRODUCT_STATUSES, WORK_KINDS, type ApprovalKind, type CompanySnapshot, type ModelPriceInput, type ProductStatus, type ReviewFinding } from './types.js'
-import { currencyUnitsToMicros, isRecord } from './schemas.js'
+import { PRODUCT_STATUSES, WORK_KINDS, type ApprovalKind, type CompanySnapshot, type EmployeeStatus, type ModelPriceInput, type ProductStatus, type ReviewFinding, type SnapshotQuery } from './types.js'
+import { currencyUnitsToMicros, isRecord, normalizeEmployeeLimit } from './schemas.js'
+import { normalizeSnapshotQuery } from './snapshot.js'
 
 const APPROVAL_KINDS: ApprovalKind[] = ['budget_change', 'pricing_change', 'governance_change', 'temporary_authorization', 'organization_change', 'product_scope', 'model_route', 'release', 'external_effect', 'forced_archive']
 const STATUS_SECTIONS = ['overview', 'company', 'org_units', 'positions', 'staffing_requests', 'employees', 'products', 'work', 'tickets', 'budget', 'model_catalog', 'temporary_authorizations', 'approvals', 'inbox'] as const
@@ -24,11 +25,14 @@ export function registerCompanyTools(ctx: Context, runtime: CompanyRuntime): voi
       },
     },
     total_budget: { type: 'number', required: true, description: 'Company-wide monetary ceiling in normal currency units (maximum 6 decimals).' },
+    hr_budget: { type: 'number', required: true, description: 'Independent initial HR spending ceiling in normal currency units (maximum 6 decimals), at most total_budget. Propose explicitly; never inherit the company budget.' },
     currency: requiredString('ISO-like currency code for all monetary amounts, e.g. USD or CNY.'),
     model_prices: modelPriceArray(),
     drafted_by: { type: 'string', enum: ['ai', 'user'] },
     hr_name: { type: 'string', description: 'Initial HR governance lead display name.' },
-    hr_provider: { type: 'string' }, hr_model: { type: 'string' }, hr_reasoning_effort: { type: 'string' },
+    hr_provider: { type: 'string', description: 'Initial HR model provider, independent of the Founder. Supply hr_model with an explicit provider; omit both to inherit the Founder route at creation.' },
+    hr_model: { type: 'string', description: 'Initial HR model ID. Honor a model specified by the human. Without hr_provider, uses the Founder provider; the chosen route is saved in the formation proposal.' },
+    hr_reasoning_effort: { type: 'string', description: 'Initial HR reasoning effort ID; default uses the selected model default.' },
   }, async (args, exec) => {
     const first = args.first_product as Record<string, unknown>
     const result = await runtime.bootstrap(requireAgent(exec), {
@@ -38,6 +42,7 @@ export function registerCompanyTools(ctx: Context, runtime: CompanyRuntime): voi
         successCriteria: first.success_criteria as string[], budgetMicros: currencyUnitsToMicros(first.product_budget, 'first_product.product_budget'),
       },
       totalBudgetMicros: currencyUnitsToMicros(args.total_budget, 'total_budget'), currency: args.currency as string,
+      hrBudgetMicros: currencyUnitsToMicros(args.hr_budget, 'hr_budget'),
       ...(args.model_prices === undefined ? {} : { modelPrices: modelPricesFromArgs(args.model_prices) }),
       ...(args.drafted_by === undefined ? {} : { draftedBy: args.drafted_by as 'ai' | 'user' }),
       ...(args.hr_name === undefined ? {} : { hrName: args.hr_name as string }),
@@ -48,7 +53,7 @@ export function registerCompanyTools(ctx: Context, runtime: CompanyRuntime): voi
     return { company_id: result.companyId, phase: result.phase, revision: result.revision, state_root_display: result.stateRootDisplay }
   })
 
-  register(ctx, 'company_edit_formation', 'Edit the staged company identity, governance, initial HR route, first product, monetary budget, currency, or three-rate price matrix before approval or provisioning retry.', {
+  register(ctx, 'company_edit_formation', 'Edit the staged company identity, governance, initial HR route and independent spending ceiling, first product, monetary budget, currency, or three-rate price matrix before approval or provisioning retry.', {
     name: { type: 'string' }, slogan: { type: 'string' }, mission: { type: 'string' }, charter: { type: 'string' },
     first_product: {
       type: 'object', additionalProperties: false,
@@ -58,7 +63,11 @@ export function registerCompanyTools(ctx: Context, runtime: CompanyRuntime): voi
       },
     },
     total_budget: { type: 'number' }, currency: { type: 'string' }, model_prices: modelPriceArray(),
-    hr_name: { type: 'string' }, hr_provider: { type: 'string' }, hr_model: { type: 'string' }, hr_reasoning_effort: { type: 'string' },
+    hr_budget: { type: 'number', description: 'Independent HR spending ceiling in normal currency units. Omission preserves the current ceiling, including when total_budget changes.' },
+    hr_name: { type: 'string' },
+    hr_provider: { type: 'string', description: 'Replacement initial HR provider; supply together with hr_model.' },
+    hr_model: { type: 'string', description: 'Replacement initial HR model ID; supply together with hr_provider. Does not change hr_budget.' },
+    hr_reasoning_effort: { type: 'string', description: 'HR reasoning effort ID, or default for the selected model default. May be changed without changing the current HR route.' },
     expected_revision: { type: 'integer' },
   }, async (args, exec) => {
     const first = args.first_product as Record<string, unknown> | undefined
@@ -75,6 +84,7 @@ export function registerCompanyTools(ctx: Context, runtime: CompanyRuntime): voi
         ...(first.product_budget === undefined ? {} : { budgetMicros: currencyUnitsToMicros(first.product_budget, 'first_product.product_budget') }),
       } }),
       ...(args.total_budget === undefined ? {} : { totalBudgetMicros: currencyUnitsToMicros(args.total_budget, 'total_budget') }),
+      ...(args.hr_budget === undefined ? {} : { hrBudgetMicros: currencyUnitsToMicros(args.hr_budget, 'hr_budget') }),
       ...(args.currency === undefined ? {} : { currency: args.currency as string }),
       ...(args.model_prices === undefined ? {} : { modelPrices: modelPricesFromArgs(args.model_prices) }),
       ...(args.hr_name === undefined ? {} : { hrName: args.hr_name as string }),
@@ -99,7 +109,8 @@ export function registerCompanyTools(ctx: Context, runtime: CompanyRuntime): voi
   register(ctx, 'company_request_staffing', 'Ask the designated HR lead to assess a hire, adjustment, or retirement. HR decides difficulty, model route, reasoning effort, monetary ceiling, org path, position, responsibilities, and optional HR succession before human approval.', {
     action: { type: 'string', required: true, enum: ['hire', 'adjust', 'retire'] },
     candidate_name: { type: 'string' }, employee_id: { type: 'string' },
-    work_profile: requiredString('Concrete work profile and expected outcomes.'), constraints: { type: 'string' },
+    work_profile: requiredString('Actual responsibilities, product phase, deliverables, acceptance criteria, failure impact, and context/tool/modality needs. For adjustments include observed work evidence and what changed; a job title or desired model alone is insufficient.'),
+    constraints: { type: 'string', description: 'Human-specified routes, quality priorities, timing, and monetary limits. Distinguish firm requirements from preferences and identify missing facts.' },
   }, async (args, exec) => runtime.requestStaffing(requireAgent(exec), {
     action: args.action as 'hire' | 'adjust' | 'retire',
     ...(args.candidate_name === undefined ? {} : { candidateName: args.candidate_name as string }),
@@ -117,11 +128,13 @@ export function registerCompanyTools(ctx: Context, runtime: CompanyRuntime): voi
 
   register(ctx, 'company_submit_staffing_assessment', 'Submit the designated HR assessment and open an organization_change approval. Hire/adjust require an enabled three-rate-priced route and full staffing fields; retire requires only difficulty and rationale because current staffing facts are Host-derived.', {
     request_id: requiredString('Staffing request id.'), attempt_id: requiredString('Exact HR assessment capability.'),
-    difficulty: { type: 'string', required: true, enum: ['low', 'medium', 'high', 'critical'] },
-    provider: { type: 'string', description: 'Recommended enabled provider; required for hire/adjust and omitted for retire.' }, model: { type: 'string', description: 'Recommended enabled model; required for hire/adjust and omitted for retire.' },
-    reasoning_effort: { type: 'string', description: 'Optional enabled reasoning-effort id, or default.' },
-    employee_budget: { type: 'number', description: 'Recommended employee monetary ceiling; required for hire/adjust and omitted for retire.' },
-    rationale: requiredString('HR assessment rationale.'), org_path: { type: 'array', items: { type: 'string' }, description: 'Organization path; required for hire/adjust and omitted for retire.' },
+    difficulty: { type: 'string', required: true, enum: ['low', 'medium', 'high', 'critical'], description: 'Difficulty and consequences of the actual work; justify from the role contract, not the position title.' },
+    provider: { type: 'string', description: 'Recommended permitted, enabled provider; required for hire/adjust and omitted for retire.' },
+    model: { type: 'string', description: 'Model suited to this role based on current capability evidence and complete pricing. Do not default every role to the Founder/HR model. Required for hire/adjust; omitted for retire.' },
+    reasoning_effort: { type: 'string', description: 'Reasoning-effort ID supported by this model and justified by the role, or default when no override is justified.' },
+    employee_budget: { type: 'number', description: 'Proposed employee spending authority in normal currency units, not a forecast of token usage or actual cost. Respect company limits and existing spend/reservations. Required for hire/adjust; omitted for retire.' },
+    rationale: requiredString('Hire/adjust: role requirements; suitable candidates and visible evidence (or why only one qualifies); selection and tradeoffs; reasoning effort; spending constraints; uncertainty and reassessment triggers. Retire: impact, handoff, and rationale only. Do not invent capability or benchmark claims.'),
+    org_path: { type: 'array', items: { type: 'string' }, description: 'Organization path; required for hire/adjust and omitted for retire.' },
     position_title: { type: 'string', description: 'Staffed position; required for hire/adjust and omitted for retire.' }, responsibilities: { type: 'array', items: { type: 'string' }, description: 'Responsibilities; required for hire/adjust and omitted for retire.' },
     designate_as_hr: { type: 'boolean', description: 'For hire/adjust only: transfer singleton HR governance authority to this employee after successful provisioning.' },
   }, async (args, exec) => runtime.submitStaffingAssessment(requireAgent(exec), {
@@ -261,14 +274,22 @@ export function registerCompanyTools(ctx: Context, runtime: CompanyRuntime): voi
         product_budget: { type: 'number', required: true, description: 'Product monetary allocation in normal currency units.' },
       } },
     },
+    employee_budgets: {
+      type: 'array', items: { type: 'object', additionalProperties: false, properties: {
+        employee_id: requiredString('Active employee id, including the HR lead.'),
+        budget: { type: 'number', required: true, description: 'Employee lifetime spending ceiling in normal currency units. Overlaps product/company ceilings; does not allocate extra money.' },
+      } },
+    },
     model_prices: modelPriceArray(),
     expected_pricing_revision: { type: 'integer' },
     expected_revision: { type: 'integer' },
   }, async (args, exec) => {
     const productBudgets = args.product_budgets as Array<Record<string, unknown>> | undefined
+    const employeeBudgets = args.employee_budgets as Array<Record<string, unknown>> | undefined
     const approvals = await runtime.requestBudgetChange(requireAgent(exec), {
       ...(args.total_budget === undefined ? {} : { totalBudgetMicros: currencyUnitsToMicros(args.total_budget, 'total_budget') }),
       ...(productBudgets === undefined ? {} : { productBudgets: productBudgets.map((entry) => ({ productId: entry.product_id as string, budgetMicros: currencyUnitsToMicros(entry.product_budget, 'product_budget') })) }),
+      ...(employeeBudgets === undefined ? {} : { employeeBudgets: employeeBudgets.map((entry) => ({ employeeId: entry.employee_id as string, budgetMicros: currencyUnitsToMicros(entry.budget, 'employee budget') })) }),
       ...(args.model_prices === undefined ? {} : { modelPrices: modelPricesFromArgs(args.model_prices) }),
       ...(args.expected_pricing_revision === undefined ? {} : { expectedPricingRevision: args.expected_pricing_revision as number }),
     }, args.expected_revision as number | undefined)
@@ -332,13 +353,15 @@ export function registerCompanyTools(ctx: Context, runtime: CompanyRuntime): voi
     expected_revision: { type: 'integer', description: 'Optional optimistic revision fence; the pre-probe state is always fenced.' },
   }, async (args, exec) => runtime.reprobeModels(requireAgent(exec), args.expected_revision as number | undefined, exec.signal))
 
-  register(ctx, 'company_request_governance_change', 'Request a high-risk, revision-fenced post-formation change to the company slogan, mission, or charter.', {
+  register(ctx, 'company_request_governance_change', 'Request a high-risk, revision-fenced post-formation change to company identity, charter, or employee ceiling. A later explicit human approval is required; a company ceiling never overrides a finite host ceiling.', {
     slogan: { type: 'string' }, mission: { type: 'string' }, charter: { type: 'string' },
+    max_employees: { oneOf: [{ type: 'integer' }, { type: 'string', const: 'unlimited' }], description: 'Positive safe integer employee ceiling, or unlimited. HR counts; retired employees do not. A finite value cannot be below current active headcount.' },
     expected_governance_revision: { type: 'integer' },
   }, async (args, exec) => runtime.requestGovernanceChange(requireAgent(exec), {
     ...(args.slogan === undefined ? {} : { slogan: args.slogan as string }),
     ...(args.mission === undefined ? {} : { mission: args.mission as string }),
     ...(args.charter === undefined ? {} : { charter: args.charter as string }),
+    ...(args.max_employees === undefined ? {} : { maxEmployees: normalizeEmployeeLimit(args.max_employees, 'max_employees') }),
     ...(args.expected_governance_revision === undefined ? {} : { expectedGovernanceRevision: args.expected_governance_revision as number }),
   }))
 
@@ -363,14 +386,17 @@ export function registerCompanyTools(ctx: Context, runtime: CompanyRuntime): voi
     approvalId: args.approval_id as string, authorizationId: args.authorization_id as string, reason: args.reason as string,
   }))
 
-  register(ctx, 'company_status', 'Read the role-filtered company overview, including budget, pending approvals, and caller mailbox. Query a section for details; array sections support exact id/status filters and offset/limit pagination. Pages cover the Host snapshot projection, which already bounds historical detail.', {
+  register(ctx, 'company_status', 'Read the role-filtered company overview, including budget, pending approvals, and caller mailbox. Employee, position, and org-unit sections are paginated at the Host before projection; other detail sections cover retained history. Follow next_offset to continue.', {
     archived: { type: 'boolean', description: 'Read the newest archive when no active company exists.' },
     section: { type: 'string', enum: [...STATUS_SECTIONS], description: 'Defaults to overview. Query work, approvals, inbox, budget, or another named section for complete projected details.' },
     id: { type: 'string', description: 'Optional exact entity id filter for array sections.' },
     status: { type: 'string', description: 'Optional exact status filter, e.g. pending approvals or in_progress work.' },
+    search: { type: 'string', description: 'Employee section only: search employee names, roles, and IDs before pagination.' },
+    org_unit_id: { type: 'string', description: 'Employee section only: exact org-unit membership filter.' },
+    position_id: { type: 'string', description: 'Employee section only: exact position membership filter.' },
     offset: { type: 'integer', description: 'Zero-based offset within filtered rows; defaults to 0.' },
     limit: { type: 'integer', description: 'Rows per page, from 1 to 20; defaults to 5. Applies separately to each array in budget/model_catalog.' },
-  }, async (args, exec) => projectToolStatus(await runtime.status(requireAgent(exec), args.archived === true), args))
+  }, async (args, exec) => projectToolStatus(await runtime.status(requireAgent(exec), args.archived === true, toolStatusQuery(args)), args))
 
   register(ctx, 'company_control', 'Pause, resume, archive, or discard a staged company. Archive revokes scheduling and attempts but preserves child transcripts. Forced archive requires approval.', {
     action: { type: 'string', required: true, enum: ['pause', 'resume', 'archive', 'discard_staged'] },
@@ -411,12 +437,39 @@ function register(
   }))
 }
 
-function projectToolStatus(snapshot: CompanySnapshot, args: Record<string, unknown>): unknown {
-  const section = (args.section ?? 'overview') as typeof STATUS_SECTIONS[number]
+function toolStatusPagination(args: Record<string, unknown>): { offset: number; limit: number } {
   const offset = (args.offset ?? 0) as number
   const limit = (args.limit ?? 5) as number
   if (!Number.isSafeInteger(offset) || offset < 0) throw new Error('company_status offset must be a non-negative safe integer')
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > 20) throw new Error('company_status limit must be an integer from 1 to 20')
+  return { offset, limit }
+}
+
+function toolStatusQuery(args: Record<string, unknown>): SnapshotQuery {
+  const { offset, limit } = toolStatusPagination(args)
+  const section = args.section ?? 'overview'
+  if (section !== 'employees' && (args.search !== undefined || args.org_unit_id !== undefined || args.position_id !== undefined)) {
+    throw new Error('company_status employee filters require the employees section')
+  }
+  const query: SnapshotQuery = { employeeLimit: 1, orgLimit: 1, positionLimit: 1 }
+  if (section === 'employees') {
+    Object.assign(query, { employeeOffset: offset, employeeLimit: limit,
+      ...(args.id === undefined ? {} : { employeeId: args.id }),
+      ...(args.status === undefined ? {} : { employeeExactStatus: args.status as EmployeeStatus }),
+      ...(args.search === undefined ? {} : { employeeSearch: args.search }),
+      ...(args.org_unit_id === undefined ? {} : { employeeOrgUnitId: args.org_unit_id }),
+      ...(args.position_id === undefined ? {} : { employeePositionId: args.position_id }) })
+  } else if (section === 'org_units' || section === 'positions') {
+    if (args.status !== undefined) throw new Error('company_status org_units and positions have no status field')
+    if (section === 'org_units') Object.assign(query, { orgOffset: offset, orgLimit: limit, ...(args.id === undefined ? {} : { orgId: args.id }) })
+    else Object.assign(query, { positionOffset: offset, positionLimit: limit, ...(args.id === undefined ? {} : { positionId: args.id }) })
+  }
+  return normalizeSnapshotQuery(query)
+}
+
+function projectToolStatus(snapshot: CompanySnapshot, args: Record<string, unknown>): unknown {
+  const section = (args.section ?? 'overview') as typeof STATUS_SECTIONS[number]
+  const { offset, limit } = toolStatusPagination(args)
   const page = (rows: readonly unknown[]) => {
     const filtered = rows.filter((row) => isRecord(row)
       && (args.id === undefined || row.id === args.id)
@@ -436,6 +489,9 @@ function projectToolStatus(snapshot: CompanySnapshot, args: Record<string, unkno
     const { models, errors, ...catalog } = snapshot.model_catalog
     return { ...identity, section, ...catalog, models: page(models), errors: page(errors) }
   }
+  if (snapshot.directory !== undefined && (section === 'employees' || section === 'org_units' || section === 'positions')) {
+    return { ...identity, section, ...snapshot.directory[section], items: snapshot[section] }
+  }
   if (section !== 'overview') return { ...identity, section, ...page(snapshot[section]) }
   if (args.id !== undefined || args.status !== undefined || args.offset !== undefined || args.limit !== undefined) {
     throw new Error('company_status filters and pagination require a detail section')
@@ -449,7 +505,7 @@ function projectToolStatus(snapshot: CompanySnapshot, args: Record<string, unkno
   return { ...identity, section, budget,
     mission: snapshot.company.mission.slice(0, 1_000),
     governance_revision: snapshot.company.governance_revision, formation_status: snapshot.company.formation_status,
-    counts: { employees: counts(snapshot.employees), products: counts(snapshot.products), work: counts(snapshot.work), tickets: counts(snapshot.tickets),
+    counts: { employees: snapshot.directory?.summary.employee_statuses ?? counts(snapshot.employees), products: counts(snapshot.products), work: counts(snapshot.work), tickets: counts(snapshot.tickets),
       staffing_requests: counts(snapshot.staffing_requests), approvals: counts(snapshot.approvals), inbox: snapshot.inbox.length },
     pending_approvals: pending.slice(0, 5).map((approval) => ({ id: approval.id, kind: approval.kind, risk: approval.risk, summary: approval.summary.slice(0, 512) })),
     recent_inbox: snapshot.inbox.slice(-3).map((message) => ({ id: message.id, from: message.from, created_at: message.created_at, content_preview: message.content.slice(0, 1_000) })),
@@ -457,7 +513,7 @@ function projectToolStatus(snapshot: CompanySnapshot, args: Record<string, unkno
     query: { tool: 'company_status', sections: STATUS_SECTIONS.filter((value) => value !== 'overview'),
       defaults: { offset: 0, limit: 5 }, max_limit: 20,
       examples: [{ section: 'approvals', status: 'pending' }, { section: 'inbox' }, { section: 'work', id: 'w1' }, { section: 'budget' }],
-      note: 'Overview text is abbreviated. Query a detail section for full projected records and follow next_offset for more rows. Historical rows/details may already be bounded by the Host snapshot.' } }
+      note: 'Overview text is abbreviated. Employee, org-unit, and position counts cover the full directory; query those sections and follow next_offset for every matching record. Other historical detail sections cover the retained Host window.' } }
 }
 
 function requireAgent(exec: ToolRunContext): Agent {

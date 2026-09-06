@@ -5,6 +5,7 @@ import type {
   CompanyConfig,
   CompanyMessage,
   CompanyState,
+  EmployeeLimit,
   JsonValue,
   ModelPrice3,
   ModelPriceInput,
@@ -22,7 +23,6 @@ const APPROVAL_ID = /^a[1-9][0-9]*$/
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 
 const HARD_MAX = {
-  maxEmployees: 32,
   maxProducts: 64,
   maxWorkItems: 1000,
   maxAttemptsPerWork: 20,
@@ -37,7 +37,13 @@ export function resolveConfig(config: CompanyConfig = {}): ResolvedCompanyConfig
     // DSH maxDepth is an absolute ceiling. Normalize the legacy v0.1.x value 0
     // to 1 so existing profiles can still provision a direct employee.
     memberMaxDepth: Math.max(1, boundedInteger(config.memberMaxDepth ?? 1, 'memberMaxDepth', 0, 32)),
-    maxEmployees: boundedInteger(config.maxEmployees ?? 8, 'maxEmployees', 1, HARD_MAX.maxEmployees),
+    maxEmployees: normalizeEmployeeLimit(config.maxEmployees ?? 'unlimited'),
+    executionMode: config.executionMode ?? 'adaptive',
+    maxConcurrentEmployees: boundedInteger(config.maxConcurrentEmployees ?? 8, 'maxConcurrentEmployees', 1, Number.MAX_SAFE_INTEGER),
+    executionMemoryHighWatermark: boundedNumber(config.executionMemoryHighWatermark ?? 0.8, 'executionMemoryHighWatermark', 0.1, 0.95),
+    executionLagHighWatermarkMs: boundedInteger(config.executionLagHighWatermarkMs ?? 200, 'executionLagHighWatermarkMs', 1, 60_000),
+    executionMaxPendingWrites: boundedInteger(config.executionMaxPendingWrites ?? 32, 'executionMaxPendingWrites', 1, Number.MAX_SAFE_INTEGER),
+    executionRetryMs: boundedInteger(config.executionRetryMs ?? 1000, 'executionRetryMs', 100, 60_000),
     maxProducts: boundedInteger(config.maxProducts ?? 8, 'maxProducts', 1, HARD_MAX.maxProducts),
     maxWorkItems: boundedInteger(config.maxWorkItems ?? 128, 'maxWorkItems', 1, HARD_MAX.maxWorkItems),
     maxOpenWorkItems: boundedInteger(config.maxOpenWorkItems ?? 32, 'maxOpenWorkItems', 1, HARD_MAX.maxWorkItems),
@@ -55,6 +61,7 @@ export function resolveConfig(config: CompanyConfig = {}): ResolvedCompanyConfig
     uiPollMs: boundedInteger(config.uiPollMs ?? 1000, 'uiPollMs', 500, 60_000),
     allowRemoteUi: config.allowRemoteUi ?? false,
   }
+  enumValue(resolved.executionMode, 'executionMode', ['adaptive', 'fixed', 'unlimited'])
   if (resolved.maxOpenWorkItems > resolved.maxWorkItems) {
     throw new Error('maxOpenWorkItems must not exceed maxWorkItems')
   }
@@ -83,6 +90,16 @@ export function normalizeCurrency(value: string): string {
   const currency = nonEmpty(value, 'currency', 12).toUpperCase()
   if (!/^[A-Z][A-Z0-9_-]{0,11}$/.test(currency)) throw new Error('currency must be a short alphanumeric code')
   return currency
+}
+
+export function normalizeEmployeeLimit(value: unknown, label = 'maxEmployees'): EmployeeLimit {
+  if (value === 'unlimited') return value
+  return boundedInteger(value, label, 1, Number.MAX_SAFE_INTEGER)
+}
+
+/** Infinity is internal only: durable and wire values always use the explicit string. */
+export function effectiveEmployeeLimit(company: EmployeeLimit, configured: EmployeeLimit): number {
+  return Math.min(company === 'unlimited' ? Infinity : company, configured === 'unlimited' ? Infinity : configured)
 }
 
 /** Convert a human currency-unit input to durable integer micros exactly once at the Host boundary. */
@@ -202,8 +219,7 @@ export function assertCompanyState(value: unknown, expectedWorkspaceHash?: strin
   if (!Array.isArray(value.employees) || !Array.isArray(value.products) || !Array.isArray(value.workItems) || !Array.isArray(value.tickets ?? []) || !Array.isArray(value.approvals) || !Array.isArray(value.governanceNotifications)) {
     throw new Error('employees, products, workItems, tickets, approvals, and governanceNotifications must be arrays')
   }
-  if ((value.employees as CompanyState['employees']).filter((employee) => employee.status !== 'retired').length > limits.maxEmployees) throw new Error('saved company exceeds active maxEmployees snapshot')
-  if (value.employees.length > 10_000) throw new Error('saved company employee history exceeds hard safety cap')
+  if (limits.maxEmployees !== 'unlimited' && (value.employees as CompanyState['employees']).filter((employee) => employee.status !== 'retired').length > limits.maxEmployees) throw new Error('saved company exceeds active maxEmployees snapshot')
   if (value.products.length > limits.maxProducts) throw new Error('saved company exceeds maxProducts snapshot')
   if (value.workItems.length > limits.maxWorkItems) throw new Error('saved company exceeds maxWorkItems snapshot')
   const employeeIds = uniqueIds(value.employees, EMPLOYEE_ID, 'employee')
@@ -399,8 +415,8 @@ export function assertCompanyState(value: unknown, expectedWorkspaceHash?: strin
     exactKeys(raw, ['id', 'governanceRevision', 'employeeIds', 'deliveredEmployeeIds', 'content', 'createdAt'], `governanceNotifications[${index}]`)
     stringMatches(raw.id, `governanceNotifications[${index}].id`, UUID)
     safeInteger(raw.governanceRevision, `governanceNotifications[${index}].governanceRevision`, 1)
-    stringArray(raw.employeeIds, `governanceNotifications[${index}].employeeIds`, 0, limits.maxEmployees, 128)
-    stringArray(raw.deliveredEmployeeIds, `governanceNotifications[${index}].deliveredEmployeeIds`, 0, limits.maxEmployees, 128)
+    stringArray(raw.employeeIds, `governanceNotifications[${index}].employeeIds`, 0, value.employees.length, 128)
+    stringArray(raw.deliveredEmployeeIds, `governanceNotifications[${index}].deliveredEmployeeIds`, 0, value.employees.length, 128)
     for (const id of raw.employeeIds as string[]) if (!employeeIds.has(id)) throw new Error(`governance notification references unknown employee ${id}`)
     for (const id of raw.deliveredEmployeeIds as string[]) if (!(raw.employeeIds as string[]).includes(id)) throw new Error(`governance notification delivered employee ${id} is not a target`)
     plainString(raw.content, `governanceNotifications[${index}].content`, 1, limits.maxMessageChars)
@@ -413,9 +429,9 @@ export function assertCompanyState(value: unknown, expectedWorkspaceHash?: strin
     stringMatches(value.provisioning.id, 'provisioning.id', UUID)
     timestamp(value.provisioning.startedAt, 'provisioning.startedAt')
     stringMatches(value.provisioning.approvalId, 'provisioning.approvalId', APPROVAL_ID)
-    stringArray(value.provisioning.employeeIds, 'provisioning.employeeIds', 1, limits.maxEmployees, 128)
+    stringArray(value.provisioning.employeeIds, 'provisioning.employeeIds', 1, value.employees.length, 128)
     for (const id of value.provisioning.employeeIds as string[]) if (!employeeIds.has(id)) throw new Error(`provisioning references unknown employee ${id}`)
-    stringArray(value.provisioning.reservationIds, 'provisioning.reservationIds', 1, limits.maxEmployees, 128)
+    stringArray(value.provisioning.reservationIds, 'provisioning.reservationIds', 1, value.employees.length, 128)
     for (const id of value.provisioning.reservationIds as string[]) stringMatches(id, 'provisioning.reservationIds[]', UUID)
   }
   const typedProducts = value.products as unknown as CompanyState['products']
@@ -442,8 +458,9 @@ function assertLimits(value: unknown): void {
   const keys = ['maxEmployees', 'maxProducts', 'maxWorkItems', 'maxOpenWorkItems', 'maxAttemptsPerWork', 'maxPendingApprovals', 'maxMailboxMessages', 'maxAuditBytes', 'maxMessageChars', 'maxOutputChars', 'memberMaxDepth']
   exactKeys(value, keys, 'limits')
   // Accept zero only when reading legacy v0.1.x snapshots; dispatch clamps it to one.
-  for (const key of keys) safeInteger(value[key], `limits.${key}`, key === 'memberMaxDepth' ? 0 : 1)
-  if ((value.maxEmployees as number) > HARD_MAX.maxEmployees || (value.maxProducts as number) > HARD_MAX.maxProducts || (value.maxWorkItems as number) > HARD_MAX.maxWorkItems || (value.maxAttemptsPerWork as number) > HARD_MAX.maxAttemptsPerWork) {
+  normalizeEmployeeLimit(value.maxEmployees, 'limits.maxEmployees')
+  for (const key of keys.filter((key) => key !== 'maxEmployees')) safeInteger(value[key], `limits.${key}`, key === 'memberMaxDepth' ? 0 : 1)
+  if ((value.maxProducts as number) > HARD_MAX.maxProducts || (value.maxWorkItems as number) > HARD_MAX.maxWorkItems || (value.maxAttemptsPerWork as number) > HARD_MAX.maxAttemptsPerWork) {
     throw new Error('saved limits exceed source hard maxima')
   }
 }
@@ -923,9 +940,10 @@ export function validateApprovalPayload(kind: ApprovalKind, payload: unknown): a
         if (!Array.isArray(payload[field])) throw new Error(`budget_change.${field} must be an array`)
         for (const [index, allocation] of payload[field].entries()) {
           if (!isRecord(allocation)) throw new Error(`budget_change.${field}[${index}] must be an object`)
-          exactKeys(allocation, ['id', 'budgetMicros'], `budget_change.${field}[${index}]`)
+          exactKeys(allocation, field === 'employeeAllocations' ? ['id', 'budgetMicros', 'expectedBudgetMicros'] : ['id', 'budgetMicros'], `budget_change.${field}[${index}]`)
           plainString(allocation.id, `budget_change.${field}[${index}].id`, 1, 128)
           safeInteger(allocation.budgetMicros, `budget_change.${field}[${index}].budgetMicros`, 0)
+          if (allocation.expectedBudgetMicros !== undefined) safeInteger(allocation.expectedBudgetMicros, `budget_change.${field}[${index}].expectedBudgetMicros`, 0)
         }
       }
       if (payload.legacyTreatment !== undefined) enumValue(payload.legacyTreatment, 'budget_change.legacyTreatment', ['accepted'])
@@ -940,12 +958,13 @@ export function validateApprovalPayload(kind: ApprovalKind, payload: unknown): a
       normalizeModelPrices(payload.prices as unknown as ModelPriceInput[], 'manual', 1, 0)
       break
     case 'governance_change':
-      exactKeys(payload, ['expectedGovernanceRevision', 'slogan', 'mission', 'charter'], 'governance_change approval payload')
+      exactKeys(payload, ['expectedGovernanceRevision', 'slogan', 'mission', 'charter', 'maxEmployees'], 'governance_change approval payload')
       safeInteger(payload.expectedGovernanceRevision, 'governance_change.expectedGovernanceRevision', 1)
       if (payload.slogan !== undefined) plainString(payload.slogan, 'governance_change.slogan', 1, 160)
       if (payload.mission !== undefined) plainString(payload.mission, 'governance_change.mission', 1, 16_384)
       if (payload.charter !== undefined) plainString(payload.charter, 'governance_change.charter', 1, 32_768)
-      if (payload.slogan === undefined && payload.mission === undefined && payload.charter === undefined) throw new Error('governance_change must change slogan, mission, or charter')
+      if (payload.maxEmployees !== undefined) normalizeEmployeeLimit(payload.maxEmployees, 'governance_change.maxEmployees')
+      if (payload.slogan === undefined && payload.mission === undefined && payload.charter === undefined && payload.maxEmployees === undefined) throw new Error('governance_change must change slogan, mission, charter, or maxEmployees')
       break
     case 'temporary_authorization':
       exactKeys(payload, ['action', 'authorizationId', 'employeeId', 'reason', 'startsAt', 'expiresAt'], 'temporary_authorization approval payload')
@@ -1135,6 +1154,11 @@ function recomputeThreeRateCost(
 
 function boundedInteger(value: unknown, label: string, min: number, max: number): number {
   safeInteger(value, label, min, max)
+  return value
+}
+
+function boundedNumber(value: unknown, label: string, min: number, max: number): number {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < min || value > max) throw new Error(`${label} must be a finite number in ${min}..${max}`)
   return value
 }
 
