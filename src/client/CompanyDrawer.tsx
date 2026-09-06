@@ -336,10 +336,6 @@ export function CompanyDrawer({
   const panelId = useId()
 
   useEffect(() => {
-    controller.setCurrentSession(currentSessionId)
-  }, [controller, currentSessionId])
-
-  useEffect(() => {
     setActiveTab('overview')
     setConfirmation(undefined)
     setConfirming(false)
@@ -350,6 +346,10 @@ export function CompanyDrawer({
     const frame = window.requestAnimationFrame(() => closeRef.current?.focus())
     return () => window.cancelAnimationFrame(frame)
   }, [state.open])
+
+  useEffect(() => {
+    controller.setDirectoryView(state.open && (activeTab === 'organization' || activeTab === 'overview') ? activeTab : 'page')
+  }, [controller, state.open, activeTab, state.action, state.sessionId])
 
   useEffect(() => {
     if (confirmation === undefined) return
@@ -482,6 +482,8 @@ export function CompanyDrawer({
   }
 
   const view = snapshot === undefined ? null : (() => {
+    const directoryView = activeTab === 'organization' || activeTab === 'overview' ? activeTab : 'page'
+    if (snapshot.directory !== undefined && state.directoryView !== directoryView) return <p className="dsh-company-empty">{t(state.networkError === undefined ? 'drawer.loading' : 'drawer.unavailable')}</p>
     switch (activeTab) {
       case 'overview':
         return <OverviewView
@@ -496,6 +498,8 @@ export function CompanyDrawer({
           onRequestGovernance={(payload, expectedRevision) => controller.performAction('request_governance_change', payload, expectedRevision)}
           onReprobe={() => controller.performAction('reprobe_models', {})}
           onOpenApprovals={() => setActiveTab('approvals')}
+          activityLoading={state.loading || state.directoryView !== 'overview'}
+          onLoadMoreActivity={(limit) => controller.loadMoreActivity(limit)}
         />
       case 'organization':
         return <OrganizationView
@@ -543,6 +547,7 @@ export function CompanyDrawer({
           canManageBudget={!state.archived && snapshot.viewer.role === 'founder'}
           onRequestBudgetChange={(payload, expectedRevision) => controller.performAction('request_budget_change', payload, expectedRevision)}
           onOpenApprovals={() => setActiveTab('approvals')}
+          onDirectoryQuery={(query) => controller.setDirectoryQuery(query)}
         />
       case 'approvals':
         return (
@@ -576,7 +581,7 @@ export function CompanyDrawer({
             <p className="dsh-company-drawer__eyebrow"><BuildingIcon />{t('drawer.eyebrow')}</p>
             <div className="dsh-company-drawer__title-row">
               <h1 className="dsh-company-drawer__title" id={titleId}>
-                {snapshot?.company.name ?? t('drawer.loading')}
+                {snapshot?.company.name ?? t('button.name')}
               </h1>
               {snapshot !== undefined ? (
                 <StatusBadge tone={phaseTone(snapshot.company.phase)}>
@@ -697,7 +702,9 @@ export function CompanyDrawer({
                 </div>
               </div>
             ) : (
-              <div className="dsh-company-no-company">{t('drawer.empty')}</div>
+              <div className="dsh-company-no-company">
+                {state.networkError === undefined ? t('drawer.empty') : t('drawer.unavailable')}
+              </div>
             )
           ) : view}
         </main>

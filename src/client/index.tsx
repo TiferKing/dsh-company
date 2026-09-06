@@ -44,6 +44,15 @@ export function apply(ctx: ClientContext): void {
     return () => document.removeEventListener('visibilitychange', updateVisibility)
   }, 'dsh-company: visibility-aware polling')
 
+  // Discovery belongs to the plugin lifecycle. The header must not depend on
+  // the root overlay being mounted before its first state request can run.
+  ctx.effect(() => {
+    const syncSession = (): void => controller.setCurrentSession(ctx.sessions.list.getSnapshot().current)
+    const unsubscribe = ctx.sessions.list.subscribe(syncSession)
+    syncSession()
+    return unsubscribe
+  }, 'dsh-company: current session discovery')
+
   const navigateToSession = async (
     targetSessionId: string,
     founderSessionId?: string,

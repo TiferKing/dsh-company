@@ -5,14 +5,19 @@ import { ChevronIcon, InfoIcon, RefreshIcon, UsersIcon, WalletIcon, WarningIcon 
 import { enablePreset, formatModelPricePreset, modelPricePreset } from '../model-presets.js'
 import {
   completedWorkCount,
-  employeeStatusLabel,
-  employeeTone,
   formatAbsolute,
   formatMoneyMicros,
   formatRelative,
   percent,
   StatusBadge,
 } from '../ui.js'
+
+function executionWaitReason(reason: string, t: CompanyTranslate): string {
+  switch (reason) {
+    case 'concurrency': case 'memory': case 'event_loop': case 'storage': case 'provider_rate_limit': case 'employee_busy': return t(`execution.reason.${reason}`)
+    default: return reason
+  }
+}
 
 export interface OverviewViewProps {
   snapshot: CompanySnapshot
@@ -28,6 +33,8 @@ export interface OverviewViewProps {
   onRequestGovernance?(payload: Record<string, unknown>, expectedRevision: number): Promise<boolean>
   onReprobe?(): Promise<boolean>
   onOpenApprovals?(): void
+  activityLoading?: boolean
+  onLoadMoreActivity?(limit: number): void
 }
 
 export type PriceDraft = {
@@ -78,6 +85,16 @@ export function governanceDraftProblem(slogan: string, mission: string, charter:
   if (mission.trim().length === 0) return 'mission'
   if (charter.trim().length === 0) return 'charter'
   return undefined
+}
+
+/** A route is the provider/model pair; provider ids and model ids may contain slashes. */
+export function formationHrModelChoices(snapshot: Pick<CompanySnapshot, 'model_catalog'>): Array<{ key: string; provider: string; model: string; name: string }> {
+  const routes = new Map<string, { key: string; provider: string; model: string; name: string }>()
+  for (const model of snapshot.model_catalog.models) {
+    const key = JSON.stringify([model.provider, model.model])
+    if (!routes.has(key)) routes.set(key, { key, provider: model.provider, model: model.model, name: model.name })
+  }
+  return [...routes.values()].sort((left, right) => left.provider.localeCompare(right.provider) || left.model.localeCompare(right.model))
 }
 
 export function buildPriceDrafts(snapshot: CompanySnapshot): PriceDraft[] {
@@ -326,6 +343,7 @@ function CharterList(props: {
 }
 
 export function OverviewView(props: OverviewViewProps): React.JSX.Element {
+  const [visibleActivity, setVisibleActivity] = useState(5)
   const { snapshot, t, locale, busy = false } = props
   const firstProduct = snapshot.products[0]
   const hrEmployee = snapshot.employees.find((employee) => employee.is_hr === true)
@@ -333,6 +351,7 @@ export function OverviewView(props: OverviewViewProps): React.JSX.Element {
   const [slogan, setSlogan] = useState(snapshot.company.slogan)
   const [mission, setMission] = useState(snapshot.company.mission)
   const [charter, setCharter] = useState(snapshot.company.charter)
+  const [employeeLimit, setEmployeeLimit] = useState(String(snapshot.company.max_employees ?? 'unlimited'))
   const [productName, setProductName] = useState(firstProduct?.name ?? '')
   const [productSummary, setProductSummary] = useState(firstProduct?.summary ?? '')
   const [productRoot, setProductRoot] = useState(firstProduct?.product_root ?? '')
@@ -341,6 +360,7 @@ export function OverviewView(props: OverviewViewProps): React.JSX.Element {
   const [totalBudget, setTotalBudget] = useState(microsToInput(snapshot.budget.total_micros))
   const [currency, setCurrency] = useState(snapshot.budget.currency)
   const [hrName, setHrName] = useState(hrEmployee?.name ?? '')
+  const [hrBudget, setHrBudget] = useState(microsToInput(hrEmployee?.budget_micros))
   const [hrProvider, setHrProvider] = useState(hrEmployee?.llm?.provider ?? '')
   const [hrModel, setHrModel] = useState(hrEmployee?.llm?.model ?? '')
   const [hrReasoningEffort, setHrReasoningEffort] = useState(hrEmployee?.llm?.reasoning_effort ?? 'default')
@@ -367,8 +387,10 @@ export function OverviewView(props: OverviewViewProps): React.JSX.Element {
       draftRevision.current = snapshot.revision
       draftGovernanceRevision.current = snapshot.company.governance_revision
       setExpandedClauses(new Set())
+      setVisibleActivity(5)
     }
     if (!formationDirty.current) {
+      setEmployeeLimit(String(snapshot.company.max_employees ?? 'unlimited'))
       draftRevision.current = snapshot.revision
       draftGovernanceRevision.current = snapshot.company.governance_revision
       setName(snapshot.company.name)
@@ -384,6 +406,7 @@ export function OverviewView(props: OverviewViewProps): React.JSX.Element {
       setCurrency(snapshot.budget.currency)
       const nextHr = snapshot.employees.find((employee) => employee.is_hr === true)
       setHrName(nextHr?.name ?? '')
+      setHrBudget(microsToInput(nextHr?.budget_micros))
       setHrProvider(nextHr?.llm?.provider ?? '')
       setHrModel(nextHr?.llm?.model ?? '')
       setHrReasoningEffort(nextHr?.llm?.reasoning_effort ?? 'default')
@@ -394,7 +417,15 @@ export function OverviewView(props: OverviewViewProps): React.JSX.Element {
   }, [snapshot.revision, snapshot.company.id])
 
   const priceProblems = priceRows.filter((row) => row.enabled && priceState(row) !== 'priced')
+  const hrModelChoices = formationHrModelChoices(snapshot)
+  const hrModelKey = JSON.stringify([hrProvider.trim(), hrModel.trim()])
   const markFormationDirty = (): void => { formationDirty.current = true }
+  const updateHrRoute = (provider: string, model: string): void => {
+    markFormationDirty()
+    if (provider.trim() !== hrProvider.trim() || model.trim() !== hrModel.trim()) setHrReasoningEffort('default')
+    setHrProvider(provider)
+    setHrModel(model)
+  }
   const toggleClause = (path: string): void => {
     setExpandedClauses((current) => {
       const next = new Set(current)
@@ -437,8 +468,15 @@ export function OverviewView(props: OverviewViewProps): React.JSX.Element {
     if (props.onEditFormation === undefined || firstProduct === undefined) return
     const totalBudgetUnits = decimalMoneyToUnits(totalBudget)
     const productBudgetUnits = decimalMoneyToUnits(productBudget)
+    const hrBudgetUnits = decimalMoneyToUnits(hrBudget)
     if (totalBudgetUnits === undefined) { setEditError(t('formation.invalidMoney', { field: t('formation.companyBudget') })); return }
     if (productBudgetUnits === undefined) { setEditError(t('formation.invalidMoney', { field: t('formation.productBudget') })); return }
+    if (hrBudgetUnits === undefined) { setEditError(t('formation.invalidMoney', { field: t('formation.hrBudget') })); return }
+    const totalMicros = decimalMoneyToMicros(totalBudget)!
+    const hrMicros = decimalMoneyToMicros(hrBudget)!
+    if (decimalMoneyToMicros(productBudget)! > totalMicros) { setEditError(t('formation.budgetAboveTotal', { field: t('formation.productBudget') })); return }
+    if (hrMicros > totalMicros) { setEditError(t('formation.budgetAboveTotal', { field: t('formation.hrBudget') })); return }
+    if (hrMicros < (hrEmployee?.spent_micros ?? 0) + (hrEmployee?.reserved_micros ?? 0)) { setEditError(t('formation.budgetBelowCommitted', { field: t('formation.hrBudget') })); return }
     if (slogan.trim().length === 0 || slogan.trim().length > 160) { setEditError(t('formation.invalidSlogan')); return }
     if (hrName.trim() === '' || hrProvider.trim() === '' || hrModel.trim() === '') { setEditError(t('formation.invalidHr')); return }
     if (priceProblems.length > 0) {
@@ -464,6 +502,7 @@ export function OverviewView(props: OverviewViewProps): React.JSX.Element {
       currency,
       model_prices: modelPrices,
       hr_name: hrName,
+      hr_budget: hrBudgetUnits,
       hr_provider: hrProvider,
       hr_model: hrModel,
       hr_reasoning_effort: hrReasoningEffort,
@@ -483,6 +522,8 @@ export function OverviewView(props: OverviewViewProps): React.JSX.Element {
 
   const submitGovernance = async (): Promise<void> => {
     if (props.onRequestGovernance === undefined) return
+    const maxEmployees = employeeLimit.trim() === 'unlimited' ? 'unlimited' : /^\d+$/u.test(employeeLimit.trim()) ? Number(employeeLimit.trim()) : NaN
+    if (maxEmployees !== 'unlimited' && (!Number.isSafeInteger(maxEmployees) || maxEmployees < 1)) { setEditError(t('directory.invalidCapacity')); return }
     const problem = governanceDraftProblem(slogan, mission, charter)
     if (problem !== undefined) {
       setEditError(problem === 'slogan' ? t('formation.invalidSlogan') : t('overview.invalidGovernance', { field: t(problem === 'mission' ? 'formation.mission' : 'formation.charter') }))
@@ -494,6 +535,7 @@ export function OverviewView(props: OverviewViewProps): React.JSX.Element {
       mission,
       charter,
       expected_governance_revision: draftGovernanceRevision.current,
+      ...(snapshot.company.max_employees === undefined || maxEmployees === snapshot.company.max_employees ? {} : { max_employees: maxEmployees }),
     }, draftRevision.current)
     if (succeeded) {
       formationDirty.current = false
@@ -504,7 +546,8 @@ export function OverviewView(props: OverviewViewProps): React.JSX.Element {
   const done = completedWorkCount(snapshot.work.map((item) => item.status))
   const total = snapshot.work.length
   const blocked = snapshot.work.filter((item) => item.blocked)
-  const activeEmployees = snapshot.employees.filter((employee) => employee.status === 'working' || employee.activity?.state === 'running')
+  const activeEmployees = (snapshot.activity_employees ?? snapshot.employees).filter((employee) => employee.status !== 'retired' && employee.activity?.state === 'running')
+  const runningCount = snapshot.directory?.summary.running_employees ?? Math.max(activeEmployees.length, snapshot.employees.filter((employee) => employee.status !== 'retired' && employee.activity?.state === 'running').length)
   const pendingApprovals = snapshot.approvals.filter((approval) => approval.status === 'pending')
   const governancePending = pendingApprovals.some((approval) => approval.kind === 'governance_change')
   const messages = [...snapshot.inbox].sort((left, right) => right.created_at - left.created_at).slice(0, 5)
@@ -516,6 +559,8 @@ export function OverviewView(props: OverviewViewProps): React.JSX.Element {
           <h2 className="dsh-company-view__heading">{t('overview.heading')}</h2>
           <p className="dsh-company-view__subheading">{t('overview.subheading')}</p>
         </header>
+        {snapshot.company.max_employees === undefined ? null : <p>{t('directory.capacity')}: {snapshot.company.max_employees === 'unlimited' ? t('directory.unlimited') : snapshot.company.max_employees}</p>}
+        {snapshot.execution === undefined ? null : <div className="dsh-company-budget-callout dsh-company-section"><span>{t('execution.summary', { mode: t(`execution.${snapshot.execution.mode}`), running: snapshot.execution.running, limit: snapshot.execution.limit ?? t('directory.unlimited'), waiting: snapshot.execution.waiting })}{snapshot.execution.reason === undefined ? null : <p>{t('execution.waiting', { reason: executionWaitReason(snapshot.execution.reason, t) })}</p>}</span></div>}
         <div className="dsh-company-governance-grid">
           <section className="dsh-company-card dsh-company-governance-card" data-kind="slogan" style={{ gridColumn: '1 / -1' }}>
             <button type="button" className="dsh-company-governance-card__toggle" aria-expanded={missionOpen} aria-controls={missionDetailId} onClick={() => setMissionOpen((value) => !value)}>
@@ -553,6 +598,7 @@ export function OverviewView(props: OverviewViewProps): React.JSX.Element {
               <label className="dsh-company-field" data-span="12"><span>{t('formation.slogan')}</span><input value={slogan} maxLength={160} onChange={(event) => { markFormationDirty(); setSlogan(event.currentTarget.value) }} /></label>
               <label className="dsh-company-field" data-span="12"><span>{t('formation.mission')}</span><textarea rows={5} value={mission} onChange={(event) => { markFormationDirty(); setMission(event.currentTarget.value) }} /></label>
               <label className="dsh-company-field" data-span="12"><span>{t('formation.charter')}</span><textarea rows={7} value={charter} onChange={(event) => { markFormationDirty(); setCharter(event.currentTarget.value) }} /></label>
+              <label className="dsh-company-field" data-span="12"><span>{t('directory.capacity')}</span><input value={employeeLimit} onChange={(event) => { markFormationDirty(); setEmployeeLimit(event.currentTarget.value) }} /><small>{t('directory.capacityHint')}</small></label>
             </div>
             {editError === undefined ? null : <div className="dsh-company-banner" data-tone="error" role="alert"><WarningIcon width="15" height="15" />{editError}</div>}
             <div className="dsh-company-formation__footer">
@@ -581,8 +627,19 @@ export function OverviewView(props: OverviewViewProps): React.JSX.Element {
                 <div className="dsh-company-formation-grid">
                   <label className="dsh-company-field" data-span="6"><span>{t('formation.hrName')}</span><input value={hrName} onChange={(event) => { markFormationDirty(); setHrName(event.currentTarget.value) }} /></label>
                   <label className="dsh-company-field" data-span="6"><span>{t('formation.hrReasoning')}</span><input value={hrReasoningEffort} onChange={(event) => { markFormationDirty(); setHrReasoningEffort(event.currentTarget.value) }} /></label>
-                  <label className="dsh-company-field" data-span="6"><span>{t('formation.hrProvider')}</span><input value={hrProvider} onChange={(event) => { markFormationDirty(); setHrProvider(event.currentTarget.value) }} /></label>
-                  <label className="dsh-company-field" data-span="6"><span>{t('formation.hrModel')}</span><input value={hrModel} onChange={(event) => { markFormationDirty(); setHrModel(event.currentTarget.value) }} /></label>
+                  <label className="dsh-company-field" data-span="12">
+                    <span>{t('formation.hrModelChoice')}</span>
+                    <select value={hrModelChoices.some((choice) => choice.key === hrModelKey) ? hrModelKey : ''} onChange={(event) => {
+                      const choice = hrModelChoices.find((item) => item.key === event.currentTarget.value)
+                      if (choice !== undefined) updateHrRoute(choice.provider, choice.model)
+                    }}>
+                      <option value="" disabled>{t('formation.hrModelCustom')}</option>
+                      {hrModelChoices.map((choice) => <option value={choice.key} key={choice.key}>{choice.name === choice.model ? `${choice.provider}/${choice.model}` : `${choice.name} · ${choice.provider}/${choice.model}`}</option>)}
+                    </select>
+                    <span className="dsh-company-field__hint">{t('formation.hrModelHint')}</span>
+                  </label>
+                  <label className="dsh-company-field" data-span="6"><span>{t('formation.hrProvider')}</span><input value={hrProvider} onChange={(event) => updateHrRoute(event.currentTarget.value, hrModel)} /></label>
+                  <label className="dsh-company-field" data-span="6"><span>{t('formation.hrModel')}</span><input value={hrModel} onChange={(event) => updateHrRoute(hrProvider, event.currentTarget.value)} /></label>
                 </div>
               </fieldset>
               <fieldset className="dsh-company-fieldset">
@@ -597,8 +654,10 @@ export function OverviewView(props: OverviewViewProps): React.JSX.Element {
               <fieldset className="dsh-company-fieldset">
                 <legend>{t('formation.money')}</legend>
                 <div className="dsh-company-formation-grid">
-                  <label className="dsh-company-field"><span>{t('formation.companyBudget')}</span><input type="text" inputMode="decimal" value={totalBudget} onChange={(event) => { markFormationDirty(); setTotalBudget(event.currentTarget.value) }} /><span className="dsh-company-field__hint">{currency}</span></label>
-                  <label className="dsh-company-field"><span>{t('formation.productBudget')}</span><input type="text" inputMode="decimal" value={productBudget} onChange={(event) => { markFormationDirty(); setProductBudget(event.currentTarget.value) }} /><span className="dsh-company-field__hint">{currency}</span></label>
+                  <label className="dsh-company-field" data-span="4"><span>{t('formation.companyBudget')}</span><input type="text" inputMode="decimal" value={totalBudget} onChange={(event) => { markFormationDirty(); setTotalBudget(event.currentTarget.value) }} /><span className="dsh-company-field__hint">{currency}</span></label>
+                  <label className="dsh-company-field" data-span="4"><span>{t('formation.productBudget')}</span><input type="text" inputMode="decimal" value={productBudget} onChange={(event) => { markFormationDirty(); setProductBudget(event.currentTarget.value) }} /><span className="dsh-company-field__hint">{currency}</span></label>
+                  <label className="dsh-company-field" data-span="4"><span>{t('formation.hrBudget')}</span><input type="text" inputMode="decimal" required value={hrBudget} onChange={(event) => { markFormationDirty(); setHrBudget(event.currentTarget.value) }} /><span className="dsh-company-field__hint">{currency}</span></label>
+                  <p className="dsh-company-field dsh-company-formation__hint" data-span="12">{t('formation.budgetHint')}</p>
                   <div className="dsh-company-field" data-span="12">
                     <div className="dsh-company-section__head">
                       <div><span>{t('formation.prices')}</span><p className="dsh-company-formation__hint">{t('formation.priceHint')}</p></div>
@@ -621,7 +680,7 @@ export function OverviewView(props: OverviewViewProps): React.JSX.Element {
 
         <section className="dsh-company-section">
           <div className="dsh-company-stats">
-            <div className="dsh-company-stat"><div className="dsh-company-stat__head"><span className="dsh-company-stat__icon"><UsersIcon /></span><span className="dsh-company-stat__label">{t('overview.activePeople')}</span></div><strong className="dsh-company-stat__value">{activeEmployees.length}</strong></div>
+            <div className="dsh-company-stat"><div className="dsh-company-stat__head"><span className="dsh-company-stat__icon"><UsersIcon /></span><span className="dsh-company-stat__label">{t('overview.activePeople')}</span></div><strong className="dsh-company-stat__value">{runningCount}</strong></div>
             <div className="dsh-company-stat"><div className="dsh-company-stat__head"><span className="dsh-company-stat__icon"><WarningIcon /></span><span className="dsh-company-stat__label">{t('overview.pendingApprovals')}</span></div><strong className="dsh-company-stat__value">{pendingApprovals.length}</strong></div>
             <div className="dsh-company-stat"><div className="dsh-company-stat__head"><span className="dsh-company-stat__icon"><WalletIcon /></span><span className="dsh-company-stat__label">{t('overview.availableMoney')}</span></div><strong className="dsh-company-stat__value">{formatMoneyMicros(snapshot.budget.available_micros, snapshot.budget.currency, locale)}</strong></div>
           </div>
@@ -635,8 +694,13 @@ export function OverviewView(props: OverviewViewProps): React.JSX.Element {
 
       <aside className="dsh-company-overview__aside">
         <section className="dsh-company-card">
-          <div className="dsh-company-section__head"><h2 className="dsh-company-section__title"><UsersIcon width="14" height="14" />{t('overview.activity')}</h2><span className="dsh-company-section__count">{activeEmployees.length}</span></div>
-          {activeEmployees.length === 0 ? <p className="dsh-company-empty"><InfoIcon />{t('overview.activityEmpty')}</p> : <ul className="dsh-company-compact-list">{activeEmployees.map((employee) => <li key={employee.id}><div><strong>{employee.name}</strong><span>{employee.activity?.subject ?? employee.role}</span></div><StatusBadge tone={employeeTone(employee.status)}>{employeeStatusLabel(employee.status, t)}</StatusBadge></li>)}</ul>}
+          <div className="dsh-company-section__head"><h2 className="dsh-company-section__title"><UsersIcon width="14" height="14" />{t('overview.activity')}</h2><span className="dsh-company-section__count">{runningCount}</span></div>
+          {activeEmployees.length === 0 ? <p className="dsh-company-empty"><InfoIcon />{t(props.activityLoading || runningCount > 0 ? 'drawer.loading' : 'overview.activityEmpty')}</p> : <ul className="dsh-company-compact-list">{activeEmployees.slice(0, visibleActivity).map((employee) => <li key={employee.id}><div><strong>{employee.name}</strong><span>{employee.activity?.subject ?? employee.role}</span></div><StatusBadge tone="active">{t('activity.running')}</StatusBadge></li>)}</ul>}
+          {runningCount > Math.min(visibleActivity, activeEmployees.length) ? <div className="dsh-company-inline-actions"><button type="button" className="dsh-company-action" disabled={busy || props.activityLoading} onClick={() => {
+            const limit = Math.min(visibleActivity, activeEmployees.length) + 5
+            setVisibleActivity(limit)
+            props.onLoadMoreActivity?.(limit)
+          }}>{t('overview.loadMoreActivity')}</button></div> : null}
         </section>
         {snapshot.warnings.length > 0 ? <section className="dsh-company-card dsh-company-section"><div className="dsh-company-section__head"><h2 className="dsh-company-section__title">{t('overview.warnings')}</h2><span className="dsh-company-section__count">{snapshot.warnings.length}</span></div><ul className="dsh-company-warning-list">{snapshot.warnings.map((warning, index) => <li key={`${index}-${warning}`}>{warning}</li>)}</ul></section> : null}
         <section className="dsh-company-card dsh-company-section"><div className="dsh-company-section__head"><h2 className="dsh-company-section__title">{t('overview.inbox')}</h2><span className="dsh-company-section__count">{messages.length}</span></div>{messages.length === 0 ? <p className="dsh-company-empty"><InfoIcon />{t('overview.inboxEmpty')}</p> : <ul className="dsh-company-message-list">{messages.map((message) => <li key={message.id}><div className="dsh-company-message-list__meta"><span>{t('overview.from', { sender: message.from })}</span><time dateTime={new Date(message.created_at).toISOString()} title={formatAbsolute(message.created_at, locale)}>{formatRelative(message.created_at, t)}</time></div><p>{message.content}</p></li>)}</ul>}</section>

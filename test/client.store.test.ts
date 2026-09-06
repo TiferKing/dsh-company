@@ -4,6 +4,66 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { CompanyUiController } from '../src/client/store.js'
 import { snapshotFixture } from './fixtures/company-snapshot.js'
+import { buildSnapshot } from '../src/snapshot.js'
+import { companyState } from './fixtures.js'
+import type { SnapshotQuery } from '../src/types.js'
+
+test('organization restores every page and overview loads running employees independently of audit filters', async () => {
+  const state = companyState()
+  state.employees = Array.from({ length: 125 }, (_, index) => ({ ...structuredClone(state.employees[0]!), id: `e${index}`, name: `Employee ${index}`, sessionId: `session-${index}` }))
+  const calls: SnapshotQuery[] = []
+  let fail = false
+  const controller = new CompanyUiController({ closedPollMs: 60_000, fetch: async (input) => {
+    if (fail) return jsonResponse({ error: 'offline' }, 503)
+    const query: Record<string, string | number> = {}
+    for (const [key, value] of new URL(String(input), 'http://localhost').searchParams) {
+      if (key === 'sessionId' || key === 'archived') continue
+      query[key] = key.endsWith('Offset') || key.endsWith('Limit') ? Number(value) : value
+    }
+    calls.push(query as SnapshotQuery)
+    const wire = buildSnapshot({ agents: { get: (id: string) => Number(id.split('-')[1]) >= 110 ? { status: 'running' } : undefined } } as any, state, { kind: 'founder', id: 'founder', sessionId: 'founder-session' }, [], undefined, query as SnapshotQuery)
+    return jsonResponse(wire)
+  } })
+  try {
+    controller.setCurrentSession('founder-session')
+    await controller.refresh()
+    controller.setDirectoryQuery({ employeeSearch: 'Employee 1', employeeOffset: 10, employeeStatus: 'retired' })
+    await controller.refresh()
+    controller.setDirectoryView('organization')
+    await controller.refresh()
+    assert.equal(controller.getSnapshot().directoryView, 'organization')
+    assert.equal(controller.getSnapshot().snapshot?.employees.length, 125)
+    assert.equal(controller.getSnapshot().snapshot?.employees.at(-1)?.id, 'e124')
+    assert.equal(calls.at(-1)?.employeeSearch, undefined)
+    await controller.refresh('poll')
+    assert.equal(controller.getSnapshot().snapshot?.employees.length, 125, 'polling must not replace the tree with its first page')
+
+    controller.setDirectoryView('overview')
+    await controller.refresh()
+    assert.equal(controller.getSnapshot().snapshot?.employees[0]?.id, 'e0', 'activity filtering must preserve the primary employee page')
+    assert.deepEqual(controller.getSnapshot().snapshot?.activity_employees?.map((employee) => employee.id), ['e110', 'e111', 'e112', 'e113', 'e114'])
+    assert.equal(controller.getSnapshot().snapshot?.directory?.summary.running_employees, 15)
+    controller.loadMoreActivity(10)
+    await controller.refresh()
+    assert.equal(controller.getSnapshot().snapshot?.activity_employees?.length, 10)
+    assert.equal(controller.getSnapshot().snapshot?.activity_employees?.[0]?.id, 'e110')
+    fail = true
+    controller.loadMoreActivity(15)
+    await controller.refresh()
+    assert.equal(controller.getSnapshot().snapshot?.activity_employees?.length, 10, 'a failed load keeps the visible prefix')
+    assert.equal(controller.getSnapshot().loading, false)
+    fail = false
+    await controller.refresh('retry')
+    assert.equal(controller.getSnapshot().snapshot?.activity_employees?.length, 15)
+
+    controller.setDirectoryView('page')
+    await controller.refresh()
+    assert.equal(calls.at(-1)?.employeeSearch, 'Employee 1', 'audit retains its own filters')
+    controller.setDirectoryView('overview')
+    await controller.refresh()
+    assert.equal(controller.getSnapshot().snapshot?.activity_employees?.length, 5)
+  } finally { controller.dispose() }
+})
 
 function jsonResponse(value: unknown, status = 200): Response {
   return new Response(JSON.stringify(value), {
@@ -11,6 +71,28 @@ function jsonResponse(value: unknown, status = 200): Response {
     headers: { 'content-type': 'application/json' },
   })
 }
+
+test('overview preserves the idle initial HR for formation editing', async () => {
+  const state = companyState()
+  state.employees[0]!.isHr = true
+  const controller = new CompanyUiController({ closedPollMs: 60_000, fetch: async (input) => {
+    const running = new URL(String(input), 'http://localhost').searchParams.get('employeeStatus') === 'running'
+    return jsonResponse(buildSnapshot({ agents: { get: () => undefined } } as any, state, { kind: 'founder', id: 'founder', sessionId: 'founder-session' }, [], undefined, running ? { employeeStatus: 'running', employeeLimit: 5 } : {}))
+  } })
+  try {
+    controller.setCurrentSession('founder-session')
+    await controller.refresh()
+    for (const phase of ['staged', 'provisioning_failed'] as const) {
+      state.phase = phase
+      controller.setDirectoryView('overview')
+      await controller.refresh()
+      const hr = controller.getSnapshot().snapshot?.employees.find((employee) => employee.is_hr)
+      assert.equal(hr?.name, state.employees[0]!.name)
+      assert.equal(hr?.budget_micros, state.employees[0]!.budgetMicros)
+      assert.equal(hr?.llm?.model, state.employees[0]!.llm.model)
+    }
+  } finally { controller.dispose() }
+})
 
 async function waitFor(predicate: () => boolean, timeoutMs = 2_000): Promise<void> {
   const deadline = Date.now() + timeoutMs
@@ -95,6 +177,38 @@ test('reuses Host ETags and accepts 304 without reparsing a full snapshot', asyn
   assert.equal(controller.getSnapshot().snapshot?.revision, 1)
   assert.equal(controller.getSnapshot().stale, false)
   controller.dispose()
+})
+
+test('directory navigation sends server filters, invalidates page validators and rejects late pages', async () => {
+  let resolveOldPage!: (response: Response) => void
+  const calls: Array<{ query: URLSearchParams; validator: string | null }> = []
+  const fetcher: typeof fetch = async (input, init) => {
+    const query = new URL(String(input), 'http://localhost').searchParams
+    calls.push({ query, validator: new Headers(init?.headers).get('if-none-match') })
+    if (query.get('employeeOffset') === '50') return new Promise<Response>((resolve) => { resolveOldPage = resolve })
+    const fixture = snapshotFixture(query.get('employeeOffset') === '100' ? 3 : 1)
+    return new Response(JSON.stringify(fixture), { headers: { 'content-type': 'application/json', etag: '"page"' } })
+  }
+  const controller = new CompanyUiController({ fetch: fetcher, openPollMs: 60_000, closedPollMs: 60_000 })
+  try {
+    controller.setCurrentSession('founder-session')
+    await controller.refresh()
+    controller.setDirectoryQuery({ employeeOffset: 50, employeeSearch: 'Engineer', employeeStatus: 'active' })
+    assert.equal(calls.at(-1)!.validator, null)
+    assert.equal(calls.at(-1)!.query.get('employeeSearch'), 'Engineer')
+    assert.equal(calls.at(-1)!.query.get('employeeStatus'), 'active')
+    controller.setDirectoryQuery({ employeeOffset: 100 })
+    await controller.refresh()
+    assert.equal(controller.getSnapshot().snapshot?.revision, 3)
+    resolveOldPage(jsonResponse(snapshotFixture(2)))
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    assert.equal(controller.getSnapshot().snapshot?.revision, 3)
+    await controller.refresh()
+    assert.equal(calls.at(-1)!.validator, '"page"')
+    controller.setCurrentSession('another-session')
+    await controller.refresh()
+    assert.equal(calls.at(-1)!.query.has('employeeOffset'), false)
+  } finally { controller.dispose() }
 })
 
 test('switching back to a session fetches a representation before sending a validator', async () => {

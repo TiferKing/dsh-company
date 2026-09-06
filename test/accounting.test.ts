@@ -65,7 +65,7 @@ test('Host request gate preserves per-turn entitlement and session usage is idem
     )
     saved = await store.readActive(workspace)
     assert.equal(saved?.moneyBudget.reservations.length, 0)
-    
+
     // An unset max_tokens is never injected: the harness/provider resolve the
     // model's real output capability (a money-derived bound can exceed what
     // the upstream accepts, e.g. Console Go's [1, 393216]).
@@ -108,6 +108,49 @@ test('restored session history replays an uncommitted usage event before flush c
     await handlers.get('session/flush')!(session)
     const saved = await store.readActive(workspace)
     assert.equal(saved?.moneyBudget.usage.find((entry) => entry.eventSeq === 12)?.totalTokens, 10)
+    await dispose()
+  } finally {
+    await rm(base, { recursive: true, force: true })
+  }
+})
+
+test('accounting replay pre-deduplicates long history with one state read', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'dsh-company-accounting-dedup-'))
+  const workspace = join(base, 'workspace')
+  await mkdir(workspace)
+  try {
+    const handlers = new Map<string, Function>()
+    const now = Date.now()
+    const events = Array.from({ length: 500 }, (_, index) => ({
+      type: 'assistant/message', seq: index + 1, time: now + index,
+      data: { turn: 1, step: index + 1, usage: { inputTokens: 1, outputTokens: 0 } },
+    }))
+    const session = { id: 'founder-session', header: { cwd: workspace }, events }
+    const founder = { id: 'founder-session', options: { provider: 'mock', model: 'mock-model' }, session }
+    const ctx = {
+      on(name: string, handler: Function) { handlers.set(name, handler); return () => handlers.delete(name) },
+      agents: { get: () => founder, list: () => [] }, subagents: { interrupt: () => undefined }, logger: { warn: () => undefined },
+    } as any
+    const config = resolveConfig({ stateRoot: join(base, 'state') })
+    const store = new CompanyStore(config)
+    const paths = await store.pathsForCwd(workspace)
+    const state = companyState({ workspaceHash: paths.workspace.sha256 })
+    state.moneyBudget.usage = events.map((event) => ({
+      id: `founder-session:${event.seq}`, sessionId: 'founder-session', eventSeq: event.seq,
+      turn: 1, step: event.seq, employeeId: 'founder', provider: 'mock', model: 'mock-model',
+      inputTokens: 1, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0,
+      inputCacheMissTokens: 1, inputCacheHitTokens: 0, totalTokens: 1, costMicros: 0, priced: false,
+      currency: 'USD', pricingRevision: 1, at: event.time,
+    }))
+    await store.createStaged(workspace, state)
+    const originalRead = store.readActive.bind(store)
+    let reads = 0
+    ;(store as any).readActive = async (cwd: string | undefined) => { reads += 1; return originalRead(cwd) }
+    const dispose = installCompanyAccounting(ctx, store, config)
+
+    handlers.get('session/created')!(session)
+    await handlers.get('session/flush')!(session)
+    assert.equal(reads, 1, '500 already-accounted events must not launch 500 concurrent company.json parses')
     await dispose()
   } finally {
     await rm(base, { recursive: true, force: true })
@@ -399,8 +442,9 @@ async function accountingFixture(setup: (state: CompanyState) => void) {
       return { provider: 'mock', model: 'mock-model' }
     }),
     founderRequest: () => handlers.get('agent/request')!({ agent: founder, turn: 1, step: 1 }, async () => ({ provider: 'mock', model: 'mock-model' })),
-    async usage(inputTokens: number, at = Date.now()) {
+    async usage(inputTokens: number, at = Date.now(), endTurnBeforeFlush = false) {
       handlers.get('session/event')!(employee.session, { type: 'assistant/message', seq: 99, time: at, data: { turn: 1, step: 1, usage: { inputTokens, outputTokens: 0 } } })
+      if (endTurnBeforeFlush) handlers.get('session/event')!(employee.session, { type: 'turn/end', seq: 100, time: at, data: { turn: 1, reason: { kind: 'completed' } } })
       await handlers.get('session/flush')!(employee.session)
       return (await store.readActive(workspace))!
     },
@@ -485,36 +529,38 @@ test('staffing and bootstrap welcome calls remain admissible through their actua
   } finally { await fixture.close() }
 })
 
-test('late usage retains its captured work, product, authorization and price without consuming a replacement reservation', async () => {
-  const fixture = await accountingFixture((state) => {
-    state.products[0]!.budgetMicros = 50_000_000
-    state.products.push({ ...structuredClone(state.products[0]!), id: 'p2', name: 'Replacement product', productRoot: 'replacement' })
-    state.counters.product = 2
-    state.workItems.push(attributionWork('w1'), attributionWork('w2', 'p2'))
-    state.counters.work = 2
-    state.moneyBudget.prices[0]!.inputCacheMissMicrosPerMillion = 1_000_000
-    const now = Date.now()
-    const authorization = approvedTemporaryAuthorization(state, { employeeId: 'e1', reason: 'Finish a bounded call.', expiresAt: now + 60_000 }, { maxMs: 60_000 }, now)
-    reserveMoneyTurn(state, { employeeId: 'e1', provider: 'mock', model: 'mock-model', workId: 'w1', bypass: { authorizationId: authorization.id, bypassCompany: true, bypassProduct: true, bypassEmployee: true } })
-  })
-  try {
-    await fixture.request()
-    const replacement = await fixture.store.transact(fixture.workspace, { actor: 'scheduler', type: 'test.replace', summary: 'Replace an in-flight reservation' }, (state) => {
-      releaseEmployeeMoneyReservations(state, 'e1')
-      state.moneyBudget.prices[0]!.inputCacheMissMicrosPerMillion = 2_000_000
-      reserveMoneyTurn(state, { employeeId: 'e1', provider: 'mock', model: 'mock-model', workId: 'w2' })
-      return structuredClone(state.moneyBudget.reservations[0]!)
+for (const endTurnBeforeFlush of [false, true]) {
+  test(`late usage retains its captured work, product, authorization and price without consuming a replacement reservation${endTurnBeforeFlush ? ' after turn/end clears the route cache' : ''}`, async () => {
+    const fixture = await accountingFixture((state) => {
+      state.products[0]!.budgetMicros = 50_000_000
+      state.products.push({ ...structuredClone(state.products[0]!), id: 'p2', name: 'Replacement product', productRoot: 'replacement' })
+      state.counters.product = 2
+      state.workItems.push(attributionWork('w1'), attributionWork('w2', 'p2'))
+      state.counters.work = 2
+      state.moneyBudget.prices[0]!.inputCacheMissMicrosPerMillion = 1_000_000
+      const now = Date.now()
+      const authorization = approvedTemporaryAuthorization(state, { employeeId: 'e1', reason: 'Finish a bounded call.', expiresAt: now + 60_000 }, { maxMs: 60_000 }, now)
+      reserveMoneyTurn(state, { employeeId: 'e1', provider: 'mock', model: 'mock-model', workId: 'w1', bypass: { authorizationId: authorization.id, bypassCompany: true, bypassProduct: true, bypassEmployee: true } })
     })
-    const saved = await fixture.usage(7)
-    const entry = saved.moneyBudget.usage[0]!
-    assert.equal(entry.costMicros, 7)
-    assert.equal(entry.workId, 'w1')
-    assert.equal(entry.productId, 'p1')
-    assert.equal(entry.authorizationId, fixture.state.temporaryAuthorizations[0]!.id)
-    assert.deepEqual(saved.moneyBudget.reservations[0], replacement.result)
-    assert.equal(fixture.warnings.length, 0)
-  } finally { await fixture.close() }
-})
+    try {
+      await fixture.request()
+      const replacement = await fixture.store.transact(fixture.workspace, { actor: 'scheduler', type: 'test.replace', summary: 'Replace an in-flight reservation' }, (state) => {
+        releaseEmployeeMoneyReservations(state, 'e1')
+        state.moneyBudget.prices[0]!.inputCacheMissMicrosPerMillion = 2_000_000
+        reserveMoneyTurn(state, { employeeId: 'e1', provider: 'mock', model: 'mock-model', workId: 'w2' })
+        return structuredClone(state.moneyBudget.reservations[0]!)
+      })
+      const saved = await fixture.usage(7, Date.now(), endTurnBeforeFlush)
+      const entry = saved.moneyBudget.usage[0]!
+      assert.equal(entry.costMicros, 7)
+      assert.equal(entry.workId, 'w1')
+      assert.equal(entry.productId, 'p1')
+      assert.equal(entry.authorizationId, fixture.state.temporaryAuthorizations[0]!.id)
+      assert.deepEqual(saved.moneyBudget.reservations[0], replacement.result)
+      assert.equal(fixture.warnings.length, 0)
+    } finally { await fixture.close() }
+  })
+}
 
 test('retiring an employee while a provider call is running preserves its final factual usage', async () => {
   const fixture = await accountingFixture((state) => {

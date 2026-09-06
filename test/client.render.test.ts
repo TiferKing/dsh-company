@@ -3,7 +3,7 @@ import test from 'node:test'
 import React, { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { CompanyActions } from '../src/client/CompanyDrawer.js'
-import { en, type CompanyTranslate } from '../src/client/locales.js'
+import { en, zh, type CompanyTranslate } from '../src/client/locales.js'
 import { parseCompanySnapshot } from '../src/client/types.js'
 import { parseCharterClauses } from '../src/charter.js'
 import { OverviewView } from '../src/client/views/OverviewView.js'
@@ -15,6 +15,9 @@ import { TicketsView } from '../src/client/views/TicketsView.js'
 import { AuditView } from '../src/client/views/AuditView.js'
 import { ApprovalsView } from '../src/client/views/ApprovalsView.js'
 import { snapshotFixture } from './fixtures/company-snapshot.js'
+import { buildSnapshot } from '../src/snapshot.js'
+import { companyState } from './fixtures.js'
+import { loadOrganizationSnapshot } from '../src/client/directory-snapshot.js'
 
 // tsx loads this test under the Host tsconfig (classic JSX fallback) while the
 // production client build uses react-jsx through tsconfig.client.json.
@@ -27,6 +30,38 @@ const t: CompanyTranslate = (key, params = {}) => {
   }
   return value
 }
+
+test('Host directory pages assemble into the original collapsed organization tree with all employees', async () => {
+  const state = companyState()
+  state.employees = Array.from({ length: 300 }, (_, index) => ({ ...structuredClone(state.employees[0]!), id: `e${index + 1}`, name: `Engineer ${index + 1}`, sessionId: `session-${index + 1}` }))
+  state.staffingRequests.push({ id: 'sr1', action: 'hire', status: 'pending', requestedBy: 'founder', candidateName: 'New reviewer', workProfile: 'Review designs', hrEmployeeId: 'e1', createdAt: 1, updatedAt: 1 })
+  const ctx = { agents: { get: () => undefined } } as any
+  const actor = { kind: 'founder', id: 'founder', sessionId: 'founder-session' } as const
+  const wire = buildSnapshot(ctx, state, actor, [])
+  wire.execution = { mode: 'adaptive', running: 9, limit: 10, waiting: 5, reason: 'memory' }
+  const snapshot = await loadOrganizationSnapshot(parseCompanySnapshot(wire), async (query) => parseCompanySnapshot(buildSnapshot(ctx, state, actor, [], undefined, query)))
+  assert.ok(snapshot.directory, 'exercise the real Host projection rather than a legacy fixture without directory metadata')
+  const org = renderToStaticMarkup(createElement(OrganizationView, { snapshot, t, locale: 'en', navigateToSession: async () => undefined }))
+  assert.match(org, /role="tree"/)
+  assert.match(org, /aria-level="1" aria-expanded="false"/)
+  assert.doesNotMatch(org, /Engineer 101/)
+  assert.doesNotMatch(org, /Search employee name|Employee scope|Previous|Next|Organization units are paged/)
+  assert.match(org, /New reviewer/)
+  assert.match(org, /300/)
+  const expanded = renderToStaticMarkup(createElement(OrganizationView, { snapshot, t, locale: 'en', navigateToSession: async () => undefined, initialExpanded: true }))
+  assert.match(expanded, /aria-level="2" aria-expanded="true"/)
+  assert.match(expanded, /dsh-company-org-node__people-list/)
+  assert.match(expanded, /Engineer 1<\//)
+  assert.match(expanded, /Engineer 101/)
+  assert.match(expanded, /Engineer 300/)
+  const overview = renderToStaticMarkup(createElement(OverviewView, { snapshot, t, locale: 'en' }))
+  assert.match(overview, /Host company employees running 9/)
+  assert.match(overview, /Waiting for memory pressure to decrease/)
+  const auditSnapshot = parseCompanySnapshot(buildSnapshot(ctx, state, actor, [], undefined, { employeeOffset: 100 }))
+  const audit = renderToStaticMarkup(createElement(AuditView, { snapshot: auditSnapshot, t, locale: 'en', canManageBudget: true, onDirectoryQuery: () => undefined }))
+  assert.match(audit, /Engineer 101/)
+  assert.doesNotMatch(audit, /Engineer 1<\//)
+})
 
 test('all seven company views render the safe Host projection', () => {
   const snapshot = parseCompanySnapshot(snapshotFixture())
@@ -73,6 +108,52 @@ test('all seven company views render the safe Host projection', () => {
   assert.match(output, /Publish a release candidate/)
   assert.doesNotMatch(output, /must-be-dropped/)
   assert.doesNotMatch(output, /attempt_id/)
+})
+
+test('overview counts only live running employees after a reload', () => {
+  for (const activity of ['idle', 'ready', 'cold', 'unavailable'] as const) {
+    const snapshot = parseCompanySnapshot(snapshotFixture())
+    snapshot.employees[0]!.activity = { state: activity }
+    const output = renderToStaticMarkup(createElement(OverviewView, { snapshot, t, locale: 'en' }))
+    assert.match(output, /No employee is currently executing company work/, activity)
+    assert.match(output, /Active employees<\/span><\/div><strong class="dsh-company-stat__value">0<\/strong>/)
+    assert.doesNotMatch(output, />Working<\/span>/)
+  }
+
+  const snapshot = parseCompanySnapshot(snapshotFixture())
+  snapshot.employees[0]!.status = 'idle'
+  const output = renderToStaticMarkup(createElement(OverviewView, { snapshot, t, locale: 'en' }))
+  assert.match(output, /Active employees<\/span><\/div><strong class="dsh-company-stat__value">1<\/strong>/)
+  assert.match(output, /<span class="dsh-company-status" data-tone="active">Running<\/span>/)
+  assert.doesNotMatch(output, />Idle<\/span>/, 'a delayed lifecycle update must not relabel a live running turn')
+
+  snapshot.employees = Array.from({ length: 12 }, (_, index) => ({ ...snapshot.employees[0]!, id: `legacy-${index}`, name: `Legacy employee ${index}` }))
+  snapshot.activity_employees = snapshot.employees.slice(0, 5)
+  const legacy = renderToStaticMarkup(createElement(OverviewView, { snapshot, t, locale: 'en' }))
+  assert.match(legacy, /Active employees<\/span><\/div><strong class="dsh-company-stat__value">12<\/strong>/)
+  assert.match(legacy, /Load more/)
+  assert.doesNotMatch(legacy, /Legacy employee 5/)
+})
+
+test('organization shows live activity without overriding paused or failed lifecycle states', () => {
+  const cases = [
+    { status: 'working', activity: 'ready', label: 'Ready to continue', tone: 'neutral' },
+    { status: 'working', activity: 'idle', label: 'Idle', tone: 'success' },
+    { status: 'idle', activity: 'running', label: 'Running', tone: 'active' },
+    { status: 'paused', activity: 'running', label: 'Paused', tone: 'warning' },
+    { status: 'failed', activity: 'idle', label: 'Failed', tone: 'danger' },
+    { status: 'retired', activity: 'running', label: 'Retired', tone: 'neutral' },
+  ] as const
+  for (const row of cases) {
+    const snapshot = parseCompanySnapshot(snapshotFixture())
+    snapshot.employees[0]!.status = row.status
+    snapshot.employees[0]!.activity = { state: row.activity }
+    const output = renderToStaticMarkup(createElement(OrganizationView, {
+      snapshot, t, locale: 'en', navigateToSession: async () => undefined, initialExpanded: true,
+    }))
+    assert.match(output, new RegExp(`<span class="dsh-company-status" data-tone="${row.tone}">${row.label}</span>`), `${row.status}/${row.activity}`)
+    assert.doesNotMatch(output, />Working<\/span>/)
+  }
 })
 
 test('approval cards show content up front with scope summary and details collapsed', () => {
@@ -129,6 +210,43 @@ test('audit page no longer hosts the price matrix', () => {
   const output = renderToStaticMarkup(createElement(AuditView, { snapshot, t, locale: 'en' }))
   assert.doesNotMatch(output, /Current model prices/)
   assert.doesNotMatch(output, /role="switch"/)
+})
+
+test('formation and audit render the independent HR limit and exclude retired employee budget controls', () => {
+  const snapshot = parseCompanySnapshot(snapshotFixture())
+  const hr = { ...snapshot.employees[0]!, id: 'hr', name: 'People Lead', is_hr: true, budget_micros: 2_500_000 }
+  snapshot.employees.push(hr, { ...hr, id: 'retired', name: 'Former HR', status: 'retired' })
+  const formation = renderToStaticMarkup(createElement(OverviewView, {
+    snapshot, t, locale: 'en', canEditFormation: true, onEditFormation: async () => true,
+  }))
+  assert.match(formation, /HR spending limit<\/span><input[^>]*required=""[^>]*value="2\.5"/)
+  const audit = renderToStaticMarkup(createElement(AuditView, {
+    snapshot, t, locale: 'en', canManageBudget: true, onRequestBudgetChange: async () => true,
+  }))
+  assert.match(audit, /Employee spending limits/)
+  assert.match(audit, /People Lead · HR<\/span><input[^>]*value="2\.5"/)
+  assert.doesNotMatch(audit, /Former HR/)
+})
+
+test('formation offers discovered HR routes and preserves editable custom model ids', () => {
+  const snapshot = parseCompanySnapshot(snapshotFixture())
+  const hr = { ...snapshot.employees[0]!, id: 'hr', name: 'People Lead', is_hr: true, budget_micros: 2_500_000 }
+  snapshot.employees.push(hr)
+  const render = (): string => renderToStaticMarkup(createElement(OverviewView, {
+    snapshot, t, locale: 'en', canEditFormation: true, onEditFormation: async () => true,
+  }))
+  const catalog = render()
+  assert.match(catalog, /Choose the initial HR model/)
+  assert.match(catalog, /<option[^>]*selected="">DeepSeek Chat · deepseek\/deepseek-chat<\/option>/)
+  assert.match(catalog, /<option[^>]*>Mock Model · mock\/mock-model<\/option>/)
+  assert.match(catalog, /Changing the model resets reasoning effort to default/)
+  hr.llm = { provider: 'custom-provider', model: 'family/custom-id', reasoning_effort: 'high' }
+  const custom = render()
+  assert.match(custom, /<option value="" disabled="" selected="">Custom model \(enter below\)<\/option>/)
+  assert.match(custom, /Model provider<\/span><input value="custom-provider"/)
+  assert.match(custom, /Model ID<\/span><input value="family\/custom-id"/)
+  assert.match(custom, /HR spending limit<\/span><input[^>]*value="2\.5"/)
+  assert.match(custom, /Reasoning effort \(default or an exact ID\)<\/span><input value="high"/, 'rendering a custom route preserves its saved reasoning effort')
 })
 
 test('Audit labels bounded details while charting Host lifetime aggregates', () => {
@@ -272,8 +390,12 @@ test('Organization lifecycle-separates retired employees without counting them a
   const output = renderToStaticMarkup(createElement(OrganizationView, {
     snapshot: parseCompanySnapshot(wire), t, locale: 'en', navigateToSession: async () => undefined, initialExpanded: true,
   }))
-  assert.match(output, /Former \/ retired employees/)
-  assert.match(output, /Former Engineer/)
+  const formerSection = output.match(/<details\b[^>]*\bdsh-company-former\b[^>]*>[\s\S]*?<\/details>/)?.[0]
+  assert.ok(formerSection)
+  assert.doesNotMatch(formerSection.split('>')[0]!, /\bopen(?:\s|=|$)/, 'former employees start collapsed even when the organization tree is expanded')
+  assert.match(formerSection, /Former employees/)
+  assert.match(formerSection, /Former Engineer/)
+  assert.equal(zh['organization.former'], '已离职员工')
 })
 
 test('organization tree fallback message is shown when no org units exist', () => {

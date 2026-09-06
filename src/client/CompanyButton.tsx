@@ -7,18 +7,21 @@ export function CompanyButton({ sessionId, controller, locale, t }: CompanyButto
   const state = useCompanyState(controller)
   useLocaleSnapshot(locale)
 
-  if (state.sessionId !== sessionId || state.snapshot === undefined) return null
+  if (state.sessionId !== sessionId || state.companyAbsent) return null
   const { snapshot } = state
-  const pending = snapshot.approvals.filter((approval) => approval.status === 'pending').length
-  const active = snapshot.work.filter(
+  const pending = snapshot?.approvals.filter((approval) => approval.status === 'pending').length ?? 0
+  const active = snapshot?.work.filter(
     (item) => item.status === 'claimed' || item.status === 'in_progress',
-  ).length
-  const secondary = pending > 0
-    ? t('button.pending', { count: pending })
-    : active > 0
-      ? t('button.active', { count: active })
-      : phaseLabel(snapshot.company.phase, t)
-  const accessible = `${t('button.open')}: ${snapshot.company.name}, ${secondary}`
+  ).length ?? 0
+  const secondary = snapshot === undefined
+    ? t(state.networkError === undefined ? 'button.loading' : 'button.unavailable')
+    : pending > 0
+      ? t('button.pending', { count: pending })
+      : active > 0
+        ? t('button.active', { count: active })
+        : phaseLabel(snapshot.company.phase, t)
+  const name = snapshot?.company.name ?? t('button.name')
+  const accessible = `${t('button.open')}: ${name}, ${secondary}`
 
   return (
     <button
@@ -33,7 +36,7 @@ export function CompanyButton({ sessionId, controller, locale, t }: CompanyButto
       <span className="dsh-company-button__mark">
         <BuildingIcon width="14" height="14" />
       </span>
-      <span className="dsh-company-button__name">{snapshot.company.name}</span>
+      <span className="dsh-company-button__name">{name}</span>
       <span aria-hidden="true" className="dsh-company-button__phase">
         {secondary}
       </span>

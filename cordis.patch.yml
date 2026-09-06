@@ -4,7 +4,13 @@
       config:
         subagentProvider: spawn
         memberMaxDepth: 1
-        maxEmployees: 8
+        maxEmployees: unlimited
+        executionMode: adaptive
+        maxConcurrentEmployees: 8
+        executionMemoryHighWatermark: 0.8
+        executionLagHighWatermarkMs: 200
+        executionMaxPendingWrites: 32
+        executionRetryMs: 1000
         maxProducts: 8
         maxWorkItems: 128
         maxOpenWorkItems: 32

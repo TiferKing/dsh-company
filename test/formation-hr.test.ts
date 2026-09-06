@@ -18,7 +18,7 @@ test('budget-only adjustment keeps the employee session; route change reprovisio
     const config = resolveConfig({ stateRoot: join(base, 'state') })
     const store = new CompanyStore(config)
     const runtime = new CompanyRuntime(ctx, config, store)
-    await runtime.bootstrap(founder, { name: 'C', mission: 'm', charter: '1. a', firstProduct: { name: 'P', summary: 's', productRoot: 'p', successCriteria: ['x'], budgetMicros: 1_000_000 }, totalBudgetMicros: 1_000_000, currency: 'CNY', draftedBy: 'ai', modelPrices: [{ provider: 'mock', model: 'mock-model', inputCacheMissMicrosPerMillion: 0, inputCacheHitMicrosPerMillion: 0, outputMicrosPerMillion: 0 }] })
+    await runtime.bootstrap(founder, { name: 'C', mission: 'm', charter: '1. a', firstProduct: { name: 'P', summary: 's', productRoot: 'p', successCriteria: ['x'], budgetMicros: 1_000_000 }, totalBudgetMicros: 1_000_000, hrBudgetMicros: 100_000, currency: 'CNY', draftedBy: 'ai', modelPrices: [{ provider: 'mock', model: 'mock-model', inputCacheMissMicrosPerMillion: 0, inputCacheHitMicrosPerMillion: 0, outputMicrosPerMillion: 0 }] })
     await runtime.approveBootstrap(founder, 'Approved and start.', { source: 'ui' })
     const hr = (await store.readActive(workspace))!.employees[0]!
     const hrAgent = { id: hr.sessionId, status: 'idle', session: { header: { cwd: workspace } } } as any
@@ -109,7 +109,7 @@ test('formation is editable, provisions HR first, and gates later hiring through
     await runtime.bootstrap(founder, {
       name: 'Draft Co', mission: 'Build one bounded tool.', charter: multilineCharter,
       firstProduct: { name: 'Tool', summary: 'One tool.', productRoot: 'tool', successCriteria: ['Tests pass'], budgetMicros: 1_000_000 },
-      totalBudgetMicros: 1_000_000, currency: 'CNY',
+      totalBudgetMicros: 1_000_000, hrBudgetMicros: 100_000, currency: 'CNY',
       modelPrices: [{ provider: 'mock', model: 'mock-model', inputCacheMissMicrosPerMillion: 0, inputCacheHitMicrosPerMillion: 0, outputMicrosPerMillion: 0 }],
       draftedBy: 'ai',
     })

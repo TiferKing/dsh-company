@@ -1,7 +1,9 @@
 import { readFileSync } from 'node:fs'
-import { mkdir, readFile, readdir, rename, rm } from 'node:fs/promises'
+import { mkdir, readFile, readdir, rename, rm, stat } from 'node:fs/promises'
 import { basename, dirname, join } from 'node:path'
-import { withFileLock, writeFileAtomic } from '@deepseek-ai/dsh-atomic-write'
+import { isDeepStrictEqual } from 'node:util'
+import { writeFileAtomic } from '@deepseek-ai/dsh-atomic-write'
+import { withCompanyFileLock as withFileLock } from './state-lock.js'
 import {
   assertNotSymlink,
   assertNotSymlinkSync,
@@ -15,6 +17,7 @@ import { assertCompanyMessage, assertCompanyState } from './schemas.js'
 import { normalizeCompanyState } from './migration.js'
 import { releaseEmployeeMoneyReservations, releaseMoneyReservation } from './money.js'
 import { consumeApproval, requireApproved } from './approvals.js'
+import { applyHistoryAppends, CompanyStateStorage, parseHistoryAppends, prepareStoredState, validateHistoryBase, type HistoryAppend, type StoredCompanyState } from './state-history.js'
 import type {
   CompanyAuditEvent,
   CompanyMessage,
@@ -51,10 +54,12 @@ interface OptionalFileSnapshot {
 }
 
 interface TransactionJournal {
-  schemaVersion: 1
+  schemaVersion: 1 | 2
   workspaceHash: string
   baseRevision: number
   state: CompanyState
+  storedState: StoredCompanyState
+  history: HistoryAppend[]
   auditContent: string
   mailboxes: Array<{ participantId: string; messages: CompanyMessage[] }>
 }
@@ -73,10 +78,24 @@ export class CompanyStore {
   readonly config: ResolvedCompanyConfig
   private readonly queues = new Map<string, Promise<void>>()
   private readonly onWarning: (message: string, error?: unknown) => void
+  private readonly storage: CompanyStateStorage
+  private readonly pendingOperations = new Map<symbol, number>()
+  private activeWrites = 0
+  private lastWriteMs = 0
 
   constructor(config: ResolvedCompanyConfig, options: CompanyStoreOptions = {}) {
     this.config = config
     this.onWarning = options.onWarning ?? (() => undefined)
+    this.storage = new CompanyStateStorage(config)
+  }
+
+  getPressure(): { pendingWrites: number; activeWrites: number; oldestPendingWriteMs: number; lastWriteMs: number } {
+    return {
+      pendingWrites: this.pendingOperations.size,
+      activeWrites: this.activeWrites,
+      oldestPendingWriteMs: this.pendingOperations.size === 0 ? 0 : Math.max(0, Date.now() - this.pendingOperations.values().next().value!),
+      lastWriteMs: this.lastWriteMs,
+    }
   }
 
   async pathsForCwd(cwd: string | undefined, create = true): Promise<WorkspacePaths> {
@@ -115,7 +134,7 @@ export class CompanyStore {
     const normalized = normalizeCompanyState(state, this.config)
     assertCompanyState(normalized, paths.workspace.sha256)
     state = normalized
-    return this.serialize(paths.root, async () => {
+    return this.serialize(paths.root, async () => withFileLock(paths.identityFile, async () => {
       await assertNotSymlink(paths.activeDir, 'dsh-company active directory')
       try {
         await mkdir(paths.activeDir, { mode: DIR_MODE })
@@ -126,20 +145,29 @@ export class CompanyStore {
       let committed = false
       try {
         await mkdir(paths.mailboxDir, { recursive: true, mode: DIR_MODE })
-        await writeFileAtomic(paths.stateFile, serializeJson(state), { mode: FILE_MODE, dirMode: DIR_MODE })
+        const prepared = prepareStoredState(state)
+        await applyHistoryAppends(paths.stateFile, prepared.appends)
+        await writeFileAtomic(paths.stateFile, serializeJson(prepared.stored), { mode: FILE_MODE, dirMode: DIR_MODE })
         await writeFileAtomic(paths.auditFile, '', { mode: FILE_MODE, dirMode: DIR_MODE })
         committed = true
+        await this.storage.committed(paths.stateFile, state, prepared.stored).catch(() => undefined)
         return structuredClone(state)
       } finally {
         if (!committed) await rm(paths.activeDir, { recursive: true, force: true }).catch(() => undefined)
       }
-    })
+    }, { waitMs: LOCK_WAIT_MS }))
   }
 
   async readActive(cwd: string | undefined): Promise<CompanyState | undefined> {
+    const state = await this.readActiveView(cwd)
+    return state === undefined ? undefined : structuredClone(state)
+  }
+
+  /** Immutable shared snapshot. Never mutate it; use transact for changes. */
+  async readActiveView(cwd: string | undefined): Promise<CompanyState | undefined> {
     const paths = await this.pathsForCwd(cwd, false)
     await this.recoverPendingTransaction(paths)
-    const state = await this.readStateFile(paths.stateFile, paths.workspace.sha256)
+    const state = (await this.storage.read(paths.stateFile, paths.workspace.sha256))?.state
     if (state?.phase === 'archived') {
       await this.finalizeArchivedDirectory(paths)
       return undefined
@@ -148,17 +176,25 @@ export class CompanyStore {
   }
 
   readActiveSync(cwd: string | undefined): CompanyState | undefined {
+    const state = this.readActiveViewSync(cwd)
+    return state === undefined ? undefined : structuredClone(state)
+  }
+
+  /** Synchronous counterpart for prompt composition; recursively frozen. */
+  readActiveViewSync(cwd: string | undefined): CompanyState | undefined {
     const paths = this.pathsForCwdSync(cwd)
     try {
       try {
+        assertNotSymlinkSync(paths.transactionFile, 'company transaction journal')
         const journal = this.parseTransactionJournal(JSON.parse(stripBom(readFileSync(paths.transactionFile, 'utf8'))), paths)
-        return journal.state.phase === 'archived' ? undefined : structuredClone(journal.state)
+        const current = this.storage.readSync(paths.stateFile, paths.workspace.sha256)
+        if (this.validateJournalCurrent(current, journal)) return current!.state.phase === 'archived' ? undefined : current!.state
+        return journal.state.phase === 'archived' ? undefined : journal.state
       } catch (error) {
         if (!isErrno(error, 'ENOENT')) throw error
       }
-      const parsed = normalizeCompanyState(JSON.parse(stripBom(readFileSync(paths.stateFile, 'utf8'))), this.config)
-      assertCompanyState(parsed, paths.workspace.sha256)
-      return parsed.phase === 'archived' ? undefined : parsed
+      const parsed = this.storage.readSync(paths.stateFile, paths.workspace.sha256)?.state
+      return parsed?.phase === 'archived' ? undefined : parsed
     } catch (error) {
       if (isErrno(error, 'ENOENT')) return undefined
       throw error
@@ -185,7 +221,7 @@ export class CompanyStore {
   async readMailbox(cwd: string | undefined, participantId: 'founder' | string): Promise<CompanyMessage[]> {
     const paths = await this.pathsForCwd(cwd, false)
     await this.recoverPendingTransaction(paths)
-    const state = await this.readStateFile(paths.stateFile, paths.workspace.sha256)
+    const state = (await this.storage.read(paths.stateFile, paths.workspace.sha256))?.state
     if (state === undefined) return []
     return this.readMailboxFile(paths, participantId, state.limits.maxMailboxMessages)
   }
@@ -202,6 +238,7 @@ export class CompanyStore {
       const current = await this.readStateFile(paths.stateFile, paths.workspace.sha256)
       if (current === undefined) throw new Error('no active company exists for this workspace')
       const target = join(paths.archiveDir, current.id)
+      await assertNotSymlink(paths.archiveDir, 'company archive directory')
       await mkdir(paths.archiveDir, { recursive: true, mode: DIR_MODE })
       // Preflight collision and destination writability before consuming approval
       // or changing the authoritative aggregate.
@@ -294,6 +331,7 @@ export class CompanyStore {
 
   async readArchived(cwd: string | undefined, companyId?: string): Promise<CompanyState[]> {
     const paths = await this.pathsForCwd(cwd, false)
+    await assertNotSymlink(paths.archiveDir, 'company archive directory')
     let entries
     try {
       entries = await readdir(paths.archiveDir, { withFileTypes: true })
@@ -346,8 +384,9 @@ export class CompanyStore {
     options: MutationOptions,
     mutation: (state: CompanyState, context: MutationContext) => Promise<T> | T,
   ): Promise<{ state: CompanyState; result: T }> {
-    const state = await this.readStateFile(paths.stateFile, paths.workspace.sha256)
-    if (state === undefined) throw new Error('no active company exists for this workspace')
+    const base = await this.storage.read(paths.stateFile, paths.workspace.sha256)
+    if (base === undefined) throw new Error('no active company exists for this workspace')
+    const state = structuredClone(base.state)
     if (options.expectedRevision !== undefined && state.revision !== options.expectedRevision) {
       throw new RevisionConflictError(options.expectedRevision, state.revision)
     }
@@ -376,14 +415,18 @@ export class CompanyStore {
     assertCompanyState(state, paths.workspace.sha256)
 
     const auditBefore = await this.readOptionalFile(paths.auditFile)
-    const auditAfter = await this.buildAuditContent(paths, state, options)
+    const auditLine = this.buildAuditLine(state, options)
+    const auditTailLine = this.serializeAuditEvent(JSON.parse(auditLine) as CompanyAuditEvent, state.limits.maxAuditBytes)
+    const auditAfter = this.boundAuditContent([...auditBefore.content.split('\n').filter((line) => line.trim() !== ''), auditTailLine], state.limits.maxAuditBytes)
+    const prepared = prepareStoredState(state, base, { before: auditBefore.content, line: auditLine })
     const mailboxBefore = new Map<string, OptionalFileSnapshot>()
     for (const participantId of pendingMailboxes.keys()) mailboxBefore.set(participantId, await this.readOptionalFile(this.mailboxFile(paths, participantId)))
-    const journal: TransactionJournal = {
-      schemaVersion: 1,
+    const journal = {
+      schemaVersion: 2,
       workspaceHash: paths.workspace.sha256,
       baseRevision: state.revision - 1,
-      state: structuredClone(state),
+      state: prepared.stored,
+      history: prepared.appends,
       auditContent: auditAfter,
       mailboxes: [...pendingMailboxes].map(([participantId, messages]) => ({ participantId, messages: structuredClone(messages) })),
     }
@@ -394,7 +437,8 @@ export class CompanyStore {
       // after state succeeds there is no remaining fallible write.
       for (const [participantId, messages] of pendingMailboxes) await this.writeMailboxFile(paths, participantId, messages, state.limits.maxMailboxMessages)
       await writeFileAtomic(paths.auditFile, auditAfter, { mode: FILE_MODE, dirMode: DIR_MODE })
-      await writeFileAtomic(paths.stateFile, serializeJson(state), { mode: FILE_MODE, dirMode: DIR_MODE })
+      await applyHistoryAppends(paths.stateFile, prepared.appends)
+      await writeFileAtomic(paths.stateFile, serializeJson(prepared.stored), { mode: FILE_MODE, dirMode: DIR_MODE })
     } catch (error) {
       const rollbackErrors: unknown[] = []
       for (const [participantId, snapshot] of mailboxBefore) {
@@ -408,6 +452,7 @@ export class CompanyStore {
       }
       throw error
     }
+    await this.storage.committed(paths.stateFile, state, prepared.stored).catch((error) => this.onWarning('dsh-company state cache publication failed; durable commit remains valid', error))
     await rm(paths.transactionFile, { force: true }).catch((error) => this.onWarning('dsh-company committed journal cleanup failed; recovery is idempotent', error))
     return { state: structuredClone(state), result }
   }
@@ -417,6 +462,7 @@ export class CompanyStore {
       const current = await this.readStateFile(paths.stateFile, paths.workspace.sha256)
       if (current === undefined || current.phase !== 'archived') return
       const target = join(paths.archiveDir, current.id)
+      await assertNotSymlink(paths.archiveDir, 'company archive directory')
       await mkdir(paths.archiveDir, { recursive: true, mode: DIR_MODE })
       try {
         await rename(paths.activeDir, target)
@@ -430,7 +476,8 @@ export class CompanyStore {
   }
 
   private async recoverPendingTransaction(paths: WorkspacePaths): Promise<void> {
-    if (!(await this.readOptionalFile(paths.transactionFile)).exists) return
+    await assertNotSymlink(paths.transactionFile, 'company transaction journal')
+    try { await stat(paths.transactionFile) } catch (error) { if (isErrno(error, 'ENOENT')) return; throw error }
     await this.serialize(paths.root, async () => withFileLock(paths.identityFile, () => this.recoverPendingTransactionLocked(paths), { waitMs: LOCK_WAIT_MS }))
   }
 
@@ -444,30 +491,46 @@ export class CompanyStore {
       throw new Error('malformed dsh-company transaction journal; refusing ambiguous recovery', { cause: error })
     }
     const journal = this.parseTransactionJournal(parsed, paths)
-    const current = await this.readStateFile(paths.stateFile, paths.workspace.sha256)
-    if (current !== undefined && current.revision > journal.state.revision) {
+    const currentSnapshot = await this.storage.read(paths.stateFile, paths.workspace.sha256)
+    const current = currentSnapshot?.state
+    if (this.validateJournalCurrent(currentSnapshot, journal)) {
       await rm(paths.transactionFile, { force: true })
       return
     }
-    if (current !== undefined && current.id !== journal.state.id) throw new Error('transaction journal company identity does not match active state')
-    if (current !== undefined && current.revision !== journal.baseRevision && current.revision !== journal.state.revision) {
-      throw new Error(`transaction journal revision ${journal.baseRevision}->${journal.state.revision} conflicts with active revision ${current.revision}`)
-    }
     for (const mailbox of journal.mailboxes) await this.writeMailboxFile(paths, mailbox.participantId, mailbox.messages, journal.state.limits.maxMailboxMessages)
     await writeFileAtomic(paths.auditFile, journal.auditContent, { mode: FILE_MODE, dirMode: DIR_MODE })
-    await writeFileAtomic(paths.stateFile, serializeJson(journal.state), { mode: FILE_MODE, dirMode: DIR_MODE })
+    // Publishing the target company.json happens after every history append.
+    // A leftover WAL must never rewrite a now-committed history prefix.
+    if (current?.revision !== journal.state.revision) await applyHistoryAppends(paths.stateFile, journal.history)
+    await writeFileAtomic(paths.stateFile, serializeJson(journal.storedState), { mode: FILE_MODE, dirMode: DIR_MODE })
     await rm(paths.transactionFile, { force: true })
     this.onWarning(`dsh-company recovered interrupted transaction at revision ${journal.state.revision}`)
+  }
+
+  /** True means the journal is obsolete. Sync views enforce the same fences as
+   * recovery so a leftover journal cannot resurrect an old revision or company. */
+  private validateJournalCurrent(current: { state: CompanyState; stored: StoredCompanyState } | undefined, journal: TransactionJournal): boolean {
+    if (current !== undefined && current.state.id !== journal.state.id) throw new Error('transaction journal company identity does not match active state')
+    if (current !== undefined && current.state.revision > journal.state.revision) return true
+    if (current !== undefined && current.state.revision !== journal.baseRevision && current.state.revision !== journal.state.revision) {
+      throw new Error(`transaction journal revision ${journal.baseRevision}->${journal.state.revision} conflicts with active revision ${current.state.revision}`)
+    }
+    if (current?.state.revision === journal.state.revision && (!isDeepStrictEqual(current.state, journal.state) || !isDeepStrictEqual(current.stored, journal.storedState))) {
+      throw new Error('transaction journal target conflicts with the already committed revision')
+    }
+    validateHistoryBase(current?.stored, journal.storedState, journal.history)
+    return false
   }
 
   private parseTransactionJournal(value: unknown, paths: WorkspacePaths): TransactionJournal {
     if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new Error('invalid dsh-company transaction journal')
     const raw = value as Record<string, unknown>
-    if (raw.schemaVersion !== 1 || raw.workspaceHash !== paths.workspace.sha256 || !Number.isSafeInteger(raw.baseRevision) || (raw.baseRevision as number) < 1) {
+    if ((raw.schemaVersion !== 1 && raw.schemaVersion !== 2) || raw.workspaceHash !== paths.workspace.sha256 || !Number.isSafeInteger(raw.baseRevision) || (raw.baseRevision as number) < 1) {
       throw new Error('transaction journal identity or base revision is invalid')
     }
-    const state = normalizeCompanyState(raw.state, this.config)
-    assertCompanyState(state, paths.workspace.sha256)
+    const history = raw.schemaVersion === 2 ? parseHistoryAppends(raw.history) : []
+    const decoded = this.storage.decodeSync(raw.state, paths.stateFile, paths.workspace.sha256, history)
+    const state = decoded.state
     if (state.revision !== (raw.baseRevision as number) + 1) throw new Error('transaction journal target revision is not contiguous')
     if (typeof raw.auditContent !== 'string' || Buffer.byteLength(raw.auditContent, 'utf8') > state.limits.maxAuditBytes) throw new Error('transaction journal audit content is invalid')
     if (!Array.isArray(raw.mailboxes)) throw new Error('transaction journal mailboxes must be an array')
@@ -488,16 +551,19 @@ export class CompanyStore {
       return { participantId: row.participantId, messages: structuredClone(messages) }
     })
     return {
-      schemaVersion: 1,
+      schemaVersion: raw.schemaVersion,
       workspaceHash: paths.workspace.sha256,
       baseRevision: raw.baseRevision as number,
-      state: structuredClone(state),
+      state,
+      storedState: decoded.stored,
+      history,
       auditContent: raw.auditContent,
       mailboxes,
     }
   }
 
   private async readOptionalFile(file: string): Promise<OptionalFileSnapshot> {
+    await assertNotSymlink(file, 'company transaction file')
     try {
       return { exists: true, content: await readFile(file, 'utf8') }
     } catch (error) {
@@ -554,10 +620,8 @@ export class CompanyStore {
 
   private async readStateFile(file: string, workspaceHash: string): Promise<CompanyState | undefined> {
     try {
-      const raw = await readFile(file, 'utf8')
-      const parsed = normalizeCompanyState(JSON.parse(stripBom(raw)), this.config)
-      assertCompanyState(parsed, workspaceHash)
-      return parsed
+      const snapshot = await this.storage.read(file, workspaceHash)
+      return snapshot === undefined ? undefined : structuredClone(snapshot.state)
     } catch (error) {
       if (isErrno(error, 'ENOENT')) return undefined
       if (error instanceof SyntaxError) throw new Error(`malformed dsh-company state in ${basename(file)}; refusing to treat it as absent`, { cause: error })
@@ -612,7 +676,7 @@ export class CompanyStore {
     await writeFileAtomic(this.mailboxFile(paths, participantId), content, { mode: FILE_MODE, dirMode: DIR_MODE })
   }
 
-  private async buildAuditContent(paths: WorkspacePaths, state: CompanyState, options: MutationOptions): Promise<string> {
+  private buildAuditLine(state: CompanyState, options: MutationOptions): string {
     const event: CompanyAuditEvent = {
       schemaVersion: 1,
       id: state.counters.event,
@@ -622,9 +686,7 @@ export class CompanyStore {
       summary: bound(options.summary, 2048),
       revision: state.revision,
     }
-    const lines = await this.readAuditLines(paths)
-    lines.push(this.serializeAuditEvent(event, state.limits.maxAuditBytes))
-    return this.boundAuditContent(lines, state.limits.maxAuditBytes)
+    return JSON.stringify(event)
   }
 
   private serializeAuditEvent(event: CompanyAuditEvent, maxAuditBytes: number): string {
@@ -638,15 +700,6 @@ export class CompanyStore {
     return line
   }
 
-  private async readAuditLines(paths: WorkspacePaths): Promise<string[]> {
-    try {
-      return (await readFile(paths.auditFile, 'utf8')).split('\n').filter((line) => line.trim() !== '')
-    } catch (error) {
-      if (!isErrno(error, 'ENOENT')) throw error
-      return []
-    }
-  }
-
   private boundAuditContent(lines: string[], maxAuditBytes: number): string {
     let content = `${lines.join('\n')}\n`
     while (Buffer.byteLength(content, 'utf8') > maxAuditBytes && lines.length > 1) {
@@ -657,16 +710,23 @@ export class CompanyStore {
   }
 
   private async serialize<T>(key: string, operation: () => Promise<T>): Promise<T> {
+    const pendingKey = Symbol()
+    this.pendingOperations.set(pendingKey, Date.now())
     const previous = this.queues.get(key) ?? Promise.resolve()
     let release!: () => void
     const gate = new Promise<void>((resolve) => { release = resolve })
     const tail = previous.catch(() => undefined).then(() => gate)
     this.queues.set(key, tail)
     await previous.catch(() => undefined)
+    this.pendingOperations.delete(pendingKey)
+    this.activeWrites += 1
+    const startedAt = Date.now()
     try {
       return await operation()
     } finally {
       release()
+      this.activeWrites -= 1
+      this.lastWriteMs = Date.now() - startedAt
       if (this.queues.get(key) === tail) this.queues.delete(key)
     }
   }

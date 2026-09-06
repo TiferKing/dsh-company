@@ -13,7 +13,7 @@ const exists = async (path) => {
 
 const manifest = JSON.parse(await read('package.json'))
 assert.equal(manifest.name, 'dsh-company')
-assert.equal(manifest.version, '0.16.0')
+assert.equal(manifest.version, '0.17.3')
 assert.equal(manifest.type, 'module')
 assert.equal(manifest.main, 'lib/index.js')
 assert.equal(manifest.exports?.['./client']?.default, './lib/client.js')
